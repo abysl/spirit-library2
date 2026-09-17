@@ -4,4 +4,7 @@ pub use spirit_core::{
 };
 
 #[cfg(feature = "node")]
-pub use spirit_node::{write_private, Member, Node, NodeConfig, NodeId, NodeInfo, Pong};
+pub use spirit_node::{
+    write_private, Member, Node, NodeConfig, NodeId, NodeInfo, PeerStatus, Pong, CONNECTED_WINDOW,
+    HEARTBEAT_INTERVAL,
+};

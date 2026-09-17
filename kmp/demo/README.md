@@ -25,3 +25,7 @@ apk
 ```
 
 The parent development environment builds the sibling `../rust` FFI crate, generates Kotlin bindings, supplies Android JNI libraries, and configures the runtime dependencies required by desktop Compose.
+
+The **Devices** tab provides mesh creation, QR pairing, ticket pasting, a connectivity list, and per-device pings. **Blobs** retains the existing local put/get demo. Android scans codes with the camera; desktop imports PNG/JPEG QR images. See [the workspace pairing guide](../README.md#device-pairing-and-presence).
+
+Green means a recently received valid message; red means an error, no previous message, or more than 60 seconds of silence. Rust heartbeats run every five seconds independently of UI polling.

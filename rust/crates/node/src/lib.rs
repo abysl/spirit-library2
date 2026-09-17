@@ -1,9 +1,11 @@
 mod membership;
 mod network;
+mod presence;
 mod storage;
 
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
+pub use presence::{PeerStatus, CONNECTED_WINDOW, HEARTBEAT_INTERVAL};
 pub use storage::write_private;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -159,6 +161,7 @@ impl Node {
             storage,
             state: Mutex::new(state),
             pending: Mutex::new(None),
+            presence: Mutex::new(Default::default()),
             endpoint: endpoint.clone(),
             config,
         });
@@ -173,6 +176,22 @@ impl Node {
             router,
             gossip,
         })
+    }
+
+    pub fn peers(&self) -> Vec<PeerStatus> {
+        let info = self.info();
+        let presence = self.shared.presence.lock().unwrap();
+        let now = Instant::now();
+        info.members
+            .into_iter()
+            .filter(|member| member.id != info.id)
+            .map(|member| {
+                presence
+                    .get(&member.id)
+                    .unwrap_or(&presence::Presence::default())
+                    .status(member.id, member.name, now)
+            })
+            .collect()
     }
 
     pub fn info(&self) -> NodeInfo {
@@ -246,6 +265,7 @@ impl Node {
             "enrollment did not admit the expected device"
         );
         self.shared.merge(&joined, member.id)?;
+        self.shared.received(member.id);
         Ok(member)
     }
 
@@ -257,15 +277,11 @@ impl Node {
             .find(|m| m.id == id)
             .context("device is not a member of this mesh")?;
         ensure!(id != info.id, "choose another mesh member to ping");
-        let address = self.shared.address(id);
-        self.shared.sync(address.clone()).await?;
-        let start = Instant::now();
-        let response: String = self.shared.request(address, PING_ALPN, &"ping").await?;
-        ensure!(response == "pong", "invalid pong response");
+        let elapsed_ms = self.shared.ping(id).await?;
         Ok(Pong {
             id,
             name: member.name.clone(),
-            elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms,
         })
     }
 

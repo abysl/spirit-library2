@@ -1,6 +1,7 @@
 use crate::{
     membership::Snapshot,
     now,
+    presence::{Presence, HEARTBEAT_INTERVAL},
     storage::{State, Storage},
     NodeConfig, NodeId, PairingTicket,
 };
@@ -12,9 +13,10 @@ use iroh::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::task::JoinSet;
@@ -28,6 +30,7 @@ pub(crate) struct Shared {
     pub storage: Storage,
     pub state: Mutex<State>,
     pub pending: Mutex<Option<PairingTicket>>,
+    pub presence: Mutex<BTreeMap<NodeId, Presence>>,
     pub endpoint: Endpoint,
     pub config: NodeConfig,
 }
@@ -44,6 +47,55 @@ pub(crate) struct EnrollmentReply {
 }
 
 impl Shared {
+    pub fn received(&self, id: NodeId) {
+        self.presence
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .received(Instant::now());
+    }
+
+    fn failed(&self, id: NodeId, error: &anyhow::Error) {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.member(id))
+            .is_some()
+        {
+            self.presence
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_default()
+                .failed(format!("{error:#}"));
+        }
+    }
+
+    fn record<T>(&self, id: NodeId, result: &Result<T>) {
+        match result {
+            Ok(_) => self.received(id),
+            Err(error) => self.failed(id, error),
+        }
+    }
+
+    pub async fn ping(&self, id: NodeId) -> Result<u128> {
+        let result = async {
+            let address = self.address(id);
+            self.sync(address.clone()).await?;
+            let start = Instant::now();
+            let response: String = self.request(address, PING_ALPN, &"ping").await?;
+            ensure!(response == "pong", "invalid pong response");
+            Ok(start.elapsed().as_millis())
+        }
+        .await;
+        self.record(id, &result);
+        result
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.state.lock().unwrap().snapshot(self.endpoint.addr())
     }
@@ -80,6 +132,20 @@ impl Shared {
         alpn: &[u8],
         request: &T,
     ) -> Result<R> {
+        let id = address.id;
+        let result = self.exchange(address, alpn, request).await;
+        if let Err(error) = &result {
+            self.failed(id, error);
+        }
+        result
+    }
+
+    async fn exchange<T: Serialize, R: DeserializeOwned>(
+        &self,
+        address: EndpointAddr,
+        alpn: &[u8],
+        request: &T,
+    ) -> Result<R> {
         let bytes = serde_json::to_vec(request)?;
         ensure!(bytes.len() <= MAX_MESSAGE, "request is too large");
         let connection = tokio::time::timeout(
@@ -103,9 +169,14 @@ impl Shared {
 
     pub async fn sync(&self, address: EndpointAddr) -> Result<()> {
         let id = address.id;
-        let snapshot = self.snapshot()?;
-        let response: Snapshot = self.request(address, SYNC_ALPN, &snapshot).await?;
-        self.merge(&response, id)
+        let result = async {
+            let snapshot = self.snapshot()?;
+            let response: Snapshot = self.request(address, SYNC_ALPN, &snapshot).await?;
+            self.merge(&response, id)
+        }
+        .await;
+        self.record(id, &result);
+        result
     }
 
     fn enroll(&self, request: Enrollment, remote: NodeId) -> Result<Snapshot> {
@@ -125,6 +196,7 @@ impl Shared {
         );
         self.merge(&request.snapshot, remote)?;
         *pending = None;
+        self.received(remote);
         self.snapshot()
     }
 }
@@ -202,11 +274,13 @@ impl Protocol {
                 );
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
                 self.shared.merge(&snapshot, remote)?;
+                self.shared.received(remote);
                 serde_json::to_vec(&self.shared.snapshot()?)?
             }
             Kind::Ping => {
                 let request: String = serde_json::from_slice(&bytes)?;
                 ensure!(request == "ping", "invalid ping");
+                self.shared.received(remote);
                 serde_json::to_vec("pong")?
             }
         };
@@ -226,41 +300,45 @@ impl ProtocolHandler for Protocol {
         )
         .await;
         connection.close(0u32.into(), b"finished");
-        result
-            .map_err(AcceptError::from_err)?
-            .map_err(|error| AcceptError::from_boxed(error.into()))
+        let result = result
+            .context("incoming request timed out")
+            .and_then(|result| result);
+        if let Err(error) = &result {
+            self.shared.failed(connection.remote_id(), error);
+        }
+        result.map_err(|error| AcceptError::from_boxed(error.into()))
     }
 }
 
 pub(crate) async fn gossip(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut in_flight = BTreeSet::new();
+    let mut tasks = JoinSet::new();
     loop {
-        interval.tick().await;
-        let peers: Vec<_> = {
-            let state = shared.state.lock().unwrap();
-            state
-                .mesh
-                .as_ref()
-                .map(|mesh| {
-                    mesh.admissions
-                        .iter()
-                        .map(|a| a.member.id)
-                        .filter(|id| *id != state.member.id)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let mut tasks = JoinSet::new();
-        for id in peers {
-            if tasks.len() >= 16 {
-                tasks.join_next().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                let peers: Vec<_> = {
+                    let state = shared.state.lock().unwrap();
+                    state.mesh.as_ref().map(|mesh| mesh.admissions.iter()
+                        .map(|admission| admission.member.id)
+                        .filter(|id| *id != state.member.id).collect()).unwrap_or_default()
+                };
+                for id in peers {
+                    if !in_flight.insert(id) { continue; }
+                    let shared = shared.clone();
+                    tasks.spawn(async move {
+                        let result = tokio::time::timeout(HEARTBEAT_INTERVAL - Duration::from_secs(1), shared.ping(id))
+                            .await.context("heartbeat timed out").and_then(|result| result);
+                        if let Err(error) = result { shared.failed(id, &error); }
+                        id
+                    });
+                }
             }
-            let shared = shared.clone();
-            tasks.spawn(async move {
-                let _ = shared.sync(shared.address(id)).await;
-            });
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Ok(id) = result { in_flight.remove(&id); }
+            }
         }
-        while tasks.join_next().await.is_some() {}
     }
 }
 

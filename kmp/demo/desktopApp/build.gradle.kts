@@ -29,8 +29,15 @@ compose.desktop {
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
-            packageName = "com.abysl.spirit2_demo"
+            packageName = "Spirit2"
             packageVersion = "1.0.0"
+            includeAllModules = true
+            linux {
+                packageName = "spirit2"
+            }
+            macOS {
+                bundleID = "com.abysl.spirit2"
+            }
         }
     }
 }

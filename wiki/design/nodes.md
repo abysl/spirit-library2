@@ -34,7 +34,7 @@ If the final acknowledgment is lost, the receiver may already have committed its
 
 Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. No mesh metadata is returned for a failed membership exchange.
 
-Background exchange runs in rounds approximately every two seconds. A round contacts known members, with at most 16 exchanges in flight. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
+Background heartbeats run every five seconds. Each peer is checked independently, with at most one active heartbeat per member and a four-second overall deadline. An unreachable peer cannot delay probing the others. Each heartbeat exchanges membership and then sends a ping. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
 
 Addresses are routing hints. A newly discovered member's address can be learned from another member. Afterward, that member's own authenticated connection updates its address. Forwarded stale snapshots do not overwrite a directly learned address. iroh still authenticates the intended device key regardless of the address used.
 
@@ -63,7 +63,7 @@ The CLI contacts the service through a loopback TCP listener authenticated by a 
 
 ## Rust API
 
-Consumers enable the `node` feature on `spirit-sdk`. Blob-only SDK and FFI consumers do not enable the networking dependency. Public types are `Node`, `NodeConfig`, `NodeId`, `NodeInfo`, `Member`, and `Pong`.
+Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types are `Node`, `NodeConfig`, `NodeId`, `NodeInfo`, `Member`, and `Pong`.
 
 - `Node::init(directory, nickname)` creates or reopens an identity.
 - `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
@@ -72,6 +72,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only SDK and FFI consu
 - `node.pair(lifetime).await` opens an enrollment window and returns a ticket.
 - `node.add(ticket).await` admits the ticket's device.
 - `node.info().resolve(nickname_or_id)` resolves a member without guessing on duplicates.
+- `node.peers()` returns each other member's connectivity, time since last received message, and last error.
 - `node.ping(member.id).await` returns an authenticated pong and elapsed milliseconds.
 - `node.shutdown().await` stops networking. Drop the node to release ownership of its directory.
 
@@ -79,7 +80,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only SDK and FFI consu
 
 ## Deferred operations
 
-This version supports one append-only mesh per device. Nicknames are fixed at initialization. Device removal, renaming, leaving, merging meshes, and restricting admission require new signed update and policy rules. Removing an introducer is not yet an operation. Blob transfer and mobile/Kotlin node bindings are outside this phase.
+This version supports one append-only mesh per device. Nicknames are fixed at initialization. Device removal, renaming, leaving, merging meshes, and restricting admission require new signed update and policy rules. Removing an introducer is not yet an operation. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
 
 The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency.
 
@@ -88,3 +89,15 @@ The protocol is an initial version intended for small personal meshes. Its autom
 - [iroh endpoint configuration](https://docs.rs/iroh/1.2.0/iroh/endpoint/struct.Builder.html)
 - [iroh router lifecycle](https://docs.rs/iroh/1.2.0/iroh/protocol/struct.Router.html)
 - [QR rendering](https://docs.rs/qrcode/0.14.1/qrcode/render/index.html)
+
+## Connectivity and KMP integration
+
+Connectivity is in-memory state measured using a monotonic clock. Only a validated application message marks a member as received. A green peer has received a message no more than 60 seconds ago and has no newer error. A transport, protocol, or heartbeat error marks it red immediately when detected; a subsequent valid received message clears the error. Never-seen peers start red. Restarting clears presence without removing memberships.
+
+Membership snapshots, enrollment messages, pings, and pongs all count. Unauthenticated traffic and malformed messages do not make a device connected. Heartbeat timeouts are recorded as errors, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
+
+`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. Pairing returns the original ticket plus QR modules generated from those exact bytes.
+
+The Android JNI initialization holds the application context in a global reference for the process lifetime and installs it once before constructing an iroh endpoint. This lifetime is required by iroh's DNS integration; a temporary activity reference must never be substituted. Device identity is stored in Android's non-backup directory so OS backup restoration does not duplicate an endpoint identity onto another phone.
+
+The KMP list polls status every second. It displays both a colored dot and textual state, keeps disconnected members visible, and shows a short ID when nicknames collide. Manual ping targets the member's full ID even though the interface displays its nickname. Camera permission denial leaves ticket pasting available.

@@ -12,6 +12,9 @@ kotlin {
 }
 dependencies {
     implementation(project(":demo:shared"))
+    implementation(project(":sdk"))
+    implementation(libs.kotlinx.coroutinesCore)
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.11.0-beta01")
 
     implementation(libs.androidx.activity.compose)
 
@@ -21,6 +24,7 @@ dependencies {
 
 android {
     namespace = "com.abysl.spirit2_demo"
+    ndkVersion = "26.3.11579264"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
 
     defaultConfig {

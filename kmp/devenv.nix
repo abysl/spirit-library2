@@ -58,7 +58,7 @@ in {
   scripts."generate-bindings".exec = ''
     set -eu
     cd "$DEVENV_ROOT/../rust"
-    cargo build -p spirit-ffi --bin uniffi-bindgen --features uniffi/cli
+    cargo build -p spirit-ffi --lib --bin uniffi-bindgen --features uniffi/cli
     lib="target/debug/libspirit_ffi.so"
     [ -f "$lib" ] || lib="target/debug/libspirit_ffi.dylib"
     ./target/debug/uniffi-bindgen generate --library "$lib" --language kotlin \

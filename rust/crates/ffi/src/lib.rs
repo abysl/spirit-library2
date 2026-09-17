@@ -1,3 +1,8 @@
+#[cfg(target_os = "android")]
+mod android;
+mod node;
+pub use node::*;
+
 use spirit_sdk::{BlobHash, BlobStore, StoreError};
 
 uniffi::setup_scaffolding!();
@@ -12,6 +17,8 @@ pub enum FfiError {
     Corrupt { expected: String, actual: String },
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("node: {0}")]
+    Node(String),
 }
 
 impl From<StoreError> for FfiError {

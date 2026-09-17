@@ -70,11 +70,18 @@ kotlin {
     }
 
     sourceSets {
+        getByName("spiritMain").dependencies {
+            implementation(project(":sdk"))
+            implementation(libs.kotlinx.coroutinesCore)
+        }
         androidMain.dependencies {
+            implementation(libs.androidx.activity.compose)
+            implementation("com.journeyapps:zxing-android-embedded:4.3.0")
             implementation(libs.compose.uiToolingPreview)
             implementation(libs.compose.uiTooling)
         }
         commonMain.dependencies {
+            implementation(libs.kotlinx.coroutinesCore)
             implementation(libs.compose.runtime)
             implementation(libs.compose.foundation)
             implementation(libs.compose.material3)
@@ -92,6 +99,7 @@ kotlin {
             implementation(libs.kotlinx.coroutinesCore)
         }
         jvmMain.dependencies {
+            implementation("com.google.zxing:javase:3.5.3")
             implementation(project(":sdk"))
             implementation(libs.kotlinx.coroutinesCore)
         }

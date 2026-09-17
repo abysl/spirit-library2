@@ -59,7 +59,7 @@ Expected output:
 Added laptop to personal.
 ```
 
-The new device joins the existing device's mesh. It does not create a separate mesh. A future mobile interface can scan the same QR payload; this version uses the CLI to redeem it.
+The new device joins the existing device's mesh. It does not create a separate mesh. The Android app can scan the same QR payload; this walkthrough uses the CLI to redeem it.
 
 For scripts, print only the ticket:
 
@@ -147,6 +147,12 @@ If enrollment loses its final acknowledgment, check `mesh members`: the admitted
 
 `rust/crates/cli/tests/node.rs` runs separate CLI services, exercises hostname defaults, terminal/SVG QR generation, nickname resolution, duplicate names, crash recovery, and communication with the introducer offline. `rust/crates/node/tests/mesh.rs` covers persistent identities, enrollment, transitive admission, restart, and ticket behavior. Library tests also send unauthorized requests directly over iroh and verify signed admission rejection.
 
-Blob storage commands continue to use their existing store. Blob transfer, mobile enrollment, mesh removal, and admission restrictions are future stories.
+Blob storage commands continue to use their existing store. Blob transfer, mesh removal, and admission restrictions are future stories.
 
 See [the node design](../../wiki/design/nodes.md) for the trust model and protocol.
+
+## Pair with the KMP app
+
+The Android app can scan the QR emitted by `node pair`, and the desktop app can import a PNG/JPEG screenshot of it. Create a mesh in the app, then scan or paste the CLI device's ticket to enroll it. An existing CLI mesh can instead redeem the app's displayed ticket with `mesh add`.
+
+Every running node now sends heartbeats every five seconds. The app shows members as green after receiving a valid message, and red on errors or after more than 60 seconds of silence. See the [KMP pairing guide](../../kmp/README.md#device-pairing-and-presence).

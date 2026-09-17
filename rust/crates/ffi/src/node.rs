@@ -1,0 +1,214 @@
+use crate::FfiError;
+use qrcode::{Color, QrCode};
+use spirit_sdk::{Node, NodeConfig};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use tokio::runtime::Runtime;
+
+fn runtime() -> Result<&'static Runtime, FfiError> {
+    static RUNTIME: OnceLock<Result<Runtime, std::io::Error>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|error| FfiError::Node(error.to_string()))
+}
+
+fn node_error(error: anyhow::Error) -> FfiError {
+    FfiError::Node(format!("{error:#}"))
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct MeshPeer {
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
+    pub last_received_ago_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct MeshStatus {
+    pub id: String,
+    pub name: String,
+    pub mesh_name: Option<String>,
+    pub peers: Vec<MeshPeer>,
+}
+
+#[derive(uniffi::Record)]
+pub struct PairingCode {
+    pub ticket: String,
+    pub width: u32,
+    pub modules: Vec<u8>,
+    pub lifetime_seconds: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct PingReply {
+    pub name: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(uniffi::Object)]
+pub struct SpiritNode {
+    node: Mutex<Option<Arc<Node>>>,
+}
+
+impl SpiritNode {
+    fn active(&self) -> Result<Arc<Node>, FfiError> {
+        self.node
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| FfiError::Node("node is closed".into()))
+    }
+}
+
+#[uniffi::export]
+impl SpiritNode {
+    #[uniffi::constructor]
+    pub fn open(node_dir: String, nickname: String, local: bool) -> Result<Self, FfiError> {
+        Node::init(&node_dir, &nickname).map_err(node_error)?;
+        let config = if local {
+            NodeConfig::local()
+        } else {
+            NodeConfig::default()
+        };
+        let node = runtime()?
+            .block_on(Node::bind(node_dir, config))
+            .map_err(node_error)?;
+        Ok(Self {
+            node: Mutex::new(Some(Arc::new(node))),
+        })
+    }
+
+    pub fn status(&self) -> Result<MeshStatus, FfiError> {
+        let node = self.active()?;
+        let info = node.info();
+        let peers = node
+            .peers()
+            .into_iter()
+            .map(|peer| MeshPeer {
+                id: peer.id.to_string(),
+                name: peer.name,
+                connected: peer.connected,
+                last_received_ago_ms: peer.last_received_ago_ms,
+                last_error: peer.last_error,
+            })
+            .collect();
+        Ok(MeshStatus {
+            id: info.id.to_string(),
+            name: info.name,
+            mesh_name: info.mesh_name,
+            peers,
+        })
+    }
+
+    pub fn create_mesh(&self, name: String) -> Result<(), FfiError> {
+        self.active()?.new_mesh(&name).map_err(node_error)?;
+        Ok(())
+    }
+
+    pub fn pair(&self) -> Result<PairingCode, FfiError> {
+        let node = self.active()?;
+        let ticket = runtime()?
+            .block_on(node.pair(Duration::from_secs(300)))
+            .map_err(node_error)?;
+        let qr =
+            QrCode::new(ticket.as_bytes()).map_err(|error| FfiError::Node(error.to_string()))?;
+        Ok(PairingCode {
+            ticket,
+            width: qr.width() as u32,
+            modules: qr
+                .to_colors()
+                .into_iter()
+                .map(|color| u8::from(color == Color::Dark))
+                .collect(),
+            lifetime_seconds: 300,
+        })
+    }
+
+    pub fn add(&self, ticket: String) -> Result<String, FfiError> {
+        let node = self.active()?;
+        let member = runtime()?
+            .block_on(node.add(ticket.trim()))
+            .map_err(node_error)?;
+        Ok(member.name)
+    }
+
+    pub fn ping(&self, device: String) -> Result<PingReply, FfiError> {
+        let node = self.active()?;
+        let member = node.info().resolve(&device).map_err(node_error)?;
+        let pong = runtime()?
+            .block_on(node.ping(member.id))
+            .map_err(node_error)?;
+        Ok(PingReply {
+            name: pong.name,
+            elapsed_ms: pong.elapsed_ms.min(u64::MAX as u128) as u64,
+        })
+    }
+
+    pub fn shutdown(&self) -> Result<(), FfiError> {
+        let node = self.node.lock().unwrap().take();
+        if let Some(node) = node {
+            runtime()?.block_on(node.shutdown()).map_err(node_error)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SpiritNode {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.get_mut().unwrap().take() {
+            if let Ok(runtime) = runtime() {
+                runtime.spawn(async move {
+                    let _ = node.shutdown().await;
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_bindings_enroll_ping_and_close() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "desktop".into(),
+            true,
+        )
+        .unwrap();
+        let b =
+            SpiritNode::open(b_dir.path().to_str().unwrap().into(), "phone".into(), true).unwrap();
+        a.create_mesh("personal".into()).unwrap();
+        let code = b.pair().unwrap();
+        assert_eq!(code.modules.len(), (code.width * code.width) as usize);
+        assert_eq!(a.add(code.ticket).unwrap(), "phone");
+        assert_eq!(a.ping("phone".into()).unwrap().name, "phone");
+        assert!(a.status().unwrap().peers[0].connected);
+        assert!(b.status().unwrap().peers[0].connected);
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
+        assert!(a.status().is_err());
+        let reopened = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "desktop".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.status().unwrap().mesh_name.as_deref(),
+            Some("personal")
+        );
+        reopened.shutdown().unwrap();
+    }
+}

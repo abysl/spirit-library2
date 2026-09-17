@@ -2991,8 +2991,14 @@ dependencies = [
 name = "spirit-ffi"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "iroh-dns",
+ "jni 0.21.1",
+ "qrcode",
  "spirit-sdk",
+ "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "uniffi",
 ]
 

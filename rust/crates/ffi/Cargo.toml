@@ -13,6 +13,17 @@ path = "uniffi-bindgen.rs"
 required-features = ["uniffi/cli"]
 
 [dependencies]
-spirit-sdk.workspace = true
+spirit-sdk = { workspace = true, features = ["node"] }
 thiserror.workspace = true
 uniffi.workspace = true
+
+anyhow.workspace = true
+tokio.workspace = true
+qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+iroh-dns = "1.1"
