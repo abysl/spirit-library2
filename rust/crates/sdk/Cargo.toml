@@ -1,0 +1,11 @@
+[package]
+name = "spirit-sdk"
+version.workspace = true
+edition.workspace = true
+
+[features]
+node = ["dep:spirit-node"]
+
+[dependencies]
+spirit-core.workspace = true
+spirit-node = { workspace = true, optional = true }

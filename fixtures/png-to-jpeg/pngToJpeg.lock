@@ -1,0 +1,17 @@
+format = 1
+name = "pngToJpeg"
+manifest = "pngToJpeg.toml"
+system = "x86_64-linux"
+executor = "nix"
+
+[inputs]
+image = "2f29a2cf21cfeb156962f8aaa649718619a50d35fa5c46e28316c3552743ada2"
+
+[packages.ffmpeg]
+attribute = "legacyPackages.x86_64-linux.ffmpeg"
+nixpkgs = "c8f90650c15282fa8656a041bfbbd2403997a9a7"
+
+[transform]
+flake_source = "pending"
+attribute = "packages.x86_64-linux.default"
+hash = "pending"

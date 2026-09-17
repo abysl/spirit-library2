@@ -1,0 +1,23 @@
+[package]
+name = "spirit-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "spirit"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+spirit-sdk = { workspace = true, features = ["node"] }
+anyhow.workspace = true
+getrandom = "0.4"
+hostname = "0.4"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

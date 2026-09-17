@@ -1,0 +1,18 @@
+[package]
+name = "spirit-ffi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "spirit_ffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi/cli"]
+
+[dependencies]
+spirit-sdk.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true

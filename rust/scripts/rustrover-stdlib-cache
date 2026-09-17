@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+rustc_bin=${1:-}
+if [ -z "$rustc_bin" ]; then
+  if [ -x "${DEVENV_PROFILE:-}/bin/rustc" ]; then
+    rustc_bin=${DEVENV_PROFILE}/bin/rustc
+  else
+    rustc_bin=$(command -v rustc 2>/dev/null || true)
+  fi
+fi
+if [ -z "$rustc_bin" ] || [ ! -x "$rustc_bin" ]; then
+  exit 0
+fi
+
+info=$("$rustc_bin" --version --verbose 2>/dev/null) || exit 0
+sysroot=$("$rustc_bin" --print sysroot 2>/dev/null) || exit 0
+release=$(printf '%s\n' "$info" | sed -n 's/^release: //p')
+commit=$(printf '%s\n' "$info" | sed -n 's/^commit-hash: //p')
+src=$sysroot/lib/rustlib/src/rust
+
+if [ -z "$release" ] || [ ! -d "$src/library" ]; then
+  exit 0
+fi
+if [ -w "$src" ]; then
+  exit 0
+fi
+
+key=${commit:-$release}
+
+if command -v perl >/dev/null 2>&1; then
+  hash=$(perl -MDigest::SHA=sha1,sha1_hex \
+    -e 'print sha1_hex(sha1($ARGV[0]) . sha1($ARGV[1]))' "$src" "$key") || exit 0
+elif command -v xxd >/dev/null 2>&1 && command -v sha1sum >/dev/null 2>&1; then
+  a=$(printf '%s' "$src" | sha1sum | cut -d' ' -f1)
+  b=$(printf '%s' "$key" | sha1sum | cut -d' ' -f1)
+  hash=$(printf '%s%s' "$a" "$b" | xxd -r -p | sha1sum | cut -d' ' -f1)
+else
+  exit 0
+fi
+
+name=$release-$hash
+rc=0
+
+for ide in "$HOME"/.cache/JetBrains/*; do
+  [ -d "$ide" ] || continue
+  case ${ide##*/} in
+    RustRover*) ;;
+    *) [ -d "$ide/intellij-rust" ] || continue ;;
+  esac
+
+  base=$ide/intellij-rust/stdlib-local-copy
+  dest=$base/$name
+
+  if [ -f "$dest/library/core/src/lib.rs" ] && [ -w "$dest" ]; then
+    continue
+  fi
+
+  mkdir -p "$base" || { rc=1; continue; }
+  rm -rf "$base"/.staging-* 2>/dev/null
+
+  tmp=$base/.staging-$$
+  mkdir -p "$tmp" || { rc=1; continue; }
+
+  if cp -rL --no-preserve=mode,ownership "$src"/. "$tmp"/ 2>/dev/null; then
+    chmod -R u+rwX "$tmp"
+    if [ -e "$dest" ]; then
+      chmod -R u+w "$dest" 2>/dev/null
+      rm -rf "$dest"
+    fi
+    if mv "$tmp" "$dest" 2>/dev/null; then
+      printf 'rust stdlib sources staged for %s: %s\n' "${ide##*/}" "$name" >&2
+    else
+      rm -rf "$tmp"
+      rc=1
+    fi
+  else
+    chmod -R u+w "$tmp" 2>/dev/null
+    rm -rf "$tmp"
+    rc=1
+  fi
+done
+
+exit $rc

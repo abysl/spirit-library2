@@ -1,0 +1,17 @@
+format = 1
+name = "pngToJpeg"
+executor = "nix"
+output = "jpeg"
+
+[transform]
+command = "ffmpeg -i \"$SPIRIT_INPUT_image\" -q:v 2 \"$SPIRIT_OUTPUT\""
+
+[inputs.image]
+file = "input.png"
+
+[packages]
+ffmpeg = "nixpkgs#ffmpeg"
+
+[fixture]
+source = "https://github.com/bevyengine/bevy/blob/main/assets/branding/icon.png"
+license = "MIT OR Apache-2.0"

@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/cli", "crates/core", "crates/ffi", "crates/node", "crates/sdk"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+spirit-core = { path = "crates/core" }
+spirit-sdk = { path = "crates/sdk" }
+spirit-node = { path = "crates/node" }
+anyhow = "1"
+base64 = "0.22"
+iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+uniffi = "0.32"

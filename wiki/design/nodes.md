@@ -1,0 +1,90 @@
+# Private device meshes
+
+## Identity and membership
+
+Each device has an Ed25519 keypair. Its public key is its iroh endpoint ID. A nickname defaults to the hostname at initialization and is stored with the identity. Nicknames are display and lookup names, not authentication credentials. Duplicate nicknames are allowed; a CLI operation targeting an ambiguous nickname requires a full device ID.
+
+A mesh is anchored by its founding device's public key, which is also the mesh ID. The founder signs its initial admission. Every member can sign admissions for additional devices. An admission binds the mesh ID, mesh name, member ID, member nickname, and issuer ID. The signed bytes are the Postcard encoding of the tuple `("spirit/mesh/admission/1", mesh_id, mesh_name, member, issuer)` in that order. The signature is Ed25519, encoded with unpadded URL-safe base64.
+
+A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admission subjects and conflicting names are rejected. Existing local admissions are retained when merging, making independent enrollments converge by device ID.
+
+A member proves ownership of its admitted key through the iroh connection. Nicknames, network addresses, and the presence of a node ID in an unsigned list cannot authorize a pong.
+
+## Enrollment
+
+The device being added runs `node pair`. It generates a random 32-byte secret, records an expiry in memory, and issues a `spirit1` ticket. The ticket contains its endpoint address, nickname, secret, and expiry, serialized with Postcard and encoded with unpadded URL-safe base64. The CLI renders those exact ticket bytes as a QR code. `--qr-svg` saves a scalable image; `--no-qr` prints only the ticket.
+
+An existing member runs `mesh add <ticket>`. It connects to the ticket's authenticated endpoint, signs an admission for that device, and sends the secret, membership evidence, and address hints over the encrypted connection. The receiving device verifies the secret, its own recorded expiry, the introducer's membership, its own admission, and compatibility with any existing mesh. It atomically saves membership before acknowledging and consumes the ticket.
+
+A ticket expires after five minutes by default. Its lifetime can be set between 1 and 3600 seconds. Creating another ticket invalidates the previous ticket. Restarting invalidates every outstanding ticket. Failed attempts with an incorrect secret or a different mesh do not consume the valid invitation. Replaying a consumed ticket fails. Re-enrolling the same device with a fresh ticket into the same mesh is harmless.
+
+The ticket is a bearer credential: possessing it authorizes its holder to enroll the issuing device into the holder's mesh. Keep the QR image and text private until enrollment completes. It contains an enrollment secret, never a device's long-term private key.
+
+If the final acknowledgment is lost, the receiver may already have committed its membership. Its subsequent membership exchange repairs the introducer's view. Inspect `mesh members` before generating a fresh ticket and retrying.
+
+## Networking
+
+`spirit-node` owns the iroh endpoint and router. It serves three versioned protocols:
+
+| ALPN | Request | Response | Authorization |
+|---|---|---|---|
+| `spirit/pair/1` | Enrollment secret and membership snapshot | Committed snapshot or error | Active ticket and introducer's valid membership |
+| `spirit/mesh/1` | Membership and address snapshot | Merged snapshot | Peer has verifiable membership in the same mesh |
+| `spirit/ping/1` | JSON string `"ping"` | JSON string `"pong"` | Authenticated peer is in the local validated membership set |
+
+Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. No mesh metadata is returned for a failed membership exchange.
+
+Background exchange runs in rounds approximately every two seconds. A round contacts known members, with at most 16 exchanges in flight. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
+
+Addresses are routing hints. A newly discovered member's address can be learned from another member. Afterward, that member's own authenticated connection updates its address. Forwarded stale snapshots do not overwrite a directly learned address. iroh still authenticates the intended device key regardless of the address used.
+
+Normal operation uses iroh's N0 relay and address lookup preset. Ticket generation waits for relay readiness so the ticket includes a usable relay address. `node serve --local` instead binds loopback with no relay or external discovery, for same-machine tests. This mode does not connect separate machines.
+
+Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh supports at most 256 members, with at most 16 transport addresses per member. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
+
+Membership propagation is eventual. Peers must have exchanged membership and usable addresses before the introducer goes offline. Once they have, the introducer need not remain online for authentication, pinging, or further enrollment.
+
+## Persistence and local control
+
+The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` or `SPIRIT_NODE_DIR`. Blob storage continues to use its separate `--store` setting.
+
+| File | Contents |
+|---|---|
+| `secret.key` | Raw 32-byte secret key |
+| `state.json` | Local identity, nickname, signed mesh admissions, and learned addresses |
+| `node.lock` | Process ownership lock |
+| `control.json` | Running node's loopback control address and random credential |
+
+Writes use temporary files and atomic replacement. New secret, state, control, and exported QR files are owner-only on Unix. Malformed or missing existing identities fail rather than silently generating a replacement. A process lock prevents a second service or offline mutation from overwriting the running node's state.
+
+The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit and a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
+
+`node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization and mesh creation work offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
+
+## Rust API
+
+Consumers enable the `node` feature on `spirit-sdk`. Blob-only SDK and FFI consumers do not enable the networking dependency. Public types are `Node`, `NodeConfig`, `NodeId`, `NodeInfo`, `Member`, and `Pong`.
+
+- `Node::init(directory, nickname)` creates or reopens an identity.
+- `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
+- `Node::bind(directory, config).await` starts networking and background exchange.
+- `node.new_mesh(mesh_name)` creates a mesh while running.
+- `node.pair(lifetime).await` opens an enrollment window and returns a ticket.
+- `node.add(ticket).await` admits the ticket's device.
+- `node.info().resolve(nickname_or_id)` resolves a member without guessing on duplicates.
+- `node.ping(member.id).await` returns an authenticated pong and elapsed milliseconds.
+- `node.shutdown().await` stops networking. Drop the node to release ownership of its directory.
+
+`Node::read_info(directory)` reads committed state without starting networking. `NodeConfig::default()` uses normal iroh services; `NodeConfig::local()` uses loopback. The SDK also exports the restricted-permission atomic file writer used by the CLI for control and QR files.
+
+## Deferred operations
+
+This version supports one append-only mesh per device. Nicknames are fixed at initialization. Device removal, renaming, leaving, merging meshes, and restricting admission require new signed update and policy rules. Removing an introducer is not yet an operation. Blob transfer and mobile/Kotlin node bindings are outside this phase.
+
+The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency.
+
+## References
+
+- [iroh endpoint configuration](https://docs.rs/iroh/1.2.0/iroh/endpoint/struct.Builder.html)
+- [iroh router lifecycle](https://docs.rs/iroh/1.2.0/iroh/protocol/struct.Router.html)
+- [QR rendering](https://docs.rs/qrcode/0.14.1/qrcode/render/index.html)
