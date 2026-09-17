@@ -58,6 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           workspaces: rust
+          cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
       - name: Install Linux packaging tools
@@ -93,6 +94,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+      - name: Upload desktop failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: spirit2-desktop-logs-${{ matrix.target }}
+          path: |
+            kmp/demo/desktopApp/build/compose/logs/
+            kmp/demo/desktopApp/build/compose/tmp/*.args.txt
+            kmp/sdk/build/test-results/
+            kmp/demo/shared/build/test-results/
+          retention-days: 7
 
   android:
     name: Android APK
@@ -107,6 +119,8 @@ jobs:
           distribution: temurin
           java-version: '25'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+        with:
+          packages: platform-tools
       - name: Install Android SDK and NDK
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;26.3.11579264'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
@@ -116,6 +130,7 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           workspaces: rust
+          cache-on-failure: true
           key: android
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb

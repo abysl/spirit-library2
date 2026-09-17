@@ -31,7 +31,7 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Spirit2"
             packageVersion = "1.0.0"
-            includeAllModules = true
+            modules("java.se", "jdk.unsupported", "jdk.crypto.cryptoki", "jdk.localedata", "jdk.charsets", "jdk.zipfs")
             linux {
                 packageName = "spirit2"
             }

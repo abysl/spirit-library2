@@ -22,12 +22,14 @@ plugins {
     alias(libs.plugins.kotlinMultiplatform) apply false
 }
 
+val downloadWebTools = !providers.environmentVariable("DEVENV_ROOT").isPresent
+
 allprojects {
-    plugins.withType<NodeJsRootPlugin> { the<NodeJsEnvSpec>().download.set(false) }
-    plugins.withType<NodeJsPlugin> { the<NodeJsEnvSpec>().download.set(false) }
-    plugins.withType<YarnPlugin> { the<YarnRootEnvSpec>().download.set(false) }
-    plugins.withType<WasmNodeJsRootPlugin> { the<WasmNodeJsEnvSpec>().download.set(false) }
-    plugins.withType<WasmNodeJsPlugin> { the<WasmNodeJsEnvSpec>().download.set(false) }
-    plugins.withType<WasmYarnPlugin> { the<WasmYarnRootEnvSpec>().download.set(false) }
-    plugins.withType<BinaryenPlugin> { the<BinaryenEnvSpec>().download.set(false) }
+    plugins.withType<NodeJsRootPlugin> { the<NodeJsEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<NodeJsPlugin> { the<NodeJsEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<YarnPlugin> { the<YarnRootEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<WasmNodeJsRootPlugin> { the<WasmNodeJsEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<WasmNodeJsPlugin> { the<WasmNodeJsEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<WasmYarnPlugin> { the<WasmYarnRootEnvSpec>().download.set(downloadWebTools) }
+    plugins.withType<BinaryenPlugin> { the<BinaryenEnvSpec>().download.set(downloadWebTools) }
 }
