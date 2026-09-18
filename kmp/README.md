@@ -69,4 +69,6 @@ The native SDK is currently available on Android and desktop. Web and iOS contin
 
 `SpiritNode.open(directory, nickname, local = false)` starts networking. Its suspend methods are `status`, `createMesh`, `pair`, `add`, and `ping`; `close` shuts down the native node and releases its directory. `status().peers` includes `connected`, `lastReceivedAgoMs`, and `lastError`. `pair()` returns the ticket, QR width, dark-module bytes, and lifetime. The wrapper moves blocking FFI calls to its IO dispatcher.
 
+`pair()` always uses the standard five-minute window. Only the CLI can configure a different ticket lifetime with `node pair --ttl-seconds` (1 to 3600); the Kotlin contract deliberately stays minimal until storage work revisits the SDK surface.
+
 Android integrations must call `AndroidNodeContext.initialize(applicationContext)` before opening any node. This installs a process-lifetime JNI reference used by iroh to read the system DNS configuration. The demo does this before starting the native runtime. The SDK requires internet and network-state permissions; the demo additionally requests camera permission for scanning.

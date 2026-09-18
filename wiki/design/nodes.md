@@ -96,7 +96,7 @@ Connectivity is in-memory state measured using a monotonic clock. Only a validat
 
 Membership snapshots, enrollment messages, pings, and pongs all count. Unauthenticated traffic and malformed messages do not make a device connected. Heartbeat timeouts are recorded as errors, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
 
-`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. Pairing returns the original ticket plus QR modules generated from those exact bytes.
+`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. Pairing returns the original ticket plus QR modules generated from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a configurable ticket lifetime, keeping the embedded contract minimal.
 
 The Android JNI initialization holds the application context in a global reference for the process lifetime and installs it once before constructing an iroh endpoint. This lifetime is required by iroh's DNS integration; a temporary activity reference must never be substituted. Device identity is stored in Android's non-backup directory so OS backup restoration does not duplicate an endpoint identity onto another phone.
 
