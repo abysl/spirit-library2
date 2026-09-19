@@ -1,10 +1,17 @@
 # spirit2 — CLI user stories
 
-spirit2 is a line-by-line reimplementation of `../spirit`, built one user
-story at a time so each piece is understood before the next lands. Every
-story lists the commands a user runs, what they see, and the tests that
-prove it. Markers follow the spirit spec: **[built]**, **[partial]**,
+Spirit2 is a smaller successor informed by `../spirit`, not a line-by-line
+reimplementation of its architecture or roadmap. The first shared-storage
+milestone keeps immutable whole files and application-owned references while
+excluding the original record, transform, broad mesh, and platform ambitions.
+Every story lists the commands a user runs, what they see, and the tests that
+prove it. Markers describe Spirit2 itself: **[built]**, **[partial]**,
 **[planned]**.
+
+The bounded AFM and Kai target is defined in the
+[SPIRIT-01 plan](../../plans/spirit-01-immutable-whole-file/plan.md). Legacy
+Spirit documentation is design history unless a Spirit2 plan deliberately
+adopts part of it.
 
 The binary is `spirit`, built from the `spirit-cli` crate. The store lives
 at `--store <dir>`, else `$SPIRIT_STORE`, else `~/.spirit2/store`. The
@@ -78,23 +85,13 @@ holding it in memory; `blob get --out` verifies while it streams. The
 `Blobs` API gains a reader form. Motivated by flac and video, the content
 spirit was designed for.
 
-## Small blobs: a note for the record layer **[planned]**
+## Small blobs and records **[deferred]**
 
-Every record (CIR, TDR, attestation, collection op) is a blob of a few
-hundred bytes. Once records exist the store's blob count is dominated by
-them while its bytes stay dominated by media. A flat file per record costs
-an inode and a 4 KiB block each and one fsync per put; SQLite reads blobs
-under ~100 KB faster than the filesystem and commits a batch in one
-transaction. Large blobs stay as `<store>/<hex>` files regardless: iroh
-serves them in place, streaming verification wants files, and `cat` works.
-
-Decision deferred until records land and a realistic import (the agni card
-catalog) gives a size distribution to measure. If it goes the expected way,
-a `SqliteBlobs` backend for blobs under a threshold sits behind the same
-`put`/`get`/`has`, the `Blobs` trait returns with its second real
-implementation, and the local index lives in the same file. A SQLite
-backend is also most of a web store: `sqlite-wasm` over OPFS is the most
-mature persistent storage a browser offers.
+The legacy Spirit design used CIR, TDR, attestation, and collection records.
+Those records, a small-blob SQLite tier, a local semantic index, and a browser
+store are not part of the first AFM and Kai milestone. Revisit them only from a
+separate consumer need; do not treat them as implied follow-ups to blob import
+and fetch.
 
 ## 4. Private device mesh **[built]**
 
