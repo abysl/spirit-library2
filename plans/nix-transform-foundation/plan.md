@@ -1,5 +1,8 @@
 # Nix transform foundation
 
+Status: deferred outside the immutable whole-file AFM and Kai milestone. This
+plan remains design history and does not gate SPIRIT-01 through SPIRIT-09.
+
 ## Goal
 
 Define the first immutable Spirit2 transform document for a Nix-backed archive-to-asset pipeline.

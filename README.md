@@ -12,6 +12,20 @@ Spirit2 is organized by implementation dependency.
 
 Consumers such as AFM use `kmp/sdk` through its Gradle project and use `rust` through the CLI or native bindings.
 
+## First shared-storage milestone
+
+The first AFM and Kai milestone is one immutable whole file shared across
+three paired devices: a Linux CLI importer, Android AFM through Kotlin and
+UniFFI, and native Linux Kai through the Rust SDK. AFM owns file names and
+paths, Kai owns asset meaning, and Spirit2 owns only verified content-addressed
+bytes and their placement. The [SPIRIT-01 plan](plans/spirit-01-immutable-whole-file/plan.md)
+defines the acceptance run and the boundary with later retention and capacity
+cards.
+
+This milestone does not adopt the original Spirit project's record system,
+transforms, automatic full-mesh replication, erasure coding, mutable file sync,
+or extra platform targets.
+
 ## Private mesh CLI
 
 Build from `rust/` with `cargo build --release -p spirit-cli`. The binary is `target/release/spirit`.
