@@ -87,7 +87,7 @@ fun MeshPanel(node: MeshNode) {
             Button(enabled = ready && ticket.isNotBlank(), onClick = { enroll(ticket) }) { Text("Add device") }
             HorizontalDivider()
             Text("Devices", style = MaterialTheme.typography.titleLarge)
-            Text("Heartbeats every 5 seconds. Devices turn red on error or after 60 seconds without a message.", style = MaterialTheme.typography.bodySmall)
+            Text("Heartbeats every 5 seconds. Devices turn red without a valid ping or pong for 60 seconds.", style = MaterialTheme.typography.bodySmall)
             if (snapshot?.peers.isNullOrEmpty()) { Text("No other devices yet. Scan a device's pairing QR to add it.") }
             snapshot?.peers?.sortedWith(compareBy<MeshPeer> { it.name }.thenBy { it.id })?.forEach { peer ->
                 key(peer.id) {

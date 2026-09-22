@@ -140,7 +140,7 @@ async fn outsiders_cannot_ping_and_one_process_owns_a_node() {
 }
 
 #[tokio::test]
-async fn heartbeat_reports_disconnect_and_recovery_without_manual_pings() {
+async fn heartbeat_errors_preserve_presence_until_recovery() {
     let (a_dir, _) = initialized("a");
     let (b_dir, b_id) = initialized("b");
     Node::create_mesh(a_dir.path(), "personal").unwrap();
@@ -149,18 +149,23 @@ async fn heartbeat_reports_disconnect_and_recovery_without_manual_pings() {
     a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
         .await
         .unwrap();
-    assert!(a.peers()[0].connected);
-    assert!(b.peers()[0].connected);
-    b.shutdown().await.unwrap();
-    drop(b);
     tokio::time::timeout(Duration::from_secs(12), async {
-        while a.peers()[0].connected {
+        while !a.peers()[0].connected || !b.peers()[0].connected {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .unwrap();
-    assert!(a.peers()[0].last_error.is_some());
+    b.shutdown().await.unwrap();
+    drop(b);
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while a.peers()[0].last_error.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(a.peers()[0].connected);
     let b = local(&b_dir).await;
     assert_eq!(b.info().id, b_id);
     tokio::time::timeout(Duration::from_secs(12), async {

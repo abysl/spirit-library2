@@ -55,7 +55,7 @@ To enroll a CLI node from the app:
 3. Scan that code in the app, or paste its ticket and select **Add device**.
 4. The new member appears in Devices. Select **Ping** to request a pong.
 
-A green dot means a valid message was received within the last 60 seconds and no error has occurred since. A red dot means never heard from, connection/request failure, or more than 60 seconds of silence. A later valid message restores green. Enrollment and membership messages count as well as pings and pongs. The list refreshes once per second; Rust sends a heartbeat to each member every five seconds, including CLI nodes. Membership and presence are separate: disconnected members stay listed.
+A green dot means an authenticated valid ping or pong was received from that member less than 60 seconds ago. A red dot means never heard from or 60 seconds of silence. Connection and request failures remain available as diagnostics without changing a green dot; a later valid ping or pong clears the diagnostic. Enrollment and membership messages do not count. The list refreshes once per second; Rust sends a heartbeat to each member every five seconds, including CLI nodes. Membership and presence are separate: disconnected members stay listed.
 
 ### State and lifecycle
 
