@@ -47,6 +47,7 @@ class PairingSession(
     )
 
     private val operations = Mutex()
+    private val actions = Mutex()
     private val samples = Mutex()
     private val mutableState = MutableStateFlow(PairingState())
     private var node: MeshNode? = null
@@ -83,7 +84,7 @@ class PairingSession(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
-            mutableState.update { it.copy(loading = false, error = "Could not open node") }
+            mutableState.update { it.copy(loading = false, error = OPEN_ERROR) }
         } finally {
             withContext(NonCancellable) {
                 operations.withLock {
@@ -92,46 +93,70 @@ class PairingSession(
                     opened = null
                     runCatching { closing?.shutdown() }
                 }
+                samples.withLock { peerSamples = emptyList() }
+                ticketExpiresAtMillis = null
+                mutableState.update {
+                    it.copy(
+                        loading = false,
+                        peers = emptyList(),
+                        invitation = null,
+                        invitationSecondsRemaining = 0,
+                        busy = false,
+                    )
+                }
             }
         }
     }
 
     suspend fun refreshTicket() {
-        perform("Could not create pairing ticket") { activeNode ->
-            val generationStartedAt = nowMillis()
-            val invitation = activeNode.pair()
-            val expiresAt = generationStartedAt + invitation.lifetimeSeconds.coerceAtLeast(0) * 1_000L
+        if (!beginAction()) return
+        try {
+            val invitation = withActiveNode { activeNode ->
+                val generationStartedAt = nowMillis()
+                val created = activeNode.pair()
+                created to generationStartedAt
+            }
+            val expiresAt = invitation.second + invitation.first.lifetimeSeconds.coerceAtLeast(0) * 1_000L
             ticketExpiresAtMillis = expiresAt
             offeredInitialTicket = true
             mutableState.update {
                 it.copy(
-                    invitation = invitation,
+                    invitation = invitation.first,
                     invitationSecondsRemaining = remainingSeconds(expiresAt),
                     error = null,
                     notice = null,
                 )
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            mutableState.update { it.copy(error = TICKET_ERROR) }
+        } finally {
+            finishAction()
         }
     }
 
     suspend fun pair(value: String) {
-        val ticket = value.trim()
-        when {
-            !isTicketSyntax(ticket) -> {
-                mutableState.update { it.copy(error = "Enter a valid pairing ticket", notice = null) }
-                return
+        if (!beginAction()) return
+        try {
+            val ticket = value.trim()
+            when {
+                !isTicketSyntax(ticket) -> {
+                    mutableState.update { it.copy(error = INVALID_TICKET_ERROR, notice = null) }
+                    return
+                }
+                state.value.invitation?.ticket == ticket -> {
+                    mutableState.update { it.copy(error = OWN_TICKET_ERROR, notice = null) }
+                    return
+                }
             }
-            state.value.invitation?.ticket == ticket -> {
-                mutableState.update { it.copy(error = "This pairing ticket belongs to this device", notice = null) }
-                return
+            val addedName = withActiveNode { activeNode ->
+                if (activeNode.status().meshName == null) {
+                    activeNode.createMesh(meshName)
+                    mutableState.update { it.copy(meshName = meshName) }
+                }
+                activeNode.add(ticket)
             }
-        }
-        perform("Could not add device. Independent meshes cannot merge.") { activeNode ->
-            if (state.value.meshName == null) {
-                activeNode.createMesh(meshName)
-                mutableState.update { it.copy(meshName = meshName) }
-            }
-            val addedName = activeNode.add(ticket)
             ticketExpiresAtMillis = null
             mutableState.update {
                 it.copy(
@@ -141,25 +166,38 @@ class PairingSession(
                     notice = "Added $addedName",
                 )
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            mutableState.update { it.copy(error = ADD_ERROR) }
+        } finally {
+            finishAction()
         }
     }
 
     fun reportError(message: String) {
-        val safeMessage = message.trim().takeIf { it.isNotEmpty() && !it.contains("spirit1") } ?: "Operation failed"
+        val safeMessage = message.trim().takeIf { it.isNotEmpty() && !it.contains(TICKET_PREFIX) } ?: "Operation failed"
         mutableState.update { it.copy(error = safeMessage, notice = null) }
     }
 
     private suspend fun poll() {
-        val snapshot = try {
-            withContext(NonCancellable) { operations.withLock { node?.status() } }
+        val offeredTicket = try {
+            operations.withLock {
+                currentCoroutineContext().ensureActive()
+                val activeNode = node ?: return
+                val snapshot = withContext(NonCancellable) { activeNode.status() }
+                acceptSnapshot(snapshot)
+                !offeredInitialTicket
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Throwable) {
-            mutableState.update { it.copy(loading = false, error = "Could not read node status") }
+            mutableState.update {
+                if (it.error == null || it.error == POLL_ERROR) it.copy(loading = false, error = POLL_ERROR) else it.copy(loading = false)
+            }
             return
-        } ?: return
-        acceptSnapshot(snapshot)
-        if (!offeredInitialTicket) refreshTicket()
+        }
+        if (offeredTicket) refreshTicket()
     }
 
     private suspend fun acceptSnapshot(snapshot: NodeStatus) {
@@ -184,7 +222,7 @@ class PairingSession(
                 peers = devicesAt(observedAtMillis, distinctPeers.values),
                 invitation = if (joinedMesh) null else it.invitation,
                 invitationSecondsRemaining = if (joinedMesh) 0 else it.invitationSecondsRemaining,
-                error = null,
+                error = if (it.error == POLL_ERROR) null else it.error,
                 notice = if (joinedMesh) "Joined ${snapshot.meshName}" else it.notice,
             )
         }
@@ -197,7 +235,7 @@ class PairingSession(
             val now = nowMillis()
             val expiresAt = ticketExpiresAtMillis
             val invitationExpired = expiresAt != null && now >= expiresAt
-            if (invitationExpired) ticketExpiresAtMillis = null
+            if (invitationExpired && ticketExpiresAtMillis == expiresAt) ticketExpiresAtMillis = null
             mutableState.update {
                 it.copy(
                     peers = devicesAt(now, currentSamples),
@@ -208,27 +246,41 @@ class PairingSession(
         }
     }
 
-    private suspend fun perform(error: String, block: suspend (MeshNode) -> Unit) {
+    private suspend fun beginAction(): Boolean {
+        currentCoroutineContext().ensureActive()
+        if (!actions.tryLock()) return false
         mutableState.update { it.copy(busy = true, error = null, notice = null) }
-        try {
-            withContext(NonCancellable) {
-                operations.withLock {
-                    val activeNode = node ?: throw IllegalStateException()
-                    block(activeNode)
-                }
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            mutableState.update { it.copy(error = error) }
-        } finally {
-            mutableState.update { it.copy(busy = false) }
+        return true
+    }
+
+    private fun finishAction() {
+        mutableState.update { it.copy(busy = false) }
+        actions.unlock()
+    }
+
+    private suspend fun <T> withActiveNode(block: suspend (MeshNode) -> T): T {
+        currentCoroutineContext().ensureActive()
+        return operations.withLock {
+            currentCoroutineContext().ensureActive()
+            val activeNode = node ?: throw IllegalStateException()
+            withContext(NonCancellable) { block(activeNode) }
         }
     }
 
     private fun devicesAt(now: Long, peers: Collection<PeerSample>): List<DeviceStatus> = peers.map { peer ->
-        val age = peer.receivedAgoMs?.let { max(0, it) + max(0, now - peer.observedAtMillis) }
-        DeviceStatus(peer.id, peer.name, age != null && age < PRESENCE_LIMIT_MILLIS)
+        DeviceStatus(peer.id, peer.name, receivedWithinPresenceWindow(peer, now))
+    }
+
+    private fun receivedWithinPresenceWindow(peer: PeerSample, now: Long): Boolean {
+        val receivedAgoMs = peer.receivedAgoMs ?: return false
+        if (receivedAgoMs < 0 || receivedAgoMs >= PRESENCE_LIMIT_MILLIS) return false
+        return elapsedSince(peer.observedAtMillis, now) < PRESENCE_LIMIT_MILLIS - receivedAgoMs
+    }
+
+    private fun elapsedSince(observedAtMillis: Long, now: Long): Long {
+        if (now <= observedAtMillis) return 0
+        val elapsed = now - observedAtMillis
+        return if (elapsed < 0) Long.MAX_VALUE else elapsed
     }
 
     private fun remainingSeconds(expiresAtMillis: Long): Int =
@@ -248,5 +300,11 @@ class PairingSession(
         const val PRESENCE_LIMIT_MILLIS = 60_000L
         const val MAX_TICKET_BYTES = 8_192
         const val TICKET_PREFIX = "spirit1"
+        const val OPEN_ERROR = "Could not open node"
+        const val POLL_ERROR = "Could not read node status"
+        const val TICKET_ERROR = "Could not create pairing ticket"
+        const val INVALID_TICKET_ERROR = "Enter a valid pairing ticket"
+        const val OWN_TICKET_ERROR = "This pairing ticket belongs to this device"
+        const val ADD_ERROR = "Could not add device. Independent meshes cannot merge."
     }
 }

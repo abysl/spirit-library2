@@ -118,9 +118,11 @@ class PairingSessionTest {
         first.cancel()
         gate.complete(Unit)
         runCurrent()
-        assertEquals(listOf("spirit1first", "spirit1second"), node.adds)
+        assertEquals(listOf("spirit1first"), node.adds)
 
         running.cancelAndJoin()
+        assertTrue(session.state.value.peers.isEmpty())
+        assertNull(session.state.value.invitation)
         assertEquals(1, node.shutdowns)
     }
 
@@ -144,6 +146,72 @@ class PairingSessionTest {
         val session = PairingSession({ throw IllegalStateException() }, "personal") { 0L }
 
         session.run()
+
+    @Test
+    fun `scanner errors survive successful polls until the next action`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        session.reportError("Camera permission denied")
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals("Camera permission denied", session.state.value.error)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `pair reads mesh membership while holding the native operation lock`() = runTest {
+        val node = FakeNode(meshName = null)
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        node.snapshot = node.snapshot.copy(meshName = "joined")
+
+        session.pair("spirit1member")
+
+        assertTrue(node.createdMeshes.isEmpty())
+        assertEquals(listOf("spirit1member"), node.adds)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `cancelled queued action does not reach the native node`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        val pollGate = CompletableDeferred<Unit>()
+        node.statusGate = pollGate
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        val action = backgroundScope.async { session.pair("spirit1cancelled") }
+        runCurrent()
+        action.cancel()
+        pollGate.complete(Unit)
+        runCurrent()
+
+        assertTrue(node.adds.isEmpty())
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `invalid or overflowing received ages are offline`() = runTest {
+        var now = 0L
+        val node = FakeNode(peerAge = -1)
+        val session = PairingSession({ node }, "personal") { now }
+        val running = start(session)
+
+        assertFalse(session.state.value.peers.single().online)
+        node.snapshot = node.snapshot.copy(peers = listOf(NodePeer("peer", "peer", true, 1, null)))
+        node.statusFailure = IllegalStateException()
+        now = Long.MAX_VALUE
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertFalse(session.state.value.peers.single().online)
+        running.cancelAndJoin()
+    }
 
         assertFalse(session.state.value.loading)
         assertEquals("Could not open node", session.state.value.error)
