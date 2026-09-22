@@ -6,10 +6,10 @@ import kotlin.test.assertTrue
 
 class MeshPeerTest {
     @Test
-    fun errors_are_visible_even_with_a_recent_message() {
-        val peer = MeshPeer("id", "desktop", false, 10, "connection refused")
+    fun errors_are_visible_without_disconnecting_a_recently_heartbeating_peer() {
+        val peer = MeshPeer("id", "desktop", true, 10, "connection refused")
         assertTrue(peer.connectionLabel().contains("connection refused"))
-        assertTrue(peer.connectionLabel().startsWith("Disconnected"))
+        assertTrue(peer.connectionLabel().startsWith("Connected"))
     }
 
     @Test

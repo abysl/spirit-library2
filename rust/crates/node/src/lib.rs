@@ -265,7 +265,6 @@ impl Node {
             "enrollment did not admit the expected device"
         );
         self.shared.merge(&joined, member.id)?;
-        self.shared.received(member.id);
         Ok(member)
     }
 

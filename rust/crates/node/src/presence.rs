@@ -21,7 +21,7 @@ pub(crate) struct Presence {
 }
 
 impl Presence {
-    pub fn received(&mut self, now: Instant) {
+    pub fn heartbeat_received(&mut self, now: Instant) {
         self.received = Some(now);
         self.error = None;
     }
@@ -31,10 +31,8 @@ impl Presence {
     }
 
     fn connected(&self, now: Instant) -> bool {
-        self.error.is_none()
-            && self
-                .received
-                .is_some_and(|received| now.saturating_duration_since(received) <= CONNECTED_WINDOW)
+        self.received
+            .is_some_and(|received| now.saturating_duration_since(received) < CONNECTED_WINDOW)
     }
 
     pub fn status(&self, id: NodeId, name: String, now: Instant) -> PeerStatus {
@@ -55,25 +53,32 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
 
     #[test]
-    fn unknown_then_received_then_stale() {
+    fn unknown_then_received_then_stale_at_the_strict_boundary() {
         let start = Instant::now();
         let mut presence = Presence::default();
         assert!(!presence.connected(start));
-        presence.received(start);
-        assert!(presence.connected(start + Duration::from_secs(60)));
-        assert!(!presence.connected(start + Duration::from_millis(60001)));
+        presence.heartbeat_received(start);
+        assert!(presence.connected(start + Duration::from_millis(59999)));
+        assert!(!presence.connected(start + Duration::from_secs(60)));
     }
 
     #[test]
-    fn errors_disconnect_immediately_and_only_receiving_restores_connection() {
+    fn errors_are_diagnostics_without_shortening_the_heartbeat_window() {
         let start = Instant::now();
         let mut presence = Presence::default();
-        presence.received(start);
+        presence.heartbeat_received(start);
         presence.failed("connection refused".into());
-        assert!(!presence.connected(start + Duration::from_secs(1)));
-        presence.received(start + Duration::from_secs(2));
+        let status = presence.status(
+            SecretKey::generate().public(),
+            "desktop".into(),
+            start + Duration::from_secs(1),
+        );
+        assert!(status.connected);
+        assert_eq!(status.last_error.as_deref(), Some("connection refused"));
+        presence.heartbeat_received(start + Duration::from_secs(2));
         assert!(presence.connected(start + Duration::from_secs(2)));
         assert!(presence.error.is_none());
     }

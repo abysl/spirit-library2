@@ -28,6 +28,7 @@ expect fun openMeshNode(dir: String, nickname: String, local: Boolean = false): 
 expect fun ScanPairingButton(enabled: Boolean, onTicket: (String) -> Unit, onError: (String) -> Unit)
 
 fun MeshPeer.connectionLabel(): String = when {
+    connected && lastError != null -> "Connected · last error $lastError"
     connected -> "Connected"
     lastError != null -> "Disconnected · $lastError"
     lastReceivedAgoMs == null -> "Disconnected · waiting for a message"

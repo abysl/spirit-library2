@@ -47,13 +47,13 @@ pub(crate) struct EnrollmentReply {
 }
 
 impl Shared {
-    pub fn received(&self, id: NodeId) {
+    pub fn heartbeat_received(&self, id: NodeId) {
         self.presence
             .lock()
             .unwrap()
             .entry(id)
             .or_default()
-            .received(Instant::now());
+            .heartbeat_received(Instant::now());
     }
 
     fn failed(&self, id: NodeId, error: &anyhow::Error) {
@@ -75,10 +75,9 @@ impl Shared {
         }
     }
 
-    fn record<T>(&self, id: NodeId, result: &Result<T>) {
-        match result {
-            Ok(_) => self.received(id),
-            Err(error) => self.failed(id, error),
+    fn record_failure<T>(&self, id: NodeId, result: &Result<T>) {
+        if let Err(error) = result {
+            self.failed(id, error);
         }
     }
 
@@ -92,7 +91,10 @@ impl Shared {
             Ok(start.elapsed().as_millis())
         }
         .await;
-        self.record(id, &result);
+        match &result {
+            Ok(_) => self.heartbeat_received(id),
+            Err(error) => self.failed(id, error),
+        }
         result
     }
 
@@ -175,7 +177,7 @@ impl Shared {
             self.merge(&response, id)
         }
         .await;
-        self.record(id, &result);
+        self.record_failure(id, &result);
         result
     }
 
@@ -196,7 +198,6 @@ impl Shared {
         );
         self.merge(&request.snapshot, remote)?;
         *pending = None;
-        self.received(remote);
         self.snapshot()
     }
 }
@@ -274,13 +275,12 @@ impl Protocol {
                 );
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
                 self.shared.merge(&snapshot, remote)?;
-                self.shared.received(remote);
                 serde_json::to_vec(&self.shared.snapshot()?)?
             }
             Kind::Ping => {
                 let request: String = serde_json::from_slice(&bytes)?;
                 ensure!(request == "ping", "invalid ping");
-                self.shared.received(remote);
+                self.shared.heartbeat_received(remote);
                 serde_json::to_vec("pong")?
             }
         };
@@ -385,6 +385,50 @@ mod tests {
         c.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_valid_ping_and_pong_messages_refresh_presence() {
+        let (a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        a.new_mesh("one").unwrap();
+        let b_id = b.info().id;
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(!a.peers()[0].connected);
+        assert!(a.peers()[0].last_received_ago_ms.is_none());
+        assert!(!b.peers()[0].connected);
+        assert!(b.peers()[0].last_received_ago_ms.is_none());
+
+        a.shared.sync(b.shared.endpoint.addr()).await.unwrap();
+        assert!(a.peers()[0].last_received_ago_ms.is_none());
+        assert!(b.peers()[0].last_received_ago_ms.is_none());
+
+        let invalid: Result<String> = a
+            .shared
+            .request(b.shared.endpoint.addr(), PING_ALPN, &"not ping")
+            .await;
+        assert!(invalid.is_err());
+        assert!(a.peers()[0].last_received_ago_ms.is_none());
+        assert!(b.peers()[0].last_received_ago_ms.is_none());
+
+        a.ping(b_id).await.unwrap();
+        assert!(a.peers()[0].connected);
+        assert!(a.peers()[0].last_received_ago_ms.is_some());
+        assert!(b.peers()[0].connected);
+        assert!(b.peers()[0].last_received_ago_ms.is_some());
+
+        a.shutdown().await.unwrap();
+        drop(a);
+        let a = Node::bind(a_dir.path(), NodeConfig::local()).await.unwrap();
+        a.gossip.abort();
+        assert!(!a.peers()[0].connected);
+        assert!(a.peers()[0].last_received_ago_ms.is_none());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     #[tokio::test]
