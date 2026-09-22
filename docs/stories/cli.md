@@ -25,7 +25,7 @@ never share a directory while spirit is live.
 | `spirit-core` | `rust/crates/core/` | the primitives; today the blob store. Private modules, a curated `pub use` list in `lib.rs` |
 | `spirit-sdk` | `rust/crates/sdk/` | the public surface: re-exports what consumers may depend on. Downstream code depends on this crate, never on `spirit-core` directly |
 | `spirit-cli` | `rust/crates/cli/` | the `spirit` binary: clap types and `run()`, a consumer of `spirit-sdk` like any other |
-| `spirit-ffi` | `rust/crates/ffi/` | the uniffi boundary over `spirit-sdk`: a `cdylib`/`staticlib` with `String` hashes and a flat error enum, from which Kotlin, Swift and Python bindings are generated. Not part of the sdk crate because `crate-type` is crate-level, uniffi must not be a dependency of Rust consumers, and its type vocabulary is an adapter over the sdk, not the sdk |
+| `spirit-ffi` | `rust/crates/ffi/` | the uniffi boundary over `spirit-sdk`: a `cdylib`/`staticlib` with `String` hashes and a flat error enum, from which Kotlin, and Swift bindings are generated. Not part of the sdk crate because `crate-type` is crate-level, uniffi must not be a dependency of Rust consumers, and its type vocabulary is an adapter over the sdk, not the sdk |
 | (Gradle) `spirit-sdk` | independent `spirit2/kmp` project | the Kotlin Multiplatform library (`blue.rae.spirit:spirit-sdk`, jvm + android): generated bindings plus a hand-written idiomatic wrapper |
 | (Gradle) `demo` | `spirit2/kmp/demo` | the Compose Multiplatform demo app consuming its parent SDK project as a composite build; a put/get panel on desktop and Android, "not available" on web |
 
