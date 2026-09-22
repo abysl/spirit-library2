@@ -7,22 +7,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.spirit_ffi.SpiritNode as FfiNode
 
-data class NodePeer(
-    val id: String,
-    val name: String,
-    val connected: Boolean,
-    val lastReceivedAgoMs: Long?,
-    val lastError: String?,
-)
-
-data class NodeStatus(val id: String, val name: String, val meshName: String?, val peers: List<NodePeer>)
-data class PairingInvitation(val ticket: String, val width: Int, val modules: ByteArray, val lifetimeSeconds: Int)
-data class NodePong(val name: String, val elapsedMs: Long)
-
 class SpiritNode private constructor(
     private val ffi: FfiNode,
     private val dispatcher: CoroutineDispatcher,
-) : AutoCloseable {
+) : MeshNode, AutoCloseable {
     private val closed = AtomicBoolean(false)
 
     companion object {
@@ -53,26 +41,28 @@ class SpiritNode private constructor(
         block()
     }
 
-    suspend fun status(): NodeStatus = io {
+    override suspend fun status(): NodeStatus = io {
         val status = ffi.status()
         NodeStatus(status.id, status.name, status.meshName, status.peers.map {
             NodePeer(it.id, it.name, it.connected, it.lastReceivedAgoMs?.toLong(), it.lastError)
         })
     }
 
-    suspend fun createMesh(name: String) = io { ffi.createMesh(name) }
+    override suspend fun createMesh(name: String) = io { ffi.createMesh(name) }
 
-    suspend fun pair(): PairingInvitation = io {
+    override suspend fun pair(): PairingInvitation = io {
         val code = ffi.pair()
         PairingInvitation(code.ticket, code.width.toInt(), code.modules, code.lifetimeSeconds.toInt())
     }
 
-    suspend fun add(ticket: String): String = io { ffi.add(ticket.trim()) }
+    override suspend fun add(ticket: String): String = io { ffi.add(ticket.trim()) }
 
-    suspend fun ping(device: String): NodePong = io {
+    override suspend fun ping(device: String): NodePong = io {
         val pong = ffi.ping(device)
         NodePong(pong.name, pong.elapsedMs.toLong())
     }
+
+    override suspend fun shutdown() = withContext(NonCancellable + dispatcher) { close() }
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {

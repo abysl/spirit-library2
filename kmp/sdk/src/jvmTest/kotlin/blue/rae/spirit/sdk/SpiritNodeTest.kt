@@ -33,3 +33,31 @@ class SpiritNodeTest {
         }
     }
 }
+
+class SpiritNodeNoIntroducerTest {
+    @Test
+    fun `third node enrolls through a member while the original inviter is offline`() = runBlocking {
+        val aDir = Files.createTempDirectory("spirit-kmp-node-a").toString()
+        val bDir = Files.createTempDirectory("spirit-kmp-node-b").toString()
+        val cDir = Files.createTempDirectory("spirit-kmp-node-c").toString()
+        val b = SpiritNode.open(bDir, "b", local = true)
+        val c = SpiritNode.open(cDir, "c", local = true)
+        val a = SpiritNode.open(aDir, "a", local = true)
+        try {
+            b.createMesh("personal")
+            assertEquals("c", b.add(c.pair().ticket))
+            b.close()
+            assertEquals("a", c.add(a.pair().ticket))
+            assertEquals("a", c.ping("a").name)
+            assertTrue(c.status().peers.any { it.name == "a" })
+        } finally {
+            b.close()
+            c.close()
+            a.close()
+        }
+        SpiritNode.open(cDir, "c", local = true).use { reopened ->
+            assertEquals("personal", reopened.status().meshName)
+            assertTrue(reopened.status().peers.any { it.name == "a" })
+        }
+    }
+}
