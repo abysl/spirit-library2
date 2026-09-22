@@ -6,7 +6,7 @@ The desktop package now has a valid Debian package name, a stable macOS bundle I
 
 ## Validation
 
-- Actionlint and Python compilation pass.
+- Actionlint and build-logic tests pass.
 - The cross-platform native build helper builds the release FFI, generates Kotlin bindings, and archives the Linux CLI successfully.
 - Linux Debian installer and self-contained app directory build successfully.
 - Both JavaScript and WebAssembly production distributions build successfully, with webpack bundle-size warnings.

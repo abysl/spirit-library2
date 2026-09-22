@@ -44,9 +44,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-        with:
-          python-version: '3.13'
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: temurin
@@ -71,7 +68,8 @@ jobs:
           cargo fmt --all --check
           cargo test --workspace --all-features --locked
       - name: Build native library, bindings, and CLI
-        run: python ci/native.py --archive '${{ matrix.target }}'
+        working-directory: kmp
+        run: ./gradlew prepareNative -ParchiveTarget='${{ matrix.target }}' --console=plain --max-workers=2
       - name: Test JVM SDK and app
         working-directory: kmp
         run: ./gradlew :sdk:jvmTest :demo:shared:jvmTest --console=plain --max-workers=2
@@ -135,7 +133,8 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
       - name: Build host library and generate bindings
-        run: python3 ci/native.py
+        working-directory: kmp
+        run: ./gradlew prepareNative --console=plain --max-workers=2
       - name: Build Android native libraries
         working-directory: rust
         run: |
