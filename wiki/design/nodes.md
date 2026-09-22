@@ -92,9 +92,9 @@ The protocol is an initial version intended for small personal meshes. Its autom
 
 ## Connectivity and KMP integration
 
-Connectivity is in-memory state measured using a monotonic clock. Only a validated heartbeat message marks a member as received. A green peer has received an authenticated valid ping or pong from that member less than 60 seconds ago. A transport, protocol, or heartbeat error is retained as a diagnostic without changing green status; a subsequent valid ping or pong clears it. Never-seen peers start red. Restarting clears presence without removing memberships.
+Connectivity is in-memory state measured using a monotonic clock. Only a validated application message marks a member as received. A green peer has received a message no more than 60 seconds ago and has no newer error. A transport, protocol, or heartbeat error marks it red immediately when detected; a subsequent valid received message clears the error. Never-seen peers start red. Restarting clears presence without removing memberships.
 
-Membership snapshots and enrollment messages do not count. Unauthenticated traffic, malformed messages, and sent requests do not make a device connected. Heartbeat timeouts are recorded as diagnostics, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
+Membership snapshots, enrollment messages, pings, and pongs all count. Unauthenticated traffic and malformed messages do not make a device connected. Heartbeat timeouts are recorded as errors, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
 
 `spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. Pairing returns the original ticket plus QR modules generated from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a configurable ticket lifetime, keeping the embedded contract minimal.
 
