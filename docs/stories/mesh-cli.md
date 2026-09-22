@@ -155,4 +155,4 @@ See [the node design](../../wiki/design/nodes.md) for the trust model and protoc
 
 The Android app can scan the QR emitted by `node pair`, and the desktop app can import a PNG/JPEG screenshot of it. Create a mesh in the app, then scan or paste the CLI device's ticket to enroll it. An existing CLI mesh can instead redeem the app's displayed ticket with `mesh add`.
 
-Every running node now sends heartbeats every five seconds. The app shows members as green after receiving a valid message, and red on errors or after more than 60 seconds of silence. See the [KMP pairing guide](../../kmp/README.md#device-pairing-and-presence).
+Every running node now sends heartbeats every five seconds. The app shows members as green after receiving an authenticated valid ping or pong from that member less than 60 seconds ago, and red when no heartbeat has been received or the heartbeat is at least 60 seconds old. Errors remain diagnostics and do not turn a green member red. See the [KMP pairing guide](../../kmp/README.md#device-pairing-and-presence).
