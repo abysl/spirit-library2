@@ -28,4 +28,4 @@ The parent development environment builds the sibling `../rust` FFI crate, gener
 
 The **Devices** tab provides mesh creation, QR pairing, ticket pasting, a connectivity list, and per-device pings. **Blobs** retains the existing local put/get demo. Android scans codes with the camera; desktop imports PNG/JPEG QR images. See [the workspace pairing guide](../README.md#device-pairing-and-presence).
 
-Green means an authenticated valid ping or pong was received from that member less than 60 seconds ago; red means no previous heartbeat or at least 60 seconds of silence. Errors are diagnostics and do not change a green status. Rust heartbeats run every five seconds independently of UI polling.
+Green means a recently received valid message; red means an error, no previous message, or more than 60 seconds of silence. Rust heartbeats run every five seconds independently of UI polling.
