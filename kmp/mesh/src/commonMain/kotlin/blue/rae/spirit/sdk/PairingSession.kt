@@ -81,21 +81,21 @@ class PairingSession(
     suspend fun refreshTicket() {
         if (!beginAction()) return
         try {
-            val (invitation, generationStartedAt) = withActiveNode { activeNode ->
-                val startedAt = nowMillis()
-                activeNode.pair() to startedAt
-            }
-            val expiresAt = generationStartedAt + invitation.lifetimeSeconds.coerceAtLeast(0) * 1_000L
-            tracking.withLock {
-                ticketExpiresAtMillis = expiresAt
-                offeredInitialTicket = true
-                mutableState.update {
-                    it.copy(
-                        invitation = invitation,
-                        invitationSecondsRemaining = remainingSeconds(expiresAt),
-                        error = null,
-                        notice = null,
-                    )
+            withActiveNode { activeNode ->
+                val generationStartedAt = nowMillis()
+                val invitation = activeNode.pair()
+                val expiresAt = generationStartedAt + invitation.lifetimeSeconds.coerceAtLeast(0) * 1_000L
+                tracking.withLock {
+                    ticketExpiresAtMillis = expiresAt
+                    offeredInitialTicket = true
+                    mutableState.update {
+                        it.copy(
+                            invitation = invitation,
+                            invitationSecondsRemaining = remainingSeconds(expiresAt),
+                            error = null,
+                            notice = null,
+                        )
+                    }
                 }
             }
         } catch (cancelled: CancellationException) {
@@ -121,22 +121,22 @@ class PairingSession(
                     return
                 }
             }
-            val addedName = withActiveNode { activeNode ->
+            withActiveNode { activeNode ->
                 if (activeNode.status().meshName == null) {
                     activeNode.createMesh(meshName)
                     tracking.withLock { recordMeshMembership(meshName) }
                 }
-                activeNode.add(ticket)
-            }
-            tracking.withLock {
-                ticketExpiresAtMillis = null
-                mutableState.update {
-                    it.copy(
-                        invitation = null,
-                        invitationSecondsRemaining = 0,
-                        error = null,
-                        notice = "Added $addedName",
-                    )
+                val addedName = activeNode.add(ticket)
+                tracking.withLock {
+                    ticketExpiresAtMillis = null
+                    mutableState.update {
+                        it.copy(
+                            invitation = null,
+                            invitationSecondsRemaining = 0,
+                            error = null,
+                            notice = "Added $addedName",
+                        )
+                    }
                 }
             }
         } catch (cancelled: CancellationException) {
@@ -188,6 +188,7 @@ class PairingSession(
                     invitation = null,
                     invitationSecondsRemaining = 0,
                     busy = false,
+                    notice = null,
                 )
             }
         }

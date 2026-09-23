@@ -153,6 +153,48 @@ class PairingSessionTest {
     }
 
     @Test
+    fun `run cancellation clears a ticket completed before shutdown`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        val pairGate = CompletableDeferred<Unit>()
+        node.pairGate = pairGate
+        val refresh = backgroundScope.async { session.refreshTicket() }
+        runCurrent()
+
+        running.cancel()
+        runCurrent()
+        pairGate.complete(Unit)
+        refresh.join()
+        running.join()
+
+        assertFalse(session.state.value.busy)
+        assertNull(session.state.value.invitation)
+        assertNull(session.state.value.notice)
+        assertEquals(1, node.shutdowns)
+    }
+
+    @Test
+    fun `caller cancellation still reconciles a completed native enrollment`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        val addGate = CompletableDeferred<Unit>()
+        node.addGate = addGate
+        val enrollment = backgroundScope.async { session.pair("spirit1member") }
+        runCurrent()
+
+        enrollment.cancel()
+        addGate.complete(Unit)
+        enrollment.join()
+
+        assertFalse(session.state.value.busy)
+        assertNull(session.state.value.invitation)
+        assertEquals("Added spirit1member", session.state.value.notice)
+        running.cancelAndJoin()
+    }
+
+    @Test
     fun `cancelled opening is cleaned up after the factory returns`() = runTest {
         val opened = CompletableDeferred<MeshNode>()
         val node = FakeNode()
@@ -257,6 +299,7 @@ class PairingSessionTest {
         )
         var statusFailure: Throwable? = null
         var statusGate: CompletableDeferred<Unit>? = null
+        var pairGate: CompletableDeferred<Unit>? = null
         var addGate: CompletableDeferred<Unit>? = null
         var addFailure: Throwable? = null
         var shutdowns = 0
@@ -275,7 +318,10 @@ class PairingSessionTest {
             snapshot = snapshot.copy(meshName = name)
         }
 
-        override suspend fun pair(): PairingInvitation = ticket
+        override suspend fun pair(): PairingInvitation {
+            pairGate?.await()
+            return ticket
+        }
 
         override suspend fun add(ticket: String): String {
             adds += ticket
