@@ -103,7 +103,33 @@ class PairingSessionTest {
     }
 
     @Test
-    fun `operations are serialized and cancellation still closes the node`() = runTest {
+    fun `failed first scan withdraws the receiver ticket once the mesh exists`() = runTest {
+        var now = 0L
+        val node = FakeNode(meshName = null)
+        node.addFailure = IllegalStateException("pairing ticket has expired")
+        val session = PairingSession({ node }, "personal") { now }
+        val running = start(session)
+        assertTrue(session.state.value.invitation != null)
+
+        session.pair("spirit1expired")
+
+        assertEquals(listOf("personal"), node.createdMeshes)
+        assertEquals("personal", session.state.value.meshName)
+        assertNull(session.state.value.invitation)
+        assertEquals(0, session.state.value.invitationSecondsRemaining)
+        assertEquals("Could not add device", session.state.value.error)
+
+        now = 1_000
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertNull(session.state.value.invitation)
+        assertEquals(0, session.state.value.invitationSecondsRemaining)
+
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `a concurrent action is rejected while another is busy and cancellation still closes the node`() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = PairingSession({ node }, "personal") { 0L }
         val running = start(session)
@@ -146,6 +172,9 @@ class PairingSessionTest {
         val session = PairingSession({ throw IllegalStateException() }, "personal") { 0L }
 
         session.run()
+        assertFalse(session.state.value.loading)
+        assertEquals("Could not open node", session.state.value.error)
+    }
 
     @Test
     fun `scanner errors survive successful polls until the next action`() = runTest {
@@ -213,10 +242,6 @@ class PairingSessionTest {
         running.cancelAndJoin()
     }
 
-        assertFalse(session.state.value.loading)
-        assertEquals("Could not open node", session.state.value.error)
-    }
-
     private fun TestScope.start(session: PairingSession) = backgroundScope.launch { session.run() }.also { runCurrent() }
 
     private class FakeNode(
@@ -233,6 +258,7 @@ class PairingSessionTest {
         var statusFailure: Throwable? = null
         var statusGate: CompletableDeferred<Unit>? = null
         var addGate: CompletableDeferred<Unit>? = null
+        var addFailure: Throwable? = null
         var shutdowns = 0
         val createdMeshes = mutableListOf<String>()
         val adds = mutableListOf<String>()
@@ -254,6 +280,7 @@ class PairingSessionTest {
         override suspend fun add(ticket: String): String {
             adds += ticket
             addGate?.await()
+            addFailure?.let { throw it }
             return ticket
         }
 
