@@ -21,18 +21,18 @@ Run commands from this directory:
 
 ```text
 direnv allow
-generate-bindings
-jvm-native
+./gradlew prepareNative --no-configuration-cache
 ./gradlew :mesh:jvmTest
 ./gradlew :sdk:jvmTest
 ./gradlew :demo:shared:jvmTest
 ./gradlew :demo:desktopApp:run
+android-native
 ./gradlew :demo:androidApp:assembleDebug
 ```
 
 The root `devenv.nix` supplies the Android SDK and NDK, Rust targets, JDK 25, Node, Yarn, Binaryen, and the Linux runtime libraries needed by Compose Desktop. It provides `jvm-test`, `unit-test`, `desktop`, `apk`, `install`, and `assemble` convenience commands.
 
-`generate-bindings` and the native build commands compile the sibling Rust workspace. Native output remains under `../rust/target`; the JVM SDK package embeds the release native library as a JNA classpath resource, and Android consumes the JNI library and JNA AAR.
+Native preparation compiles the sibling Rust workspace before the consuming Gradle invocation. Native output remains under `../rust/target`; the JVM SDK package embeds the release native library as a JNA classpath resource, and Android consumes the JNI library and JNA AAR. `prepareNative` builds the host native artifacts and matching UniFFI bindings; `android-native` separately builds the Android ABIs.
 
 ## Device pairing and presence
 
@@ -40,7 +40,7 @@ The root `devenv.nix` supplies the Android SDK and NDK, Rust targets, JDK 25, No
 
 `MeshNode` is the reusable native-node contract. It exposes suspend `status`, `createMesh`, `pair`, `add`, `ping`, and `shutdown` operations using `NodeStatus`, `NodePeer`, `PairingInvitation`, and `NodePong`. `SpiritNode` implements `MeshNode`, retains `AutoCloseable.close`, and provides noncancellable off-main `shutdown` for session cleanup.
 
-`PairingSession(nodeFactory, meshName, nowMillis)` owns exactly one node while `run()` is active. `run()` may be called once per session instance. It publishes `StateFlow<PairingState>`, automatically creates a ticket after its first successful status read, polls status and ages displayed peer samples once per second, serializes node operations and shutdown, and closes a node even when opening or an operation is cancelled. Call `refreshTicket()` for a manual QR refresh, `pair(value)` for a scanned or pasted ticket, and `reportError(message)` for host failures such as camera errors.
+`PairingSession(nodeFactory, meshName, nowMillis)` owns exactly one node while `run()` is active. `run()` may be called once per session instance. It publishes `StateFlow<PairingState>`, automatically creates a ticket after its first successful status read, polls status and ages displayed peer samples once per second, serializes node operations and shutdown, and waits for in-flight opening/actions before closing the node on owner teardown. Call `refreshTicket()` for a manual QR refresh, `pair(value)` for a scanned or pasted ticket, and `reportError(message)` for host failures such as camera errors.
 
 A fresh receiver stays enrollable until it scans a ticket. Its first eligible enrollment attempt creates the requested mesh immediately before enrollment; later scans reuse that mesh. A failed remote enrollment can leave a founder-only mesh in place; the receiver QR is withdrawn as soon as this node enters a mesh. Independent meshes cannot merge. To join an existing mesh, have an existing member scan the fresh receiver's ticket, not the other way around.
 
@@ -73,4 +73,3 @@ devenv shell -- idea .
 ```
 
 Quit existing IntelliJ processes before using this command. The project-local IntelliJ settings use the Gradle wrapper and the devenv-provided Gradle JVM.
-
