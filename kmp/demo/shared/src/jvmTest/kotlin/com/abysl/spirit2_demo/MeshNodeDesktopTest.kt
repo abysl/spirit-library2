@@ -18,8 +18,10 @@ class MeshNodeDesktopTest {
             first.createMesh("personal")
             first.add(second.pair().ticket)
             val peer = first.status().peers.single()
-            assertTrue(peer.connected)
+            assertEquals("phone", peer.name)
             assertTrue(first.ping(peer.id).contains("Pong from phone"))
+            assertTrue(first.status().peers.single().connected)
+            assertTrue(second.status().peers.single().connected)
         } finally {
             first.close()
             second.close()
