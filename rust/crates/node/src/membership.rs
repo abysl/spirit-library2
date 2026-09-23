@@ -277,8 +277,20 @@ mod tests {
             founder: None,
             admissions: Vec::new(),
         };
-        old.admissions
-            .push(Admission::signed(&old, member(&root, "root"), &root).unwrap());
+        let root_member = member(&root, "root");
+        let legacy_payload = postcard::to_stdvec(&(
+            "spirit/mesh/admission/1",
+            root.public(),
+            "private",
+            &root_member,
+            root.public(),
+        ))
+        .unwrap();
+        old.admissions.push(Admission {
+            member: root_member,
+            issuer: root.public(),
+            signature: URL_SAFE_NO_PAD.encode(root.sign(&legacy_payload).to_bytes()),
+        });
         let stored = serde_json::to_value(&old).unwrap();
         assert!(stored.get("founder").is_none());
         assert_eq!(stored["id"], root.public().to_string());
@@ -286,6 +298,19 @@ mod tests {
         reopened.verify().unwrap();
         reopened.admit(member(&child, "child"), &root).unwrap();
         reopened.verify().unwrap();
+        let child_member = member(&child, "child");
+        let legacy_child_payload = postcard::to_stdvec(&(
+            "spirit/mesh/admission/1",
+            root.public(),
+            "private",
+            &child_member,
+            root.public(),
+        ))
+        .unwrap();
+        assert_eq!(
+            reopened.admissions[1].signature,
+            URL_SAFE_NO_PAD.encode(root.sign(&legacy_child_payload).to_bytes()),
+        );
         assert_eq!(reopened.id.to_string(), root.public().to_string());
         let mut invalid = reopened.clone();
         invalid.founder = Some(root.public());
