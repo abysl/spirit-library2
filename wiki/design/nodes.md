@@ -4,9 +4,11 @@
 
 Each device has an Ed25519 keypair. Its public key is its iroh endpoint ID. A nickname defaults to the hostname at initialization and is stored with the identity. Nicknames are display and lookup names, not authentication credentials. Duplicate nicknames are allowed; a CLI operation targeting an ambiguous nickname requires a full device ID.
 
-A mesh is anchored by its founding device's public key, which is also the mesh ID. The founder signs its initial admission. Every member can sign admissions for additional devices. An admission binds the mesh ID, mesh name, member ID, member nickname, and issuer ID. The signed bytes are the Postcard encoding of the tuple `("spirit/mesh/admission/1", mesh_id, mesh_name, member, issuer)` in that order. The signature is Ed25519, encoded with unpadded URL-safe base64.
+A new mesh receives a cryptographically random 32-byte `MeshId`, independent of every device key. Its canonical text form is `mesh1_` followed by unpadded URL-safe base64. The founder is recorded separately and signs its initial admission; every member can sign admissions for additional devices without the founder remaining online. The signed bytes are the Postcard encoding of the tuple `("spirit/mesh/admission/2", mesh_id_bytes, founder_id, mesh_name, member, issuer)` in that order. The signature is Ed25519, encoded with unpadded URL-safe base64. Mesh-level authorization still requires validated membership evidence: possession of a mesh ID is not a credential, and this change does not introduce roles or administrative privileges.
 
-A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admission subjects and conflicting names are rejected. Existing local admissions are retained when merging, making independent enrollments converge by device ID.
+Existing meshes retain their original founder-key IDs and version-1 admission signatures, with no `founder` field. Their signed tuple remains `("spirit/mesh/admission/1", mesh_id, mesh_name, member, issuer)`. They remain readable and can admit more members; they are not silently migrated because changing an ID would invalidate signed membership on other devices. New-format meshes require upgraded clients. Older clients reject their IDs and admissions; the unchanged pairing and sync ALPNs do not negotiate a downgrade. Rebuild native libraries together with their UniFFI bindings when upgrading.
+
+A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admission subjects and conflicting names are rejected. Existing local admissions are retained when merging, making independent enrollments converge by device ID. Merges must agree on mesh ID, mesh name, and founder; matching display names alone never join independent meshes.
 
 A member proves ownership of its admitted key through the iroh connection. Nicknames, network addresses, and the presence of a node ID in an unsigned list cannot authorize a pong.
 
@@ -63,7 +65,7 @@ The CLI contacts the service through a loopback TCP listener authenticated by a 
 
 ## Rust API
 
-Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types are `Node`, `NodeConfig`, `NodeId`, `NodeInfo`, `Member`, and `Pong`.
+Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types include `Node`, `NodeConfig`, `NodeId`, `MeshId`, `NodeInfo`, `Member`, and `Pong`. `NodeInfo.mesh_id` is an optional `MeshId`, not a `NodeId`; `mesh status` prints it separately from the mesh name.
 
 - `Node::init(directory, nickname)` creates or reopens an identity.
 - `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
@@ -96,7 +98,7 @@ Connectivity is in-memory state measured using a monotonic clock. Only a validat
 
 Membership snapshots and enrollment messages do not count. Unauthenticated traffic, malformed messages, and sent requests do not make a device connected. Heartbeat timeouts are recorded as diagnostics, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
 
-`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. Pairing returns the original ticket plus QR modules generated from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a configurable ticket lifetime, keeping the embedded contract minimal.
+`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. `MeshStatus.mesh_id`, `NodeStatus.meshId`, and `PairingState.meshId` expose mesh identity separately from device identity. Pairing returns the original ticket plus QR modules generated from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a configurable ticket lifetime, keeping the embedded contract minimal.
 
 The Android JNI initialization holds the application context in a global reference for the process lifetime and installs it once before constructing an iroh endpoint. This lifetime is required by iroh's DNS integration; a temporary activity reference must never be substituted. Device identity is stored in Android's non-backup directory so OS backup restoration does not duplicate an endpoint identity onto another phone.
 
