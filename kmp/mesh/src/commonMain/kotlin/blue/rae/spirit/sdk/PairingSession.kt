@@ -32,6 +32,7 @@ data class PairingState(
     val busy: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
+    val meshId: String? = null,
 )
 
 class PairingSession(
@@ -227,6 +228,7 @@ class PairingSession(
                     loading = false,
                     nodeId = snapshot.id,
                     name = snapshot.name,
+                    meshId = snapshot.meshId,
                     peers = devicesAt(observedAtMillis, samples),
                     error = if (it.error == POLL_ERROR) null else it.error,
                     notice = if (joinedMesh) "Joined ${snapshot.meshName}" else it.notice,

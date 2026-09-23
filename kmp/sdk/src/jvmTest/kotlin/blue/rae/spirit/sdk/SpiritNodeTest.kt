@@ -14,8 +14,11 @@ class SpiritNodeTest {
         val secondDir = Files.createTempDirectory("spirit-kmp-node-b").toString()
         val first = SpiritNode.open(firstDir, "desktop", local = true)
         val second = SpiritNode.open(secondDir, "phone", local = true)
-        try {
+        val meshId = try {
             first.createMesh("personal")
+            val createdId = first.status().meshId ?: error("mesh ID is missing")
+            assertTrue(createdId.startsWith("mesh1_"))
+            assertTrue(createdId != first.status().id)
             val code = second.pair()
             assertTrue(code.ticket.startsWith("spirit1"))
             assertEquals(code.width * code.width, code.modules.size)
@@ -23,12 +26,15 @@ class SpiritNodeTest {
             assertEquals("phone", first.ping("phone").name)
             assertTrue(first.status().peers.single().connected)
             assertTrue(second.status().peers.single().connected)
+            assertEquals(createdId, second.status().meshId)
+            createdId
         } finally {
             first.close()
             second.close()
         }
         SpiritNode.open(firstDir, "desktop", local = true).use { reopened ->
             assertEquals("personal", reopened.status().meshName)
+            assertEquals(meshId, reopened.status().meshId)
             assertEquals("phone", reopened.status().peers.single().name)
         }
     }
