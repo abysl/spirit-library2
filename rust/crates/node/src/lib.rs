@@ -136,6 +136,14 @@ pub struct Node {
     gossip: JoinHandle<()>,
 }
 
+fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::Snapshot> {
+    ensure!(
+        response.departure.is_none(),
+        "device refused readmission twice; update the introducing device if it runs an older Spirit"
+    );
+    response.joined.map_err(anyhow::Error::msg)
+}
+
 impl Node {
     pub fn init(root: impl AsRef<Path>, name: &str) -> Result<NodeInfo> {
         Storage::init(root.as_ref(), name)
@@ -274,7 +282,7 @@ impl Node {
             self.shared.record_departure(&departure, member.id)?;
             response = self.enroll(&ticket, &member).await?;
         }
-        let joined = response.joined.map_err(anyhow::Error::msg)?;
+        let joined = joined_after_retry(response)?;
         ensure!(
             joined.mesh.member(member.id) == Some(&member),
             "enrollment did not admit the expected device"
@@ -305,20 +313,27 @@ impl Node {
     pub async fn leave(&self) -> Result<LeftMesh> {
         let (departure, peers) = {
             let mut pending = self.shared.pending.lock().unwrap();
-            let info = self.info();
-            let peers: Vec<_> = info
-                .members
-                .iter()
-                .filter(|member| member.id != info.id)
-                .map(|member| self.shared.address(member.id))
-                .collect();
-            let departure = self
-                .shared
-                .update(|state| state.leave(&self.shared.storage.key))?;
+            let (departure, peers) = self.shared.update(|state| {
+                let peers: Vec<_> = state
+                    .mesh
+                    .as_ref()
+                    .context("device is not a mesh member")?
+                    .members()
+                    .filter(|member| member.id != state.member.id)
+                    .map(|member| {
+                        state
+                            .addresses
+                            .get(&member.id)
+                            .cloned()
+                            .unwrap_or_else(|| member.id.into())
+                    })
+                    .collect();
+                Ok((state.leave(&self.shared.storage.key)?, peers))
+            })?;
             *pending = None;
+            self.shared.presence.lock().unwrap().clear();
             (departure, peers)
         };
-        self.shared.presence.lock().unwrap().clear();
         let remaining_members = peers.len();
         let left = LeftMesh {
             mesh_id: departure.mesh.id,
@@ -365,6 +380,28 @@ impl Drop for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_departure_refusal_is_an_error_not_another_retry() {
+        let key = SecretKey::generate();
+        let mesh = Mesh::create(
+            "home",
+            Member {
+                id: key.public(),
+                name: "device".into(),
+            },
+            &key,
+        )
+        .unwrap();
+        let reply = network::EnrollmentReply {
+            joined: Err("this device left the mesh".into()),
+            departure: Some(membership::Snapshot::without_addresses(mesh)),
+        };
+        assert!(joined_after_retry(reply)
+            .unwrap_err()
+            .to_string()
+            .contains("refused readmission twice"));
+    }
 
     #[test]
     fn duplicate_nicknames_require_an_id() {

@@ -8,7 +8,7 @@ A new mesh receives a cryptographically random 32-byte `MeshId`, independent of 
 
 Existing meshes retain their original founder-key IDs and version-1 admission signatures, with no `founder` field. Their signed tuple remains `("spirit/mesh/admission/1", mesh_id, mesh_name, member, issuer)`. They remain readable and can admit more members; they are not silently migrated because changing an ID would invalidate signed membership on other devices. New-format meshes require upgraded clients. Older clients reject their IDs and admissions; the unchanged pairing and sync ALPNs do not negotiate a downgrade. Rebuild native libraries together with their UniFFI bindings when upgrading.
 
-A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admissions for the same device generation, duplicate departures, and conflicting names are rejected. Existing local admissions are retained when merging, making independent enrollments converge by device ID. Merges must agree on mesh ID, mesh name, and founder; matching display names alone never join independent meshes.
+A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admissions for the same `(device, generation)`, duplicate departures, and conflicting nicknames for the same `(device, generation)` are rejected. Existing local records are retained when merging, making independent enrollments and departures converge by `(device, generation)`. Merges must agree on mesh ID, mesh name, and founder; matching display names alone never join independent meshes.
 
 A member proves ownership of its admitted key through the iroh connection. Nicknames, network addresses, and the presence of a node ID in an unsigned list cannot authorize a pong.
 
@@ -30,24 +30,24 @@ A member leaves by signing a departure record for its own current admission. The
 
 A device is a current member when its highest-generation admission has no matching departure. Current members are the only devices listed, pinged, sent heartbeats, answered with pongs, or allowed to admit devices. Departed admissions remain in the signed history because later admissions may trace their trust through them. Consequently the founder, or any introducer, may leave without invalidating the devices it admitted. Departure is a cooperative membership change, not key revocation: a departed key that is later compromised can still sign records that other members accept, and removing a device against its will requires a future policy.
 
-Leaving atomically clears the local mesh, its routing addresses, presence state, and any outstanding pairing ticket, then retains a copy of the departed mesh. The running node announces that copy to every former member over `spirit/depart/1` in parallel, bounded by one request deadline, and reports how many recorded it. One notified member suffices for membership exchange to propagate the departure. `Node::leave_mesh` leaves while stopped and notifies nobody immediately. The retained copy answers later membership exchanges from former members, so they learn of the departure when they next reach the device while it is running.
+Leaving atomically clears the local mesh, its routing addresses, presence state, and any outstanding pairing ticket. When other current members remain, it retains a copy of the departed mesh in a map keyed by mesh ID. At most 64 copies are retained; the oldest recorded departure is evicted when a new one exceeds that bound. This limits pull delivery to retained meshes: members of an evicted mesh must learn the departure from a member who received it earlier. The running node announces that copy to every former member over `spirit/depart/1` in parallel, bounded by one request deadline, and reports how many recorded it. One notified member suffices for membership exchange to propagate the departure. `Node::leave_mesh` leaves while stopped and notifies nobody immediately. The retained copy answers later membership exchanges from former members, so they learn of the departure when they next reach the device while it is running.
 
-A departed device can be enrolled again with a fresh ticket. The introducer signs a readmission with the next generation, using `("spirit/mesh/readmission/1", mesh_id, founder, mesh_name, member, issuer, generation)`; a readmission is valid only after a departure from the previous generation. If the introducer has not yet learned of the departure, the receiving device refuses the stale enrollment and returns its departure record without consuming the ticket. The introducer records it and retries once with a readmission. Rejoining the same mesh discards the retained departure copy; joining a different mesh keeps it for the old mesh's members. Only the most recent departure is retained.
+A departed device can be enrolled again with a fresh ticket. The introducer signs a readmission with the next generation, using `("spirit/mesh/readmission/1", mesh_id, founder, mesh_name, member, issuer, generation)`; a readmission is valid only after a departure from the previous generation. If the introducer has not yet learned of the departure, the receiving device refuses the stale enrollment and returns its departure record without consuming the ticket. The introducer records it and retries once with a readmission. Rejoining the same mesh discards that mesh's retained departure copy; joining a different mesh keeps the old copy for its members. The departed device still receives full membership snapshots from stale members' syncs and stale introducers' enrollment attempts, even though it does not persist those snapshots as current membership or rejoin on those attempts.
 
 Clients from before departures ignore them, so they keep listing a departed device until they upgrade. They reject readmission signatures, so a mixed-version mesh stops exchanging membership with older clients after a device rejoins.
 
 ## Networking
 
-`spirit-node` owns the iroh endpoint and router. It serves three versioned protocols:
+`spirit-node` owns the iroh endpoint and router. It serves four versioned protocols:
 
 | ALPN | Request | Response | Authorization |
 |---|---|---|---|
-| `spirit/pair/1` | Enrollment secret and membership snapshot | Committed snapshot or error | Active ticket and introducer's valid membership |
-| `spirit/mesh/1` | Membership and address snapshot | Merged snapshot | Peer has verifiable membership in the same mesh |
+| `spirit/pair/1` | Enrollment secret and membership snapshot | Committed snapshot, error, or refusal with departed copy | Active ticket and introducer's valid membership |
+| `spirit/mesh/1` | Membership and address snapshot | Merged snapshot or retained departed copy | Peer has verifiable membership in the same mesh |
 | `spirit/ping/1` | JSON string `"ping"` | JSON string `"pong"` | Authenticated peer is in the local validated membership set |
 | `spirit/depart/1` | Departed mesh copy without addresses | JSON string `"recorded"` | The authenticated peer's own signed departure, for the local mesh |
 
-Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. No mesh metadata is returned for a failed membership exchange.
+Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. A stale introducer's pairing refusal includes the departed mesh copy, which the introducer records before retrying. A departed device's sync reply also includes its retained departed copy.
 
 Background heartbeats run every five seconds. Each peer is checked independently, with at most one active heartbeat per member and a four-second overall deadline. An unreachable peer cannot delay probing the others. Each heartbeat exchanges membership and then sends a ping. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
 
@@ -55,7 +55,7 @@ Addresses are routing hints. A newly discovered member's address can be learned 
 
 Normal operation uses iroh's N0 relay and address lookup preset. Ticket generation waits for relay readiness so the ticket includes a usable relay address. `node serve --local` instead binds loopback with no relay or external discovery, for same-machine tests. This mode does not connect separate machines.
 
-Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh holds at most 256 admission records, including readmissions, with at most 16 transport addresses per member. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
+Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh holds at most 256 admission records, including readmissions, with at most 16 transport addresses per member. Leave and rejoin cycles consume the admission cap permanently. Two individually valid snapshots whose union exceeds it fail to merge in either direction with `invalid mesh size`; same-generation readmissions with different signed nicknames permanently fail to merge with `conflicting device nickname`. Neither conflict is resolved automatically. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
 
 Membership propagation is eventual. Peers must have exchanged membership and usable addresses before the introducer goes offline. Once they have, the introducer need not remain online for authentication, pinging, or further enrollment.
 
@@ -66,7 +66,7 @@ The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` o
 | File | Contents |
 |---|---|
 | `secret.key` | Raw 32-byte secret key |
-| `state.json` | Local identity, nickname, signed mesh admissions and departures, learned addresses, and the most recently departed mesh |
+| `state.json` | Local identity, nickname, signed mesh admissions and departures, learned addresses, and up to 64 departed mesh copies with their recording order |
 | `node.lock` | Process ownership lock |
 | `control.json` | Running node's loopback control address and random credential |
 

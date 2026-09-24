@@ -184,18 +184,12 @@ impl Mesh {
             !self.admissions.is_empty() && self.admissions.len() <= MAX_ADMISSIONS,
             "invalid mesh size"
         );
-        ensure!(
-            self.departures.len() <= self.admissions.len(),
-            "invalid departure count"
-        );
         let mut admissions = BTreeSet::new();
         for admission in &self.admissions {
-            admission.verify(self)?;
             ensure!(admissions.insert(admission.key()), "duplicate admission");
         }
         let mut departures = BTreeSet::new();
         for departure in &self.departures {
-            departure.verify(self)?;
             ensure!(
                 admissions.contains(&departure.key()),
                 "departure has no matching admission"
@@ -208,6 +202,12 @@ impl Mesh {
                     || departures.contains(&(admission.member.id, admission.generation - 1)),
                 "readmission does not follow a departure"
             );
+        }
+        for admission in &self.admissions {
+            admission.verify(self)?;
+        }
+        for departure in &self.departures {
+            departure.verify(self)?;
         }
         let founder = match (self.id.legacy_node(), self.founder) {
             (Some(id), None) => id,
@@ -261,12 +261,21 @@ impl Mesh {
     }
 
     pub fn members(&self) -> impl Iterator<Item = &Member> {
+        let mut latest = BTreeMap::new();
+        for admission in &self.admissions {
+            latest
+                .entry(admission.member.id)
+                .and_modify(|generation: &mut u32| {
+                    *generation = (*generation).max(admission.generation);
+                })
+                .or_insert(admission.generation);
+        }
+        let departures: BTreeSet<_> = self.departures.iter().map(Departure::key).collect();
         self.admissions
             .iter()
-            .filter(|admission| {
-                self.latest_admission(admission.member.id)
-                    .is_some_and(|latest| latest.generation == admission.generation)
-                    && !self.departed_generation(admission.member.id, admission.generation)
+            .filter(move |admission| {
+                latest.get(&admission.member.id) == Some(&admission.generation)
+                    && !departures.contains(&admission.key())
             })
             .map(|admission| &admission.member)
     }
@@ -563,6 +572,142 @@ mod tests {
             .departures
             .push(Departure::signed(&other, 0, &child).unwrap());
         assert!(replayed.verify().is_err());
+    }
+
+    #[test]
+    fn shuffled_departures_and_readmissions_verify() {
+        let root = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        mesh.admit(member(&child, "child"), &root).unwrap();
+        for _ in 0..3 {
+            mesh.depart(&child).unwrap();
+            mesh.admit(member(&child, "child"), &root).unwrap();
+        }
+        mesh.admissions.reverse();
+        mesh.departures.reverse();
+        mesh.verify().unwrap();
+        assert_eq!(mesh.members().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_readmissions_converge_and_repeat_merges_are_noops() {
+        let root = SecretKey::generate();
+        let introducer = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        mesh.admit(member(&introducer, "introducer"), &root)
+            .unwrap();
+        mesh.admit(member(&child, "child"), &root).unwrap();
+        mesh.depart(&child).unwrap();
+        let mut left = mesh.clone();
+        let mut right = mesh;
+        left.admit(member(&child, "child"), &root).unwrap();
+        right.admit(member(&child, "child"), &introducer).unwrap();
+        left.merge(&right).unwrap();
+        right.merge(&left).unwrap();
+        assert_eq!(left.admissions.len(), right.admissions.len());
+        assert_eq!(left.members().count(), 3);
+        let before = serde_json::to_vec(&left).unwrap();
+        left.merge(&right).unwrap();
+        assert_eq!(before, serde_json::to_vec(&left).unwrap());
+        let before = serde_json::to_vec(&right).unwrap();
+        right.merge(&left).unwrap();
+        assert_eq!(before, serde_json::to_vec(&right).unwrap());
+    }
+
+    #[test]
+    fn independently_valid_admission_caps_cannot_merge() {
+        let root = SecretKey::generate();
+        let mut base = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        for index in 0..MAX_ADMISSIONS - 2 {
+            let key = SecretKey::generate();
+            base.admit(member(&key, &index.to_string()), &root).unwrap();
+        }
+        let mut left = base.clone();
+        let mut right = base;
+        left.admit(member(&SecretKey::generate(), "left"), &root)
+            .unwrap();
+        right
+            .admit(member(&SecretKey::generate(), "right"), &root)
+            .unwrap();
+        left.verify().unwrap();
+        right.verify().unwrap();
+        assert!(left
+            .merge(&right)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid mesh size"));
+        assert!(right
+            .merge(&left)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid mesh size"));
+    }
+
+    #[test]
+    fn signed_conflicting_readmission_names_fail_permanently() {
+        let root = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut base = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        base.admit(member(&child, "child"), &root).unwrap();
+        base.depart(&child).unwrap();
+        let mut left = base.clone();
+        let mut right = base;
+        left.admit(member(&child, "child"), &root).unwrap();
+        right.admit(member(&child, "dishonest"), &root).unwrap();
+        left.verify().unwrap();
+        right.verify().unwrap();
+        for _ in 0..2 {
+            assert!(left
+                .merge(&right)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting device nickname"));
+            assert!(right
+                .merge(&left)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting device nickname"));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_members_at_admission_cap() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let root = SecretKey::generate();
+        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        let keys: Vec<_> = (0..MAX_ADMISSIONS - 1)
+            .map(|_| SecretKey::generate())
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            mesh.admit(member(key, &index.to_string()), &root).unwrap();
+        }
+        for key in keys.iter().take(127) {
+            mesh.depart(key).unwrap();
+        }
+        let rounds = 1000;
+        let before = Instant::now();
+        for _ in 0..rounds {
+            black_box(
+                mesh.admissions
+                    .iter()
+                    .filter(|admission| {
+                        mesh.latest_admission(admission.member.id)
+                            .is_some_and(|latest| latest.generation == admission.generation)
+                            && !mesh.departed_generation(admission.member.id, admission.generation)
+                    })
+                    .count(),
+            );
+        }
+        let old = before.elapsed();
+        let after = Instant::now();
+        for _ in 0..rounds {
+            black_box(mesh.members().count());
+        }
+        println!("256 admissions, 127 departures: previous members(): {:?}/call; current members(): {:?}/call", old / rounds, after.elapsed() / rounds);
     }
 
     #[test]
