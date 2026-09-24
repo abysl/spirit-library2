@@ -940,6 +940,16 @@ mod tests {
             .unwrap();
         let start = Instant::now();
         let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while test_ping_count(b.info().id) < 1
+                || TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].0 != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_round = start.elapsed();
         tokio::time::timeout(Duration::from_secs(13), async {
             while test_ping_count(b.info().id) < 3 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -983,7 +993,7 @@ mod tests {
             1
         );
         println!(
-            "three heartbeat rounds, one permanently failing mesh: {:?}",
+            "first heartbeat round with one permanently failing mesh: {first_round:?}; three intervals: {:?}",
             start.elapsed()
         );
         heartbeat.abort();
