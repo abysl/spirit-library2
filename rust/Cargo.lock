@@ -2971,6 +2971,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "hostname",
+ "iroh",
  "qrcode",
  "serde",
  "serde_json",

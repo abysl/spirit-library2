@@ -5,7 +5,7 @@ use qrcode::{
     render::{svg, unicode::Dense1x2},
     QrCode,
 };
-use spirit_sdk::{LeftMesh, Node, NodeInfo};
+use spirit_sdk::{LeftMesh, MeshId, Node, NodeInfo};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -48,15 +48,24 @@ pub enum MeshCommand {
         name: String,
     },
     #[command(about = "enroll a device using its pairing ticket")]
-    Add { ticket: String },
+    Add {
+        ticket: String,
+        #[arg(long, help = "mesh ID; required if in several meshes")]
+        mesh: Option<MeshId>,
+    },
     #[command(about = "leave this device's mesh; members must enroll it again to readmit it")]
-    Leave,
+    Leave {
+        #[arg(long, help = "mesh ID; required if in several meshes")]
+        mesh: Option<MeshId>,
+    },
     #[command(about = "show this device's membership and service status")]
     Status,
     #[command(about = "list known mesh members")]
     Members {
         #[arg(long, help = "include full device IDs for disambiguation")]
         ids: bool,
+        #[arg(long, help = "list members of this mesh only")]
+        mesh: Option<MeshId>,
     },
 }
 
@@ -177,66 +186,77 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
                 Node::read_info(&root)?.name
             );
         }
-        MeshCommand::Add { ticket } => {
-            info(&root).await?.0.only_mesh()?;
-            let Reply::Added(member) = control::request(&root, Operation::Add { ticket }).await?
+        MeshCommand::Add { ticket, mesh } => {
+            let info = info(&root).await?.0;
+            let mesh_id = info.select_mesh(mesh)?;
+            let mesh_name = &info
+                .meshes
+                .iter()
+                .find(|mesh| mesh.id == mesh_id)
+                .unwrap()
+                .name;
+            let Reply::Added(member) =
+                control::request(&root, Operation::Add { mesh_id, ticket }).await?
             else {
                 bail!("unexpected node response");
             };
-            println!(
-                "Added {} to {}.",
-                member.name,
-                info(&root).await?.0.mesh_name.unwrap()
-            );
+            println!("Added {} to {}.", member.name, mesh_name);
         }
-        MeshCommand::Leave => {
-            info(&root).await?.0.only_mesh()?;
-            let left = match control::request_if_running(&root, Operation::Leave).await? {
-                Some(Reply::Left(left)) => left,
-                None => Node::leave_mesh(&root, Node::read_info(&root)?.only_mesh()?)?,
-                _ => bail!("unexpected node response"),
-            };
+        MeshCommand::Leave { mesh } => {
+            let mesh_id = info(&root).await?.0.select_mesh(mesh)?;
+            let left =
+                match control::request_if_running(&root, Operation::Leave { mesh_id }).await? {
+                    Some(Reply::Left(left)) => left,
+                    None => Node::leave_mesh(&root, mesh_id)?,
+                    _ => bail!("unexpected node response"),
+                };
             println!("{}", departure_message(&left));
         }
         MeshCommand::Status => {
             let (info, running) = info(&root).await?;
-            if !info.meshes.is_empty() {
-                info.only_mesh()?;
-            }
             println!("Device: {}", info.name);
             println!("Node: {}", if running { "running" } else { "stopped" });
-            println!(
-                "Mesh: {}",
-                info.mesh_name.as_deref().unwrap_or("not enrolled")
-            );
-            if let Some(mesh_id) = info.mesh_id {
-                println!("Mesh ID: {mesh_id}");
+            if info.meshes.is_empty() {
+                println!("Mesh: not enrolled");
             }
-            println!("Members: {}", info.members.len());
+            for mesh in &info.meshes {
+                println!("Mesh: {}", mesh.name);
+                println!("Mesh ID: {}", mesh.id);
+                println!("Members: {}", mesh.members.len());
+            }
         }
-        MeshCommand::Members { ids } => {
-            let (mut info, _) = info(&root).await?;
-            info.only_mesh()?;
-            info.members
-                .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-            println!(
-                "{}",
-                if ids {
-                    "NICKNAME\tDEVICE ID"
-                } else {
-                    "NICKNAME"
-                }
-            );
-            for member in info.members {
-                let suffix = if member.id == info.id {
-                    " (this device)"
-                } else {
-                    ""
-                };
-                if ids {
-                    println!("{}\t{}{}", member.name, member.id, suffix);
-                } else {
-                    println!("{}{suffix}", member.name);
+        MeshCommand::Members { ids, mesh } => {
+            let (info, _) = info(&root).await?;
+            if let Some(id) = mesh {
+                info.select_mesh(Some(id))?;
+            }
+            let selected = info
+                .meshes
+                .iter()
+                .filter(|entry| mesh.is_none_or(|id| entry.id == id));
+            for entry in selected {
+                println!("Mesh: {} ({})", entry.name, entry.id);
+                println!(
+                    "{}",
+                    if ids {
+                        "NICKNAME\tDEVICE ID"
+                    } else {
+                        "NICKNAME"
+                    }
+                );
+                let mut members = entry.members.clone();
+                members.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+                for member in members {
+                    let suffix = if member.id == info.id {
+                        " (this device)"
+                    } else {
+                        ""
+                    };
+                    if ids {
+                        println!("{}\t{}{}", member.name, member.id, suffix);
+                    } else {
+                        println!("{}{suffix}", member.name);
+                    }
                 }
             }
         }
