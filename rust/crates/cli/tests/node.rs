@@ -145,6 +145,29 @@ fn three_devices_enroll_by_ticket_and_ping_by_nickname_without_introducer() {
 }
 
 #[test]
+fn mesh_specific_cli_actions_require_selection_when_multiple_meshes_exist() {
+    let mut device = Device::new("desktop");
+    device.start();
+    device.ok(&["mesh", "create", "--name", "one"]);
+    device.ok(&["mesh", "create", "--name", "two"]);
+    for args in [
+        vec!["mesh", "status"],
+        vec!["mesh", "members"],
+        vec!["mesh", "add", "not-a-ticket"],
+        vec!["mesh", "leave"],
+    ] {
+        let result = device.run(&args);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("this device is in several meshes; choose one"));
+    }
+    device.stop();
+    let result = device.run(&["mesh", "leave"]);
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("this device is in several meshes; choose one"));
+}
+
+#[test]
 fn initialization_defaults_to_hostname_and_persists_identity() {
     let dir = tempfile::tempdir().unwrap();
     let device = Device { dir, child: None };

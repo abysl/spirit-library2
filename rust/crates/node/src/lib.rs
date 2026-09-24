@@ -29,9 +29,32 @@ pub struct NodeInfo {
     pub mesh_id: Option<MeshId>,
     pub mesh_name: Option<String>,
     pub members: Vec<Member>,
+    pub meshes: Vec<MeshInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeshInfo {
+    pub id: MeshId,
+    pub name: String,
+    pub members: Vec<MeshMember>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeshMember {
+    pub id: NodeId,
+    pub name: String,
+    pub generation: u32,
 }
 
 impl NodeInfo {
+    pub fn only_mesh(&self) -> Result<MeshId> {
+        match self.meshes.as_slice() {
+            [mesh] => Ok(mesh.id),
+            [] => bail!("device is not enrolled in a mesh"),
+            _ => bail!("this device is in several meshes; choose one"),
+        }
+    }
+
     pub fn resolve(&self, nickname_or_id: &str) -> Result<Member> {
         if let Ok(id) = nickname_or_id.parse::<NodeId>() {
             if let Some(member) = self.members.iter().find(|m| m.id == id) {
@@ -119,9 +142,15 @@ impl PairingTicket {
         membership::validate_name(&ticket.name)?;
         ensure!(ticket.expires_at > now()?, "pairing ticket has expired");
         ensure!(
-            ticket.address.addrs.len() <= 16,
+            ticket.address.addrs.len() <= membership::MAX_ADDRESSES,
             "too many ticket addresses"
         );
+        for transport in &ticket.address.addrs {
+            ensure!(
+                serde_json::to_vec(transport)?.len() <= membership::MAX_TRANSPORT_ADDRESS_BYTES,
+                "transport address is too long"
+            );
+        }
         Ok(ticket)
     }
 }
@@ -145,17 +174,22 @@ impl Node {
         Ok(Storage::read(root.as_ref())?.info())
     }
 
-    pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<NodeInfo> {
+    pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<MeshId> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        ensure!(state.mesh.is_none(), "device already belongs to a mesh");
-        state.mesh = Some(Mesh::create(name, state.member.clone(), &storage.key)?);
+        ensure!(
+            state.meshes.len() < storage::MAX_CURRENT_MESHES,
+            "device has reached the 64-group limit"
+        );
+        let mesh = Mesh::create(name, state.member.clone(), &storage.key)?;
+        let id = mesh.id;
+        state.meshes.insert(id, mesh);
         storage.save(&state)?;
-        Ok(state.info())
+        Ok(id)
     }
 
-    pub fn leave_mesh(root: impl AsRef<Path>) -> Result<LeftMesh> {
+    pub fn leave_mesh(root: impl AsRef<Path>, mesh_id: MeshId) -> Result<LeftMesh> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        let departure = state.leave(&storage.key)?;
+        let departure = state.leave(mesh_id, &storage.key)?;
         storage.save(&state)?;
         Ok(LeftMesh {
             mesh_id: departure.mesh.id,
@@ -186,6 +220,8 @@ impl Node {
             presence: Mutex::new(Default::default()),
             endpoint: endpoint.clone(),
             config,
+            #[cfg(test)]
+            ping_count: std::sync::atomic::AtomicUsize::new(0),
         });
         let router = Router::builder(endpoint)
             .accept(PAIR_ALPN, Protocol::pair(shared.clone()))
@@ -221,18 +257,17 @@ impl Node {
         self.shared.state.lock().unwrap().info()
     }
 
-    pub fn new_mesh(&self, name: &str) -> Result<NodeInfo> {
-        let mut state = self.shared.state.lock().unwrap();
-        ensure!(state.mesh.is_none(), "device already belongs to a mesh");
-        let mut next = state.clone();
-        next.mesh = Some(Mesh::create(
-            name,
-            state.member.clone(),
-            &self.shared.storage.key,
-        )?);
-        self.shared.storage.save(&next)?;
-        *state = next;
-        Ok(state.info())
+    pub fn new_mesh(&self, name: &str) -> Result<MeshId> {
+        self.shared.update(|state| {
+            ensure!(
+                state.meshes.len() < storage::MAX_CURRENT_MESHES,
+                "device has reached the 64-group limit"
+            );
+            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
+            let id = mesh.id;
+            state.meshes.insert(id, mesh);
+            Ok(id)
+        })
     }
 
     pub async fn pair(&self, lifetime: Duration) -> Result<String> {
@@ -259,7 +294,16 @@ impl Node {
         Ok(encoded)
     }
 
-    pub async fn add(&self, ticket: &str) -> Result<Member> {
+    pub async fn add(&self, mesh_id: MeshId, ticket: &str) -> Result<Member> {
+        ensure!(
+            self.shared
+                .state
+                .lock()
+                .unwrap()
+                .meshes
+                .contains_key(&mesh_id),
+            "device is not a member of this mesh"
+        );
         let ticket = PairingTicket::decode(ticket)?;
         ensure!(
             ticket.address.id != self.info().id,
@@ -269,10 +313,10 @@ impl Node {
             id: ticket.address.id,
             name: ticket.name.clone(),
         };
-        let mut response = self.enroll(&ticket, &member).await?;
+        let mut response = self.enroll(mesh_id, &ticket, &member).await?;
         if let Some(departure) = response.departure.take() {
             self.shared.record_departure(&departure, member.id)?;
-            response = self.enroll(&ticket, &member).await?;
+            response = self.enroll(mesh_id, &ticket, &member).await?;
         }
         let joined = joined_after_retry(response)?;
         ensure!(
@@ -285,10 +329,11 @@ impl Node {
 
     async fn enroll(
         &self,
+        mesh_id: MeshId,
         ticket: &PairingTicket,
         member: &Member,
     ) -> Result<network::EnrollmentReply> {
-        let mut snapshot = self.shared.snapshot()?;
+        let mut snapshot = self.shared.snapshot(mesh_id)?;
         snapshot
             .mesh
             .admit(member.clone(), &self.shared.storage.key)?;
@@ -302,14 +347,14 @@ impl Node {
             .await
     }
 
-    pub async fn leave(&self) -> Result<LeftMesh> {
+    pub async fn leave(&self, mesh_id: MeshId) -> Result<LeftMesh> {
         let (departure, peers) = {
             let mut pending = self.shared.pending.lock().unwrap();
             let (departure, peers) = self.shared.update(|state| {
                 let peers: Vec<_> = state
-                    .mesh
-                    .as_ref()
-                    .context("device is not a mesh member")?
+                    .meshes
+                    .get(&mesh_id)
+                    .context("device is not a member of this mesh")?
                     .members()
                     .filter(|member| member.id != state.member.id)
                     .map(|member| {
@@ -320,7 +365,7 @@ impl Node {
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
-                Ok((state.leave(&self.shared.storage.key)?, peers))
+                Ok((state.leave(mesh_id, &self.shared.storage.key)?, peers))
             })?;
             *pending = None;
             (departure, peers)
@@ -418,6 +463,7 @@ mod tests {
             mesh_id: Some(MeshId::legacy(a.id)),
             mesh_name: Some("home".into()),
             members: vec![a.clone(), b.clone()],
+            meshes: Vec::new(),
         };
         assert!(info
             .resolve("desktop")

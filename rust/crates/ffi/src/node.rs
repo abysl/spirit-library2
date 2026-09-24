@@ -98,6 +98,11 @@ impl SpiritNode {
     pub fn status(&self) -> Result<MeshStatus, FfiError> {
         let node = self.active()?;
         let info = node.info();
+        let mesh_id = if info.meshes.is_empty() {
+            None
+        } else {
+            Some(info.only_mesh().map_err(node_error)?)
+        };
         let peers = node
             .peers()
             .into_iter()
@@ -112,7 +117,7 @@ impl SpiritNode {
         Ok(MeshStatus {
             id: info.id.to_string(),
             name: info.name,
-            mesh_id: info.mesh_id.map(|id| id.to_string()),
+            mesh_id: mesh_id.map(|id| id.to_string()),
             mesh_name: info.mesh_name,
             peers,
         })
@@ -125,7 +130,10 @@ impl SpiritNode {
 
     pub fn leave_mesh(&self) -> Result<LeftMesh, FfiError> {
         let node = self.active()?;
-        let left = runtime()?.block_on(node.leave()).map_err(node_error)?;
+        let mesh_id = node.info().only_mesh().map_err(node_error)?;
+        let left = runtime()?
+            .block_on(node.leave(mesh_id))
+            .map_err(node_error)?;
         Ok(LeftMesh {
             mesh_id: left.mesh_id.to_string(),
             mesh_name: left.mesh_name,
@@ -155,8 +163,9 @@ impl SpiritNode {
 
     pub fn add(&self, ticket: String) -> Result<String, FfiError> {
         let node = self.active()?;
+        let mesh_id = node.info().only_mesh().map_err(node_error)?;
         let member = runtime()?
-            .block_on(node.add(ticket.trim()))
+            .block_on(node.add(mesh_id, ticket.trim()))
             .map_err(node_error)?;
         Ok(member.name)
     }
@@ -197,6 +206,24 @@ impl Drop for SpiritNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_specific_bindings_need_selection_for_multiple_meshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node =
+            SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap();
+        node.create_mesh("one".into()).unwrap();
+        node.create_mesh("two".into()).unwrap();
+        for error in [
+            node.status().err(),
+            node.add("invalid".into()).err(),
+            node.leave_mesh().err(),
+        ] {
+            assert!(format!("{}", error.unwrap())
+                .contains("this device is in several meshes; choose one"));
+        }
+        node.shutdown().unwrap();
+    }
 
     #[test]
     fn node_bindings_enroll_ping_and_close() {

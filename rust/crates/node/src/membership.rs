@@ -5,7 +5,12 @@ use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) const MAX_MEMBERS: usize = 256;
 pub(crate) const MAX_ADMISSIONS: usize = 256;
+#[cfg(test)]
+const MAX_MEMBERSHIP_RECORDS: usize = 2 * MAX_ADMISSIONS;
+pub(crate) const MAX_ADDRESSES: usize = 16;
+pub(crate) const MAX_TRANSPORT_ADDRESS_BYTES: usize = 160;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -280,6 +285,12 @@ impl Mesh {
             .map(|admission| &admission.member)
     }
 
+    pub fn generation(&self, id: EndpointId) -> Option<u32> {
+        self.latest_admission(id)
+            .filter(|admission| !self.departed_generation(id, admission.generation))
+            .map(|admission| admission.generation)
+    }
+
     pub fn departed(&self, id: EndpointId) -> bool {
         self.latest_admission(id)
             .is_some_and(|admission| self.departed_generation(id, admission.generation))
@@ -300,7 +311,7 @@ impl Mesh {
         validate_name(&member.name)?;
         ensure!(
             self.admissions.len() < MAX_ADMISSIONS,
-            "mesh admission limit reached"
+            "group membership history is full"
         );
         let generation = match self.latest_admission(member.id) {
             Some(departed) => departed
@@ -326,6 +337,10 @@ impl Mesh {
 
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         other.verify()?;
+        self.merge_verified(other)
+    }
+
+    pub fn merge_verified(&mut self, other: &Self) -> Result<()> {
         ensure!(
             self.id == other.id && self.name == other.name && self.founder == other.founder,
             "device belongs to a different mesh"
@@ -366,7 +381,7 @@ impl Snapshot {
     pub fn verify(&self) -> Result<()> {
         self.mesh.verify()?;
         ensure!(
-            self.addresses.len() <= MAX_ADMISSIONS,
+            self.addresses.len() <= MAX_MEMBERS,
             "too many peer addresses"
         );
         for (id, addr) in &self.addresses {
@@ -374,7 +389,16 @@ impl Snapshot {
                 addr.id == *id && self.mesh.member(*id).is_some(),
                 "address does not belong to a member"
             );
-            ensure!(addr.addrs.len() <= 16, "too many transports for device");
+            ensure!(
+                addr.addrs.len() <= MAX_ADDRESSES,
+                "too many transports for device"
+            );
+            for transport in &addr.addrs {
+                ensure!(
+                    serde_json::to_vec(transport)?.len() <= MAX_TRANSPORT_ADDRESS_BYTES,
+                    "transport address is too long"
+                );
+            }
         }
         Ok(())
     }
@@ -483,7 +507,7 @@ mod tests {
         let mut invalid = reopened.clone();
         invalid.founder = Some(root.public());
         assert!(invalid.verify().is_err());
-        state.mesh = Some(reopened);
+        state.meshes.insert(reopened.id, reopened);
         storage.save(&state).unwrap();
         drop(storage);
         let info = crate::Node::read_info(directory.path()).unwrap();
@@ -643,6 +667,108 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid mesh size"));
+    }
+
+    #[test]
+    fn membership_bounds_and_maximum_snapshot_fit_wire_limit() {
+        use iroh::{RelayUrl, TransportAddr};
+        use std::time::Instant;
+
+        let root = SecretKey::generate();
+        let mut mesh =
+            Mesh::create(&"n".repeat(128), member(&root, &"r".repeat(128)), &root).unwrap();
+        let mut keys = vec![root.clone()];
+        for _ in 1..MAX_MEMBERS {
+            let key = SecretKey::generate();
+            mesh.admit(member(&key, &"n".repeat(128)), &root).unwrap();
+            keys.push(key);
+        }
+        assert!(mesh
+            .admit(member(&SecretKey::generate(), "extra"), &root)
+            .unwrap_err()
+            .to_string()
+            .contains("group membership history is full"));
+        let readmission = SecretKey::generate();
+        let mut past = Mesh::create("past", member(&root, "root"), &root).unwrap();
+        past.admit(member(&readmission, "returning"), &root)
+            .unwrap();
+        past.depart(&readmission).unwrap();
+        for _ in 0..MAX_ADMISSIONS - 2 {
+            past.admit(member(&SecretKey::generate(), "other"), &root)
+                .unwrap();
+        }
+        assert!(past
+            .admit(member(&readmission, "returning"), &root)
+            .unwrap_err()
+            .to_string()
+            .contains("group membership history is full"));
+        let mesh_current = mesh.clone();
+        for key in &keys {
+            mesh.depart(key).unwrap();
+            assert!(mesh.admissions.len() + mesh.departures.len() <= MAX_MEMBERSHIP_RECORDS);
+        }
+        assert_eq!(
+            mesh.admissions.len() + mesh.departures.len(),
+            MAX_MEMBERSHIP_RECORDS
+        );
+        mesh.verify().unwrap();
+        let mut addresses = BTreeMap::new();
+        for key in &keys {
+            let mut addr: EndpointAddr = key.public().into();
+            for index in 0..MAX_ADDRESSES {
+                let prefix = format!("https://relay.example/{index:02}/");
+                let overhead =
+                    serde_json::to_vec(&TransportAddr::Relay(prefix.parse::<RelayUrl>().unwrap()))
+                        .unwrap()
+                        .len();
+                let url = format!(
+                    "{prefix}{}",
+                    "x".repeat(MAX_TRANSPORT_ADDRESS_BYTES - overhead)
+                );
+                let transport = TransportAddr::Relay(url.parse::<RelayUrl>().unwrap());
+                assert_eq!(
+                    serde_json::to_vec(&transport).unwrap().len(),
+                    MAX_TRANSPORT_ADDRESS_BYTES
+                );
+                addr.addrs.insert(transport);
+            }
+            addresses.insert(key.public(), addr);
+        }
+        let snapshot = Snapshot {
+            mesh: mesh_current.clone(),
+            addresses,
+        };
+        let departed_snapshot = Snapshot::without_addresses(mesh);
+        departed_snapshot.verify().unwrap();
+        let departed_length = serde_json::to_vec(&departed_snapshot).unwrap().len();
+        snapshot.verify().unwrap();
+        let length = serde_json::to_vec(&snapshot).unwrap().len();
+        assert!(
+            length.max(departed_length) < 1024 * 1024,
+            "maximum snapshot is {} bytes",
+            length.max(departed_length)
+        );
+        let start = Instant::now();
+        departed_snapshot.mesh.verify().unwrap();
+        let verify = start.elapsed();
+        let mut merging = departed_snapshot.mesh.clone();
+        let start = Instant::now();
+        merging.merge(&departed_snapshot.mesh).unwrap();
+        let merge = start.elapsed();
+        println!("256 current members: snapshot={length} bytes; 512 records, no current members: snapshot={departed_length} bytes verify={verify:?} merge={merge:?}");
+        let mut too_long = snapshot;
+        let first = too_long.addresses.values_mut().next().unwrap();
+        first.addrs.clear();
+        first.addrs.insert(TransportAddr::Relay(
+            format!("https://relay.example/{}", "z".repeat(160))
+                .parse()
+                .unwrap(),
+        ));
+        assert!(too_long
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("transport address is too long"));
     }
 
     #[test]

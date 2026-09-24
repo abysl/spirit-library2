@@ -162,21 +162,23 @@ fn departure_message(left: &LeftMesh) -> String {
 pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
     match command {
         MeshCommand::Create { name } => {
-            let info =
-                match control::request_if_running(&root, Operation::Create { name: name.clone() })
-                    .await?
-                {
-                    Some(Reply::Info(info)) => info,
-                    None => Node::create_mesh(&root, &name)?,
-                    _ => bail!("unexpected node response"),
-                };
+            match control::request_if_running(&root, Operation::Create { name: name.clone() })
+                .await?
+            {
+                Some(Reply::Created) => {}
+                None => {
+                    Node::create_mesh(&root, &name)?;
+                }
+                _ => bail!("unexpected node response"),
+            }
             println!(
                 "Created {} with {} as its first member.",
-                info.mesh_name.unwrap(),
-                info.name
+                name,
+                Node::read_info(&root)?.name
             );
         }
         MeshCommand::Add { ticket } => {
+            info(&root).await?.0.only_mesh()?;
             let Reply::Added(member) = control::request(&root, Operation::Add { ticket }).await?
             else {
                 bail!("unexpected node response");
@@ -188,15 +190,19 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
             );
         }
         MeshCommand::Leave => {
+            info(&root).await?.0.only_mesh()?;
             let left = match control::request_if_running(&root, Operation::Leave).await? {
                 Some(Reply::Left(left)) => left,
-                None => Node::leave_mesh(&root)?,
+                None => Node::leave_mesh(&root, Node::read_info(&root)?.only_mesh()?)?,
                 _ => bail!("unexpected node response"),
             };
             println!("{}", departure_message(&left));
         }
         MeshCommand::Status => {
             let (info, running) = info(&root).await?;
+            if !info.meshes.is_empty() {
+                info.only_mesh()?;
+            }
             println!("Device: {}", info.name);
             println!("Node: {}", if running { "running" } else { "stopped" });
             println!(
@@ -210,9 +216,7 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
         }
         MeshCommand::Members { ids } => {
             let (mut info, _) = info(&root).await?;
-            if info.mesh_id.is_none() {
-                bail!("device is not enrolled in a mesh");
-            }
+            info.only_mesh()?;
             info.members
                 .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
             println!(
