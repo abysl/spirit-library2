@@ -1,5 +1,5 @@
 use crate::{
-    membership::Snapshot,
+    membership::{Snapshot, VerifiedSnapshot},
     now,
     presence::{Presence, HEARTBEAT_INTERVAL},
     storage::{State, Storage},
@@ -13,7 +13,7 @@ use iroh::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -30,6 +30,52 @@ pub(crate) const DEPART_ALPN: &[u8] = b"spirit/depart/1";
 const DEPARTURE_RECORDED: &str = "recorded";
 const MAX_MESSAGE: usize = 1024 * 1024;
 
+#[cfg(test)]
+static TEST_PINGS: OnceLock<Mutex<BTreeMap<NodeId, usize>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_HEARTBEATS: OnceLock<Mutex<BTreeMap<NodeId, (usize, usize)>>> = OnceLock::new();
+
+#[cfg(test)]
+struct TestHeartbeat(NodeId);
+
+#[cfg(test)]
+impl TestHeartbeat {
+    fn start(id: NodeId) -> Self {
+        let mut counts = TEST_HEARTBEATS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        let count = counts.entry(id).or_default();
+        count.0 += 1;
+        count.1 = count.1.max(count.0);
+        Self(id)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHeartbeat {
+    fn drop(&mut self) {
+        TEST_HEARTBEATS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&self.0)
+            .unwrap()
+            .0 -= 1;
+    }
+}
+
+#[cfg(test)]
+fn test_ping_count(id: NodeId) -> usize {
+    *TEST_PINGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&id)
+        .unwrap_or(&0)
+}
+
 pub(crate) struct Shared {
     pub storage: Storage,
     pub state: Mutex<State>,
@@ -37,8 +83,6 @@ pub(crate) struct Shared {
     pub presence: Mutex<BTreeMap<NodeId, Presence>>,
     pub endpoint: Endpoint,
     pub config: NodeConfig,
-    #[cfg(test)]
-    pub ping_count: AtomicUsize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,7 +145,9 @@ impl Shared {
         }
     }
 
-    pub async fn ping(&self, id: NodeId) -> Result<u128> {
+    pub async fn ping(self: &Arc<Self>, id: NodeId) -> Result<u128> {
+        #[cfg(test)]
+        let _heartbeat = TestHeartbeat::start(id);
         let result = async {
             let address = self.address(id);
             let shared: Vec<_> = self
@@ -114,18 +160,38 @@ impl Shared {
                 .map(|mesh| mesh.id)
                 .collect();
             ensure!(!shared.is_empty(), "peer is not a mesh member");
+            let mut syncs = JoinSet::new();
             for mesh_id in shared {
-                self.sync(address.clone(), mesh_id).await?;
+                let peer = self.clone();
+                let address = address.clone();
+                syncs.spawn(async move { (mesh_id, peer.sync(address, mesh_id).await) });
+            }
+            let mut errors = Vec::new();
+            let sync_result = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(result) = syncs.join_next().await {
+                    match result {
+                        Ok((mesh_id, Err(error))) => errors.push(format!("{mesh_id}: {error:#}")),
+                        Err(error) => errors.push(error.to_string()),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            if sync_result.is_err() {
+                errors.push("membership exchange timed out".into());
             }
             let start = Instant::now();
             let response: String = self.request(address, PING_ALPN, &"ping").await?;
             ensure!(response == "pong", "invalid pong response");
+            self.heartbeat_received(id);
+            if !errors.is_empty() {
+                self.failed(id, &anyhow::anyhow!(errors.join("; ")));
+            }
             Ok(start.elapsed().as_millis())
         }
         .await;
-        match &result {
-            Ok(_) => self.heartbeat_received(id),
-            Err(error) => self.failed(id, error),
+        if let Err(error) = &result {
+            self.failed(id, error);
         }
         result
     }
@@ -148,36 +214,50 @@ impl Shared {
     }
 
     pub fn merge(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
-        snapshot.verify()?;
+        let verified = VerifiedSnapshot::new(snapshot)?;
+        self.merge_verified_snapshot(&verified, source, false)
+    }
+
+    fn merge_verified_snapshot(
+        &self,
+        verified: &VerifiedSnapshot<'_>,
+        source: NodeId,
+        current_only: bool,
+    ) -> Result<()> {
+        let snapshot = verified.snapshot();
         ensure!(
             snapshot.mesh.member(source).is_some(),
             "peer is not a mesh member"
         );
-        self.update(|state| state.merge(snapshot, source))
+        self.update(|state| {
+            let changed = if current_only {
+                state.merge_current(snapshot, source)?
+            } else {
+                state.join(snapshot, source)?
+            };
+            ensure!(
+                !current_only || state.meshes[&snapshot.mesh.id].member(source).is_some(),
+                "mesh unavailable"
+            );
+            Ok(((), changed))
+        })
     }
 
     pub fn record_departure(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
-        ensure!(
-            self.state
-                .lock()
-                .unwrap()
-                .meshes
-                .contains_key(&snapshot.mesh.id),
-            "device is not a member of this mesh"
-        );
+        let verified = VerifiedSnapshot::new(snapshot)?;
+        let snapshot = verified.snapshot();
         ensure!(
             snapshot.mesh.departed(source),
             "peer has not left this mesh"
         );
-        snapshot.verify()?;
-        self.update(|state| state.merge_departure(snapshot, source))
+        self.update(|state| Ok(((), state.merge_departure(snapshot, source)?)))
     }
 
-    pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+    pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<(T, bool)>) -> Result<T> {
         let mut state = self.state.lock().unwrap();
         let mut next = state.clone();
-        let result = change(&mut next)?;
-        if serde_json::to_vec(&next)? != serde_json::to_vec(&*state)? {
+        let (result, changed) = change(&mut next)?;
+        if changed {
             self.storage.save(&next)?;
             *state = next;
         }
@@ -283,6 +363,7 @@ impl Shared {
     }
 
     fn enroll(&self, request: Enrollment, remote: NodeId) -> Result<Enrolled> {
+        let verified = VerifiedSnapshot::new(&request.snapshot)?;
         let mut pending = self.pending.lock().unwrap();
         let ticket = pending
             .as_ref()
@@ -292,9 +373,8 @@ impl Shared {
             "invalid pairing secret"
         );
         ensure!(ticket.expires_at > now()?, "pairing ticket has expired");
-        request.snapshot.verify()?;
         ensure!(
-            request.snapshot.mesh.member(remote).is_some(),
+            verified.snapshot().mesh.member(remote).is_some(),
             "introducer is not a mesh member"
         );
         if let Some(departure) = self
@@ -306,40 +386,35 @@ impl Shared {
             return Ok(Enrolled::Departed(departure));
         }
         let mesh_id = request.snapshot.mesh.id;
-        self.merge(&request.snapshot, remote)?;
+        self.merge_verified_snapshot(&verified, remote, false)?;
         *pending = None;
         Ok(Enrolled::Joined(self.snapshot(mesh_id)?))
     }
 
     fn answer_sync(&self, snapshot: &Snapshot, remote: NodeId) -> Result<Snapshot> {
-        let mesh_id = snapshot.mesh.id;
-        let (current, departure) = {
-            let state = self.state.lock().unwrap();
-            (
-                state
-                    .meshes
-                    .get(&mesh_id)
-                    .is_some_and(|mesh| !mesh.departed(remote)),
-                state.departure(mesh_id),
-            )
-        };
-        ensure!(current || departure.is_some(), "mesh unavailable");
         ensure!(snapshot.mesh.member(remote).is_some(), "mesh unavailable");
-        snapshot.verify()?;
+        let verified =
+            VerifiedSnapshot::new(snapshot).map_err(|_| anyhow::anyhow!("mesh unavailable"))?;
+        let mesh_id = snapshot.mesh.id;
+        let departure = {
+            let state = self.state.lock().unwrap();
+            if let Some(departure) = state.departure(mesh_id) {
+                ensure!(
+                    departure.mesh.same_identity(&snapshot.mesh),
+                    "mesh unavailable"
+                );
+                Some(departure)
+            } else {
+                None
+            }
+        };
         if let Some(departure) = departure {
             return Ok(departure);
         }
-        self.merge(snapshot, remote)?;
-        ensure!(
-            self.state
-                .lock()
-                .unwrap()
-                .meshes
-                .get(&mesh_id)
-                .is_some_and(|mesh| mesh.member(remote).is_some()),
-            "mesh unavailable"
-        );
+        self.merge_verified_snapshot(&verified, remote, true)
+            .map_err(|_| anyhow::anyhow!("mesh unavailable"))?;
         self.snapshot(mesh_id)
+            .map_err(|_| anyhow::anyhow!("mesh unavailable"))
     }
 }
 
@@ -411,11 +486,14 @@ impl Protocol {
                         departure: None,
                     },
                     Ok(Enrolled::Departed(departure)) => EnrollmentReply {
-                        joined: Err("this device left the mesh; update the introducing device if it runs an older Spirit, then record the departure before readmitting it".into()),
+                        joined: Err("could not join this mesh".into()),
                         departure: Some(departure),
                     },
                     Err(error) => EnrollmentReply {
-                        joined: Err(error.to_string()),
+                        joined: Err({
+                            eprintln!("pairing refused: {error:#}");
+                            "could not join this mesh".into()
+                        }),
                         departure: None,
                     },
                 })?
@@ -434,7 +512,14 @@ impl Protocol {
                 ensure!(request == "ping", "invalid ping");
                 self.shared.heartbeat_received(remote);
                 #[cfg(test)]
-                self.shared.ping_count.fetch_add(1, Ordering::Relaxed);
+                {
+                    *TEST_PINGS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .entry(self.shared.endpoint.id())
+                        .or_default() += 1;
+                }
                 serde_json::to_vec("pong")?
             }
         };
@@ -499,6 +584,7 @@ pub(crate) async fn gossip(shared: Arc<Shared>) {
 mod tests {
     use super::*;
     use crate::{Mesh, Node, PairingTicket};
+    use iroh::SecretKey;
 
     async fn device(name: &str) -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
@@ -543,7 +629,11 @@ mod tests {
         assert!(!std::fs::read_to_string(c_dir.path().join("state.json"))
             .unwrap()
             .contains(&m1.to_string()));
-        assert!(a.ping(c_id).await.is_err());
+        let refused_ping: Result<String> = a
+            .shared
+            .request(c.shared.endpoint.addr(), PING_ALPN, &"ping")
+            .await;
+        assert!(refused_ping.is_err());
         let request = a.shared.snapshot(m1).unwrap();
         let unknown = Snapshot {
             mesh: Mesh {
@@ -624,10 +714,94 @@ mod tests {
         );
         assert!(!b.shared.state.lock().unwrap().departed.contains_key(&m1));
         assert!(b.shared.state.lock().unwrap().addresses.contains_key(&c_id));
+        a.add(m1, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(b.info().meshes.len(), 2);
+        assert_eq!(
+            b.info()
+                .meshes
+                .iter()
+                .find(|mesh| mesh.id == m1)
+                .unwrap()
+                .members
+                .iter()
+                .find(|member| member.id == b_id)
+                .unwrap()
+                .generation,
+            1
+        );
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
         }
         drop((a_dir, b_dir, c_dir));
+    }
+
+    #[tokio::test]
+    async fn departed_copy_requires_a_verified_member_of_the_same_founder() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        let id = a.new_mesh("secret mesh").unwrap();
+        a.add(id, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        b.leave(id).await.unwrap();
+        let forged = Mesh::create_with_id(
+            "decoy",
+            c.shared.state.lock().unwrap().member.clone(),
+            &c.shared.storage.key,
+            id,
+        )
+        .unwrap();
+        let forged = Snapshot::without_addresses(forged);
+        let unknown = Snapshot::without_addresses(
+            Mesh::create(
+                "unknown",
+                c.shared.state.lock().unwrap().member.clone(),
+                &c.shared.storage.key,
+            )
+            .unwrap(),
+        );
+        let unknown_error = b
+            .shared
+            .answer_sync(&unknown, c.info().id)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            b.shared
+                .answer_sync(&forged, c.info().id)
+                .unwrap_err()
+                .to_string(),
+            unknown_error
+        );
+        let reply: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &forged)
+            .await;
+        let unknown_reply: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &unknown)
+            .await;
+        assert_eq!(
+            reply.unwrap_err().to_string(),
+            unknown_reply.unwrap_err().to_string()
+        );
+        let mut invalid = forged.clone();
+        invalid.mesh.admissions[0].member.name = "tampered".into();
+        assert_eq!(
+            b.shared
+                .answer_sync(&invalid, c.info().id)
+                .unwrap_err()
+                .to_string(),
+            unknown_error
+        );
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -646,7 +820,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string()
-            .contains("64-group limit"));
+            .contains("could not join this mesh"));
         assert_eq!(a.info().meshes.len(), 64);
         assert!(a.shared.pending.lock().unwrap().is_some());
         b.shutdown().await.unwrap();
@@ -704,13 +878,172 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(b.shared.ping_count.load(Ordering::Relaxed), 1);
+        assert_eq!(test_ping_count(b.info().id), 1);
+        assert_eq!(
+            TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].1,
+            1
+        );
         assert_eq!(a.peers().len(), 1);
         assert!(a.peers()[0].connected);
         println!("two-mesh heartbeat round: {:?}", start.elapsed());
         heartbeat.abort();
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_permanently_failing_mesh_does_not_block_sync_or_one_ping_per_interval() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let first = a.new_mesh("first").unwrap();
+        a.add(first, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second = a.new_mesh("second").unwrap();
+        a.add(second, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let conflict = SecretKey::generate();
+        let new_member = SecretKey::generate();
+        a.shared
+            .update(|state| {
+                state.meshes.get_mut(&second).unwrap().admit(
+                    crate::Member {
+                        id: conflict.public(),
+                        name: "one".into(),
+                    },
+                    &a.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        b.shared
+            .update(|state| {
+                state.meshes.get_mut(&second).unwrap().admit(
+                    crate::Member {
+                        id: conflict.public(),
+                        name: "two".into(),
+                    },
+                    &b.shared.storage.key,
+                )?;
+                state.meshes.get_mut(&first).unwrap().admit(
+                    crate::Member {
+                        id: new_member.public(),
+                        name: "new".into(),
+                    },
+                    &b.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        let start = Instant::now();
+        let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(13), async {
+            while test_ping_count(b.info().id) < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(test_ping_count(b.info().id), 3);
+        assert!(a
+            .info()
+            .meshes
+            .iter()
+            .find(|mesh| mesh.id == first)
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.id == new_member.public()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].0 != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(a
+            .peers()
+            .iter()
+            .find(|peer| peer.id == b.info().id)
+            .unwrap()
+            .last_error
+            .is_some());
+        assert!(
+            a.peers()
+                .iter()
+                .find(|peer| peer.id == b.info().id)
+                .unwrap()
+                .connected
+        );
+        assert_eq!(
+            TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].1,
+            1
+        );
+        println!(
+            "three heartbeat rounds, one permanently failing mesh: {:?}",
+            start.elapsed()
+        );
+        heartbeat.abort();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn timing_at_sixty_four_meshes_with_two_hundred_fifty_six_admissions() {
+        let directory = tempfile::tempdir().unwrap();
+        Node::init(directory.path(), "root").unwrap();
+        let (storage, mut state) = Storage::open(directory.path()).unwrap();
+        let peers: Vec<_> = (0..255).map(|_| SecretKey::generate()).collect();
+        for _ in 0..64 {
+            let mut mesh =
+                Mesh::create(&"\"".repeat(128), state.member.clone(), &storage.key).unwrap();
+            for key in &peers {
+                mesh.admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "\"".repeat(128),
+                    },
+                    &storage.key,
+                )
+                .unwrap();
+            }
+            state.meshes.insert(mesh.id, mesh);
+        }
+        let start = Instant::now();
+        storage.save(&state).unwrap();
+        let save = start.elapsed();
+        let bytes = std::fs::metadata(directory.path().join("state.json"))
+            .unwrap()
+            .len();
+        drop(storage);
+        let node = Node::bind(directory.path(), NodeConfig::local())
+            .await
+            .unwrap();
+        node.gossip.abort();
+        let start = Instant::now();
+        let info = node.info();
+        let info_time = start.elapsed();
+        let start = Instant::now();
+        let statuses = node.peers();
+        let peers_time = start.elapsed();
+        let start = Instant::now();
+        node.shared
+            .update(|state| {
+                state
+                    .addresses
+                    .insert(peers[0].public(), EndpointAddr::new(peers[0].public()));
+                Ok(((), true))
+            })
+            .unwrap();
+        let update = start.elapsed();
+        assert_eq!(info.meshes.len(), 64);
+        assert_eq!(statuses.len(), 255);
+        println!("64x256: state={bytes} bytes save={save:?} info={info_time:?} peers={peers_time:?} update_save={update:?}");
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -823,7 +1156,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string()
-            .contains("expired"));
+            .contains("could not join this mesh"));
         assert!(b.info().mesh_id.is_none());
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
@@ -900,10 +1233,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(refusal
-            .joined
-            .unwrap_err()
-            .contains("update the introducing device"));
+        assert_eq!(refusal.joined.unwrap_err(), "could not join this mesh");
         assert!(refusal.departure.unwrap().mesh.departed(b_id));
         assert!(b.shared.pending.lock().unwrap().is_some());
         c.add(c.info().only_mesh().unwrap(), &ticket).await.unwrap();
@@ -1128,7 +1458,7 @@ mod tests {
                     let id = mesh.id;
                     state.meshes.insert(id, mesh);
                     state.leave(id, &b.shared.storage.key)?;
-                    Ok(())
+                    Ok(((), true))
                 })
                 .unwrap();
         }

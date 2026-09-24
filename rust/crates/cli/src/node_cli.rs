@@ -165,7 +165,7 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
             match control::request_if_running(&root, Operation::Create { name: name.clone() })
                 .await?
             {
-                Some(Reply::Created) => {}
+                Some(Reply::Created(_)) => {}
                 None => {
                     Node::create_mesh(&root, &name)?;
                 }

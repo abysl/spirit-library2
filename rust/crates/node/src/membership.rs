@@ -1,14 +1,12 @@
 use crate::mesh_id::MeshId;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
+use iroh::{EndpointAddr, EndpointId, SecretKey, Signature, TransportAddr};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_MEMBERS: usize = 256;
 pub(crate) const MAX_ADMISSIONS: usize = 256;
-#[cfg(test)]
-const MAX_MEMBERSHIP_RECORDS: usize = 2 * MAX_ADMISSIONS;
 pub(crate) const MAX_ADDRESSES: usize = 16;
 pub(crate) const MAX_TRANSPORT_ADDRESS_BYTES: usize = 160;
 
@@ -49,6 +47,38 @@ pub(crate) struct Mesh {
 pub(crate) struct Snapshot {
     pub mesh: Mesh,
     pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+}
+
+pub(crate) struct VerifiedSnapshot<'a>(&'a Snapshot);
+
+impl<'a> VerifiedSnapshot<'a> {
+    pub fn new(snapshot: &'a Snapshot) -> Result<Self> {
+        snapshot.verify()?;
+        Ok(Self(snapshot))
+    }
+
+    pub fn snapshot(&self) -> &'a Snapshot {
+        self.0
+    }
+}
+
+pub(crate) fn bounded_address(mut addr: EndpointAddr) -> EndpointAddr {
+    let mut addrs: Vec<_> = std::mem::take(&mut addr.addrs).into_iter().collect();
+    addrs.sort_by_key(|transport| match transport {
+        TransportAddr::Relay(_) => 0,
+        TransportAddr::Ip(ip) if ip.is_ipv4() => 1,
+        TransportAddr::Ip(_) => 2,
+        _ => 3,
+    });
+    addr.addrs = addrs
+        .into_iter()
+        .filter(|transport| {
+            serde_json::to_vec(transport)
+                .is_ok_and(|bytes| bytes.len() <= MAX_TRANSPORT_ADDRESS_BYTES)
+        })
+        .take(MAX_ADDRESSES)
+        .collect();
+    addr
 }
 
 fn is_first_generation(generation: &u32) -> bool {
@@ -170,8 +200,37 @@ impl Mesh {
             member.id == key.public(),
             "founder identity does not match key"
         );
+        Self::create_with_id(name, member, key, MeshId::generate()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_legacy(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
         let mut mesh = Self {
-            id: MeshId::generate()?,
+            id: MeshId::legacy(key.public()),
+            name: name.into(),
+            founder: None,
+            admissions: Vec::new(),
+            departures: Vec::new(),
+        };
+        mesh.admissions
+            .push(Admission::signed(&mesh, member, 0, key)?);
+        mesh.verify()?;
+        Ok(mesh)
+    }
+
+    pub(crate) fn create_with_id(
+        name: &str,
+        member: Member,
+        key: &SecretKey,
+        id: MeshId,
+    ) -> Result<Self> {
+        validate_name(name)?;
+        ensure!(
+            member.id == key.public(),
+            "founder identity does not match key"
+        );
+        let mut mesh = Self {
+            id,
             name: name.to_owned(),
             founder: Some(member.id),
             admissions: Vec::new(),
@@ -184,6 +243,17 @@ impl Mesh {
     }
 
     pub fn verify(&self) -> Result<()> {
+        self.verify_structure()?;
+        for admission in &self.admissions {
+            admission.verify(self)?;
+        }
+        for departure in &self.departures {
+            departure.verify(self)?;
+        }
+        Ok(())
+    }
+
+    fn verify_structure(&self) -> Result<()> {
         validate_name(&self.name)?;
         ensure!(
             !self.admissions.is_empty() && self.admissions.len() <= MAX_ADMISSIONS,
@@ -209,10 +279,7 @@ impl Mesh {
             );
         }
         for admission in &self.admissions {
-            admission.verify(self)?;
-        }
-        for departure in &self.departures {
-            departure.verify(self)?;
+            validate_name(&admission.member.name)?;
         }
         let founder = match (self.id.legacy_node(), self.founder) {
             (Some(id), None) => id,
@@ -265,7 +332,7 @@ impl Mesh {
             .map(|admission| &admission.member)
     }
 
-    pub fn members(&self) -> impl Iterator<Item = &Member> {
+    pub fn current_admissions(&self) -> impl Iterator<Item = (&Member, u32)> {
         let mut latest = BTreeMap::new();
         for admission in &self.admissions {
             latest
@@ -282,13 +349,11 @@ impl Mesh {
                 latest.get(&admission.member.id) == Some(&admission.generation)
                     && !departures.contains(&admission.key())
             })
-            .map(|admission| &admission.member)
+            .map(|admission| (&admission.member, admission.generation))
     }
 
-    pub fn generation(&self, id: EndpointId) -> Option<u32> {
-        self.latest_admission(id)
-            .filter(|admission| !self.departed_generation(id, admission.generation))
-            .map(|admission| admission.generation)
+    pub fn members(&self) -> impl Iterator<Item = &Member> {
+        self.current_admissions().map(|(member, _)| member)
     }
 
     pub fn departed(&self, id: EndpointId) -> bool {
@@ -335,14 +400,19 @@ impl Mesh {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         other.verify()?;
-        self.merge_verified(other)
+        self.merge_trusted(other)
     }
 
-    pub fn merge_verified(&mut self, other: &Self) -> Result<()> {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.id == other.id && self.name == other.name && self.founder == other.founder
+    }
+
+    pub fn merge_trusted(&mut self, other: &Self) -> Result<()> {
         ensure!(
-            self.id == other.id && self.name == other.name && self.founder == other.founder,
+            self.same_identity(other),
             "device belongs to a different mesh"
         );
         let mut merged = self.clone();
@@ -364,7 +434,7 @@ impl Mesh {
                 merged.departures.push(departure.clone());
             }
         }
-        merged.verify()?;
+        merged.verify_structure()?;
         *self = merged;
         Ok(())
     }
@@ -680,7 +750,7 @@ mod tests {
         let mut keys = vec![root.clone()];
         for _ in 1..MAX_MEMBERS {
             let key = SecretKey::generate();
-            mesh.admit(member(&key, &"n".repeat(128)), &root).unwrap();
+            mesh.admit(member(&key, &"\"".repeat(128)), &root).unwrap();
             keys.push(key);
         }
         assert!(mesh
@@ -705,11 +775,11 @@ mod tests {
         let mesh_current = mesh.clone();
         for key in &keys {
             mesh.depart(key).unwrap();
-            assert!(mesh.admissions.len() + mesh.departures.len() <= MAX_MEMBERSHIP_RECORDS);
+            assert!(mesh.admissions.len() + mesh.departures.len() <= 2 * MAX_ADMISSIONS);
         }
         assert_eq!(
             mesh.admissions.len() + mesh.departures.len(),
-            MAX_MEMBERSHIP_RECORDS
+            2 * MAX_ADMISSIONS
         );
         mesh.verify().unwrap();
         let mut addresses = BTreeMap::new();
@@ -753,9 +823,9 @@ mod tests {
         let verify = start.elapsed();
         let mut merging = departed_snapshot.mesh.clone();
         let start = Instant::now();
-        merging.merge(&departed_snapshot.mesh).unwrap();
+        merging.merge_trusted(&departed_snapshot.mesh).unwrap();
         let merge = start.elapsed();
-        println!("256 current members: snapshot={length} bytes; 512 records, no current members: snapshot={departed_length} bytes verify={verify:?} merge={merge:?}");
+        println!("256 current members: snapshot={length} bytes; 512 records, no current members: snapshot={departed_length} bytes verify={verify:?} trusted_merge={merge:?}");
         let mut too_long = snapshot;
         let first = too_long.addresses.values_mut().next().unwrap();
         first.addrs.clear();
@@ -769,6 +839,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("transport address is too long"));
+    }
+
+    #[test]
+    fn addresses_are_trimmed_before_sending() {
+        use iroh::RelayUrl;
+        let id = SecretKey::generate().public();
+        let mut address: EndpointAddr = id.into();
+        let relay = TransportAddr::Relay("https://relay.example/".parse::<RelayUrl>().unwrap());
+        address.addrs.insert(relay.clone());
+        address.addrs.insert(TransportAddr::Relay(
+            format!("https://relay.example/{}", "x".repeat(200))
+                .parse()
+                .unwrap(),
+        ));
+        for index in 0..20 {
+            address.addrs.insert(TransportAddr::Ip(
+                format!("127.0.0.1:{}", 1000 + index).parse().unwrap(),
+            ));
+        }
+        address
+            .addrs
+            .insert(TransportAddr::Ip("[::1]:1111".parse().unwrap()));
+        let bounded = bounded_address(address);
+        assert_eq!(bounded.addrs.len(), MAX_ADDRESSES);
+        assert!(bounded.addrs.contains(&relay));
+        assert_eq!(
+            bounded
+                .addrs
+                .iter()
+                .filter(|addr| matches!(addr, TransportAddr::Ip(ip) if ip.is_ipv4()))
+                .count(),
+            MAX_ADDRESSES - 1
+        );
+        assert!(bounded
+            .addrs
+            .iter()
+            .all(|addr| serde_json::to_vec(addr).unwrap().len() <= MAX_TRANSPORT_ADDRESS_BYTES));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use spirit_sdk::{LeftMesh, Member, Node, NodeConfig, NodeInfo, Pong};
+use spirit_sdk::{LeftMesh, Member, MeshId, Node, NodeConfig, NodeInfo, Pong};
 use std::{
     io::Write,
     net::SocketAddr,
@@ -31,7 +31,7 @@ pub enum Operation {
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
     Info(NodeInfo),
-    Created,
+    Created(MeshId),
     Ticket(String),
     Added(Member),
     Pong(Pong),
@@ -125,17 +125,8 @@ pub async fn request(root: &Path, operation: Operation) -> Result<Reply> {
 
 async fn execute(node: &Node, operation: Operation) -> Result<Reply> {
     match operation {
-        Operation::Info => {
-            let info = node.info();
-            if !info.meshes.is_empty() {
-                info.only_mesh()?;
-            }
-            Ok(Reply::Info(info))
-        }
-        Operation::Create { name } => {
-            node.new_mesh(&name)?;
-            Ok(Reply::Created)
-        }
+        Operation::Info => Ok(Reply::Info(node.info())),
+        Operation::Create { name } => Ok(Reply::Created(node.new_mesh(&name)?)),
         Operation::Pair { ttl_seconds } => Ok(Reply::Ticket(
             node.pair(Duration::from_secs(ttl_seconds)).await?,
         )),

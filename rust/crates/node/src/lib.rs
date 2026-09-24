@@ -29,6 +29,7 @@ pub struct NodeInfo {
     pub mesh_id: Option<MeshId>,
     pub mesh_name: Option<String>,
     pub members: Vec<Member>,
+    #[serde(default)]
     pub meshes: Vec<MeshInfo>,
 }
 
@@ -220,8 +221,6 @@ impl Node {
             presence: Mutex::new(Default::default()),
             endpoint: endpoint.clone(),
             config,
-            #[cfg(test)]
-            ping_count: std::sync::atomic::AtomicUsize::new(0),
         });
         let router = Router::builder(endpoint)
             .accept(PAIR_ALPN, Protocol::pair(shared.clone()))
@@ -238,12 +237,18 @@ impl Node {
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {
-        let info = self.info();
+        let state = self.shared.state.lock().unwrap();
+        let members: std::collections::BTreeMap<_, _> = state
+            .meshes
+            .values()
+            .flat_map(|mesh| mesh.members())
+            .filter(|member| member.id != state.member.id)
+            .map(|member| (member.id, member.clone()))
+            .collect();
         let presence = self.shared.presence.lock().unwrap();
         let now = Instant::now();
-        info.members
-            .into_iter()
-            .filter(|member| member.id != info.id)
+        members
+            .into_values()
             .map(|member| {
                 presence
                     .get(&member.id)
@@ -266,7 +271,7 @@ impl Node {
             let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
             let id = mesh.id;
             state.meshes.insert(id, mesh);
-            Ok(id)
+            Ok((id, true))
         })
     }
 
@@ -284,7 +289,7 @@ impl Node {
             .context("relay is unavailable; use node serve --local for same-machine testing")?;
         }
         let ticket = PairingTicket {
-            address: self.shared.endpoint.addr(),
+            address: membership::bounded_address(self.shared.endpoint.addr()),
             name: self.info().name,
             secret: SecretKey::generate().to_bytes(),
             expires_at: now()? + lifetime.as_secs(),
@@ -315,6 +320,10 @@ impl Node {
         };
         let mut response = self.enroll(mesh_id, &ticket, &member).await?;
         if let Some(departure) = response.departure.take() {
+            ensure!(
+                departure.mesh.id == mesh_id,
+                "departure names a different mesh"
+            );
             self.shared.record_departure(&departure, member.id)?;
             response = self.enroll(mesh_id, &ticket, &member).await?;
         }
@@ -365,7 +374,10 @@ impl Node {
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
-                Ok((state.leave(mesh_id, &self.shared.storage.key)?, peers))
+                Ok((
+                    (state.leave(mesh_id, &self.shared.storage.key)?, peers),
+                    true,
+                ))
             })?;
             *pending = None;
             (departure, peers)
