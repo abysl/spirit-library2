@@ -191,6 +191,26 @@ fn a_device_leaves_its_mesh_and_is_enrolled_again() {
     desktop.stop();
     assert_eq!(
         desktop.ok(&["mesh", "leave"]),
-        "Left personal. Notified 0 of 1 remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving.\n"
+        "Left personal. Notified 0 of 1 remaining member; the others can also learn it when they next reach this device while it is serving.\n"
+    );
+}
+
+#[test]
+fn partial_departure_notice_counts_multiple_remaining_members() {
+    let mut desktop = Device::new("desktop");
+    let mut laptop = Device::new("laptop");
+    let mut tablet = Device::new("tablet");
+    desktop.ok(&["mesh", "create", "--name", "personal"]);
+    for device in [&mut desktop, &mut laptop, &mut tablet] {
+        device.start();
+    }
+    for device in [&laptop, &tablet] {
+        let ticket = device.ok(&["node", "pair", "--no-qr"]);
+        desktop.ok(&["mesh", "add", ticket.trim()]);
+    }
+    tablet.stop();
+    assert_eq!(
+        desktop.ok(&["mesh", "leave"]),
+        "Left personal. Notified 1 of 2 remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving.\n"
     );
 }

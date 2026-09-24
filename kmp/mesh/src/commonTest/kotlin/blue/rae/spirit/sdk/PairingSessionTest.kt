@@ -333,14 +333,34 @@ class PairingSessionTest {
         session.leaveMesh()
 
         assertEquals(
-            "Left personal. Notified 0 of 1 devices; notified devices relay the departure; the rest can also learn it when they next reach this device",
+            "Left personal. Notified 0 of 1 device; the rest can also learn it when they next reach this device",
             session.state.value.notice,
         )
         running.cancelAndJoin()
     }
 
     @Test
-    fun `cancelling the fresh ticket after leave does not hold up teardown`() = runTest {
+    fun `leaving reports partial notification to multiple devices`() = runTest {
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        node.snapshot = node.snapshot.copy(peers = listOf(
+            NodePeer("first", "first", false, 0, null),
+            NodePeer("second", "second", false, 0, null),
+        ))
+        node.notifiedOnLeave = 1
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        session.leaveMesh()
+
+        assertEquals(
+            "Left personal. Notified 1 of 2 devices; notified devices relay the departure; the rest can also learn it when they next reach this device",
+            session.state.value.notice,
+        )
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `cancelling a suspending node ticket refresh after leave does not hold up teardown`() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = PairingSession({ node }, "personal") { 0L }
         val running = start(session)

@@ -198,7 +198,11 @@ class PairingSession(
     private fun departureNotice(left: LeftMesh): String = when {
         left.remainingMembers <= 0 -> "Left ${left.meshName}"
         left.notifiedMembers >= left.remainingMembers -> "Left ${left.meshName} and notified its other devices"
-        else -> "Left ${left.meshName}. Notified ${left.notifiedMembers} of ${left.remainingMembers} devices; notified devices relay the departure; the rest can also learn it when they next reach this device"
+        else -> {
+            val devices = if (left.remainingMembers == 1) "device" else "devices"
+            val relay = if (left.notifiedMembers == 0) "" else " notified devices relay the departure;"
+            "Left ${left.meshName}. Notified ${left.notifiedMembers} of ${left.remainingMembers} $devices;$relay the rest can also learn it when they next reach this device"
+        }
     }
 
     private suspend fun openNode(): Boolean {
