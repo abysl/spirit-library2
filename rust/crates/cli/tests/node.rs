@@ -180,6 +180,7 @@ fn mesh_selection_adds_and_leaves_only_the_named_mesh() {
     b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m1]);
     let ticket = c.ok(&["node", "pair", "--no-qr"]);
     b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m2]);
+    assert!(b.ok(&["mesh", "status"]).contains("Devices: 3"));
     assert!(b.ok(&["mesh", "members", "--mesh", &m1]).contains("a"));
     assert!(!b.ok(&["mesh", "members", "--mesh", &m1]).contains("c\n"));
     assert!(b.ok(&["mesh", "members", "--mesh", &m2]).contains("c"));

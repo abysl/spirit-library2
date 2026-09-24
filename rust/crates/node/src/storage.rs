@@ -290,6 +290,7 @@ impl Storage {
                 "device is missing from its mesh"
             );
         }
+        state.retain_member_addresses();
         ensure!(
             state.departed.len() <= MAX_DEPARTED_MESHES,
             "too many departed meshes"

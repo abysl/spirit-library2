@@ -224,6 +224,7 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
                 println!("Mesh ID: {}", mesh.id);
                 println!("Members: {}", mesh.members.len());
             }
+            println!("Devices: {}", info.members.len());
         }
         MeshCommand::Members { ids, mesh } => {
             let (info, _) = info(&root).await?;
