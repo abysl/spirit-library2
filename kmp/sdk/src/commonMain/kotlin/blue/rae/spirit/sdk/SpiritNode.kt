@@ -45,7 +45,7 @@ class SpiritNode private constructor(
         val status = ffi.status()
         NodeStatus(status.id, status.name, status.meshName, status.peers.map {
             NodePeer(it.id, it.name, it.connected, it.lastReceivedAgoMs?.toLong(), it.lastError)
-        })
+        }, status.meshId)
     }
 
     override suspend fun createMesh(name: String) = io { ffi.createMesh(name) }

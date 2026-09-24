@@ -1,3 +1,4 @@
+use crate::mesh_id::MeshId;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
@@ -21,8 +22,10 @@ pub(crate) struct Admission {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Mesh {
-    pub id: EndpointId,
+    pub id: MeshId,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub founder: Option<EndpointId>,
     pub admissions: Vec<Admission>,
 }
 
@@ -41,14 +44,24 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 }
 
 impl Admission {
-    fn payload(&self, mesh_id: EndpointId, mesh_name: &str) -> Result<Vec<u8>> {
-        Ok(postcard::to_stdvec(&(
-            "spirit/mesh/admission/1",
-            mesh_id,
-            mesh_name,
-            &self.member,
-            self.issuer,
-        ))?)
+    fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
+        match mesh.id.random_bytes() {
+            Some(id) => Ok(postcard::to_stdvec(&(
+                "spirit/mesh/admission/2",
+                id,
+                mesh.founder.context("missing mesh founder")?,
+                &mesh.name,
+                &self.member,
+                self.issuer,
+            ))?),
+            None => Ok(postcard::to_stdvec(&(
+                "spirit/mesh/admission/1",
+                mesh.id.legacy_node().context("missing legacy mesh ID")?,
+                &mesh.name,
+                &self.member,
+                self.issuer,
+            ))?),
+        }
     }
 
     fn signed(mesh: &Mesh, member: Member, key: &SecretKey) -> Result<Self> {
@@ -57,10 +70,8 @@ impl Admission {
             issuer: key.public(),
             signature: String::new(),
         };
-        admission.signature = URL_SAFE_NO_PAD.encode(
-            key.sign(&admission.payload(mesh.id, &mesh.name)?)
-                .to_bytes(),
-        );
+        admission.signature =
+            URL_SAFE_NO_PAD.encode(key.sign(&admission.payload(mesh)?).to_bytes());
         Ok(admission)
     }
 
@@ -71,10 +82,7 @@ impl Admission {
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid admission signature length"))?;
         self.issuer
-            .verify(
-                &self.payload(mesh.id, &mesh.name)?,
-                &Signature::from_bytes(&bytes),
-            )
+            .verify(&self.payload(mesh)?, &Signature::from_bytes(&bytes))
             .context("invalid admission signature")?;
         Ok(())
     }
@@ -83,9 +91,14 @@ impl Admission {
 impl Mesh {
     pub fn create(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
         validate_name(name)?;
+        ensure!(
+            member.id == key.public(),
+            "founder identity does not match key"
+        );
         let mut mesh = Self {
-            id: key.public(),
+            id: MeshId::generate()?,
             name: name.to_owned(),
+            founder: Some(member.id),
             admissions: Vec::new(),
         };
         mesh.admissions.push(Admission::signed(&mesh, member, key)?);
@@ -104,13 +117,18 @@ impl Mesh {
             admission.verify(self)?;
             ensure!(ids.insert(admission.member.id), "duplicate admission");
         }
+        let founder = match (self.id.legacy_node(), self.founder) {
+            (Some(id), None) => id,
+            (None, Some(id)) => id,
+            _ => bail!("mesh identity and founder format do not match"),
+        };
         let root = self
             .admissions
             .iter()
-            .find(|a| a.member.id == self.id)
+            .find(|a| a.member.id == founder)
             .context("missing mesh founder")?;
-        ensure!(root.issuer == self.id, "invalid founding admission");
-        let mut trusted = BTreeSet::from([self.id]);
+        ensure!(root.issuer == founder, "invalid founding admission");
+        let mut trusted = BTreeSet::from([founder]);
         loop {
             let before = trusted.len();
             for admission in &self.admissions {
@@ -158,7 +176,7 @@ impl Mesh {
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         other.verify()?;
         ensure!(
-            self.id == other.id && self.name == other.name,
+            self.id == other.id && self.name == other.name && self.founder == other.founder,
             "device belongs to a different mesh"
         );
         let mut merged = self.clone();
@@ -221,9 +239,88 @@ mod tests {
         let mut forged = mesh.clone();
         forged.name = "different".into();
         assert!(forged.verify().is_err());
+        let mut forged = mesh.clone();
+        forged.id = MeshId::generate().unwrap();
+        assert!(forged.verify().is_err());
+        let mut forged = mesh.clone();
+        forged.founder = Some(child.public());
+        assert!(forged.verify().is_err());
         let mut forged = mesh;
         forged.admissions[0].member.name = "impostor".into();
         assert!(forged.verify().is_err());
+    }
+
+    #[test]
+    fn mesh_ids_are_independent_of_the_founder_and_are_bound_to_admissions() {
+        let root = SecretKey::generate();
+        let mut first = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        let second = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.id.to_string(), root.public().to_string());
+        assert!(first.merge(&second).is_err());
+        let stored = serde_json::to_vec(&first).unwrap();
+        let reopened: Mesh = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(reopened.id, first.id);
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn legacy_meshes_retain_their_signed_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::Node::init(directory.path(), "root").unwrap();
+        let (storage, mut state) = crate::storage::Storage::open(directory.path()).unwrap();
+        let root = storage.key.clone();
+        let child = SecretKey::generate();
+        let mut old = Mesh {
+            id: MeshId::legacy(root.public()),
+            name: "private".into(),
+            founder: None,
+            admissions: Vec::new(),
+        };
+        let root_member = member(&root, "root");
+        let legacy_payload = postcard::to_stdvec(&(
+            "spirit/mesh/admission/1",
+            root.public(),
+            "private",
+            &root_member,
+            root.public(),
+        ))
+        .unwrap();
+        old.admissions.push(Admission {
+            member: root_member,
+            issuer: root.public(),
+            signature: URL_SAFE_NO_PAD.encode(root.sign(&legacy_payload).to_bytes()),
+        });
+        let stored = serde_json::to_value(&old).unwrap();
+        assert!(stored.get("founder").is_none());
+        assert_eq!(stored["id"], root.public().to_string());
+        let mut reopened: Mesh = serde_json::from_value(stored).unwrap();
+        reopened.verify().unwrap();
+        reopened.admit(member(&child, "child"), &root).unwrap();
+        reopened.verify().unwrap();
+        let child_member = member(&child, "child");
+        let legacy_child_payload = postcard::to_stdvec(&(
+            "spirit/mesh/admission/1",
+            root.public(),
+            "private",
+            &child_member,
+            root.public(),
+        ))
+        .unwrap();
+        assert_eq!(
+            reopened.admissions[1].signature,
+            URL_SAFE_NO_PAD.encode(root.sign(&legacy_child_payload).to_bytes()),
+        );
+        assert_eq!(reopened.id.to_string(), root.public().to_string());
+        let mut invalid = reopened.clone();
+        invalid.founder = Some(root.public());
+        assert!(invalid.verify().is_err());
+        state.mesh = Some(reopened);
+        storage.save(&state).unwrap();
+        drop(storage);
+        let info = crate::Node::read_info(directory.path()).unwrap();
+        assert_eq!(info.mesh_id, Some(MeshId::legacy(root.public())));
+        assert_eq!(info.members.len(), 2);
     }
 
     #[test]

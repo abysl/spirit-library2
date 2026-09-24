@@ -103,6 +103,18 @@ class PairingSessionTest {
     }
 
     @Test
+    fun `session exposes the mesh identity from status`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        node.snapshot = node.snapshot.copy(meshId = "mesh1_example")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        assertEquals("mesh1_example", session.state.value.meshId)
+        assertEquals("self", session.state.value.nodeId)
+        running.cancelAndJoin()
+    }
+
+    @Test
     fun `failed first scan withdraws the receiver ticket once the mesh exists`() = runTest {
         var now = 0L
         val node = FakeNode(meshName = null)

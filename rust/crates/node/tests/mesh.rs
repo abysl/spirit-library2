@@ -51,7 +51,16 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     let (phone_dir, phone_id) = initialized("phone");
     let (desktop_dir, desktop_id) = initialized("desktop");
     let (laptop_dir, laptop_id) = initialized("laptop");
-    Node::create_mesh(phone_dir.path(), "personal").unwrap();
+    let mesh_id = Node::create_mesh(phone_dir.path(), "personal")
+        .unwrap()
+        .mesh_id
+        .unwrap();
+    assert!(mesh_id.to_string().starts_with("mesh1_"));
+    assert_ne!(mesh_id.to_string(), phone_id.to_string());
+    assert_eq!(
+        Node::read_info(phone_dir.path()).unwrap().mesh_id,
+        Some(mesh_id)
+    );
     let phone = local(&phone_dir).await;
     let desktop = local(&desktop_dir).await;
     let laptop = local(&laptop_dir).await;
@@ -70,7 +79,7 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     })
     .await
     .unwrap();
-    assert_eq!(desktop.info().mesh_id, Some(phone_id));
+    assert_eq!(desktop.info().mesh_id, Some(mesh_id));
     phone.shutdown().await.unwrap();
     drop(phone);
     assert_eq!(desktop.ping(laptop_id).await.unwrap().id, laptop_id);
@@ -86,7 +95,7 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
         .add(&fourth.pair(Duration::from_secs(60)).await.unwrap())
         .await
         .unwrap();
-    assert_eq!(fourth.info().mesh_id, Some(phone_id));
+    assert_eq!(fourth.info().mesh_id, Some(mesh_id));
     assert_eq!(fourth.ping(laptop_id).await.unwrap().id, laptop_id);
     assert_eq!(desktop.ping(fourth_id).await.unwrap().id, fourth_id);
     fourth.shutdown().await.unwrap();
@@ -99,8 +108,9 @@ async fn enrollment_rejects_wrong_mesh_replays_and_expired_tickets() {
     let (a_dir, _) = initialized("a");
     let (b_dir, _) = initialized("b");
     let (c_dir, _) = initialized("c");
-    Node::create_mesh(a_dir.path(), "one").unwrap();
-    Node::create_mesh(b_dir.path(), "two").unwrap();
+    let a_mesh = Node::create_mesh(a_dir.path(), "personal").unwrap().mesh_id;
+    let b_mesh = Node::create_mesh(b_dir.path(), "personal").unwrap().mesh_id;
+    assert_ne!(a_mesh, b_mesh);
     let a = local(&a_dir).await;
     let b = local(&b_dir).await;
     let c = local(&c_dir).await;

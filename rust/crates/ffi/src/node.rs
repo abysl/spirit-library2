@@ -35,6 +35,7 @@ pub struct MeshPeer {
 pub struct MeshStatus {
     pub id: String,
     pub name: String,
+    pub mesh_id: Option<String>,
     pub mesh_name: Option<String>,
     pub peers: Vec<MeshPeer>,
 }
@@ -103,6 +104,7 @@ impl SpiritNode {
         Ok(MeshStatus {
             id: info.id.to_string(),
             name: info.name,
+            mesh_id: info.mesh_id.map(|id| id.to_string()),
             mesh_name: info.mesh_name,
             peers,
         })

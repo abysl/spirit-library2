@@ -1,10 +1,12 @@
 mod membership;
+mod mesh_id;
 mod network;
 mod presence;
 mod storage;
 
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
+pub use mesh_id::MeshId;
 pub use presence::{PeerStatus, CONNECTED_WINDOW, HEARTBEAT_INTERVAL};
 pub use storage::write_private;
 
@@ -24,7 +26,7 @@ use tokio::task::JoinHandle;
 pub struct NodeInfo {
     pub id: NodeId,
     pub name: String,
-    pub mesh_id: Option<NodeId>,
+    pub mesh_id: Option<MeshId>,
     pub mesh_name: Option<String>,
     pub members: Vec<Member>,
 }
@@ -314,7 +316,7 @@ mod tests {
         let info = NodeInfo {
             id: a.id,
             name: a.name.clone(),
-            mesh_id: Some(a.id),
+            mesh_id: Some(MeshId::legacy(a.id)),
             mesh_name: Some("home".into()),
             members: vec![a.clone(), b.clone()],
         };

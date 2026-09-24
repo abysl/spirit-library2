@@ -171,6 +171,9 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
                 "Mesh: {}",
                 info.mesh_name.as_deref().unwrap_or("not enrolled")
             );
+            if let Some(mesh_id) = info.mesh_id {
+                println!("Mesh ID: {mesh_id}");
+            }
             println!("Members: {}", info.members.len());
         }
         MeshCommand::Members { ids } => {
