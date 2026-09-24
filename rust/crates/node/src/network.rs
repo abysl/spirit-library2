@@ -300,10 +300,11 @@ impl Shared {
     fn answer_sync(&self, snapshot: &Snapshot, remote: NodeId) -> Result<Snapshot> {
         let departure = self.state.lock().unwrap().departure(snapshot.mesh.id);
         if let Some(departure) = departure {
-            snapshot.verify()?;
             ensure!(
-                snapshot.mesh.member(remote).is_some(),
-                "peer is not a mesh member"
+                departure.mesh.same_identity(&snapshot.mesh)
+                    && snapshot.mesh.member(remote).is_some()
+                    && snapshot.verify().is_ok(),
+                "device is not enrolled"
             );
             return Ok(departure);
         }
@@ -656,6 +657,60 @@ mod tests {
         assert_eq!(c.ping(b_id).await.unwrap().id, b_id);
         a.shared.sync(c.shared.endpoint.addr()).await.unwrap();
         assert!(a.info().members.iter().any(|member| member.id == b_id));
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn departed_copy_is_not_sent_to_a_self_founded_mesh_reusing_its_id() {
+        let (_a_dir, a) = device("founder-private-unique").await;
+        let (_b_dir, b) = device("departed-private-unique").await;
+        let (_c_dir, c) = device("c outsider nickname").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("private mesh name").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let mesh_id = a.info().mesh_id.unwrap();
+        b.leave().await.unwrap();
+        let forged = Mesh::create_with_id(
+            mesh_id,
+            "outsider mesh",
+            c.shared.state.lock().unwrap().member.clone(),
+            &c.shared.storage.key,
+        )
+        .unwrap();
+        assert_ne!(
+            forged.founder,
+            b.shared.state.lock().unwrap().departed[&mesh_id].founder
+        );
+        c.shared
+            .update(|state| {
+                state.mesh = Some(forged);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = c.shared.snapshot().unwrap();
+        assert!(snapshot.verify().is_ok());
+        assert_eq!(
+            b.shared
+                .answer_sync(&snapshot, c.info().id)
+                .unwrap_err()
+                .to_string(),
+            "device is not enrolled"
+        );
+        let response: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &snapshot)
+            .await;
+        let error = response.unwrap_err().to_string();
+        assert!(!error.contains("private mesh name"));
+        assert!(!error.contains("founder-private-unique"));
+        assert!(!error.contains("departed-private-unique"));
+        assert!(b.shared.state.lock().unwrap().mesh.is_none());
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
         }

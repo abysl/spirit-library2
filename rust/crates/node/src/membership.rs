@@ -160,13 +160,27 @@ impl Departure {
 
 impl Mesh {
     pub fn create(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
+        Self::with_id(MeshId::generate()?, name, member, key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_id(
+        id: MeshId,
+        name: &str,
+        member: Member,
+        key: &SecretKey,
+    ) -> Result<Self> {
+        Self::with_id(id, name, member, key)
+    }
+
+    fn with_id(id: MeshId, name: &str, member: Member, key: &SecretKey) -> Result<Self> {
         validate_name(name)?;
         ensure!(
             member.id == key.public(),
             "founder identity does not match key"
         );
         let mut mesh = Self {
-            id: MeshId::generate()?,
+            id,
             name: name.to_owned(),
             founder: Some(member.id),
             admissions: Vec::new(),
@@ -324,10 +338,14 @@ impl Mesh {
         Ok(())
     }
 
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.id == other.id && self.name == other.name && self.founder == other.founder
+    }
+
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         other.verify()?;
         ensure!(
-            self.id == other.id && self.name == other.name && self.founder == other.founder,
+            self.same_identity(other),
             "device belongs to a different mesh"
         );
         let mut merged = self.clone();
