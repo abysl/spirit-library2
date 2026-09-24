@@ -57,8 +57,16 @@ impl<'a> VerifiedSnapshot<'a> {
         Ok(Self(snapshot))
     }
 
+    pub fn from_verified_local(snapshot: &'a Snapshot) -> Self {
+        Self(snapshot)
+    }
+
     pub fn snapshot(&self) -> &'a Snapshot {
         self.0
+    }
+
+    pub fn merge_into(&self, mesh: &mut Mesh) -> Result<()> {
+        mesh.merge_trusted(&self.0.mesh)
     }
 }
 
@@ -361,6 +369,12 @@ impl Mesh {
             .is_some_and(|admission| self.departed_generation(id, admission.generation))
     }
 
+    pub fn records_departure_at(&self, other: &Self, id: EndpointId) -> bool {
+        other
+            .latest_admission(id)
+            .is_some_and(|admission| self.departed_generation(id, admission.generation))
+    }
+
     pub fn admit(&mut self, member: Member, key: &SecretKey) -> Result<()> {
         ensure!(
             self.member(key.public()).is_some(),
@@ -410,7 +424,7 @@ impl Mesh {
         self.id == other.id && self.name == other.name && self.founder == other.founder
     }
 
-    pub fn merge_trusted(&mut self, other: &Self) -> Result<()> {
+    fn merge_trusted(&mut self, other: &Self) -> Result<()> {
         ensure!(
             self.same_identity(other),
             "device belongs to a different mesh"

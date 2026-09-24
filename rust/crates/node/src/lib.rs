@@ -56,6 +56,18 @@ impl NodeInfo {
         }
     }
 
+    pub fn select_mesh(&self, selected: Option<MeshId>) -> Result<MeshId> {
+        if let Some(id) = selected {
+            ensure!(
+                self.meshes.iter().any(|mesh| mesh.id == id),
+                "device is not a member of this mesh"
+            );
+            Ok(id)
+        } else {
+            self.only_mesh()
+        }
+    }
+
     pub fn resolve(&self, nickname_or_id: &str) -> Result<Member> {
         if let Ok(id) = nickname_or_id.parse::<NodeId>() {
             if let Some(member) = self.members.iter().find(|m| m.id == id) {
@@ -329,10 +341,24 @@ impl Node {
         }
         let joined = joined_after_retry(response)?;
         ensure!(
+            joined.mesh.id == mesh_id,
+            "enrollment response names a different mesh"
+        );
+        ensure!(
+            self.shared
+                .state
+                .lock()
+                .unwrap()
+                .meshes
+                .get(&mesh_id)
+                .is_some_and(|mesh| mesh.same_identity(&joined.mesh)),
+            "enrollment response has a different mesh identity"
+        );
+        ensure!(
             joined.mesh.member(member.id) == Some(&member),
             "enrollment did not admit the expected device"
         );
-        self.shared.merge(&joined, member.id)?;
+        self.shared.merge_current(&joined, member.id)?;
         Ok(member)
     }
 
@@ -370,7 +396,7 @@ impl Node {
                         state
                             .addresses
                             .get(&member.id)
-                            .cloned()
+                            .and_then(|entry| entry.dial().cloned())
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
