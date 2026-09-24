@@ -195,35 +195,20 @@ impl Departure {
 
 impl Mesh {
     pub fn create(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
-        validate_name(name)?;
-        ensure!(
-            member.id == key.public(),
-            "founder identity does not match key"
-        );
-        Self::create_with_id(name, member, key, MeshId::generate()?)
+        Self::with_id(MeshId::generate()?, name, member, key)
     }
 
     #[cfg(test)]
-    pub(crate) fn create_legacy(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
-        let mut mesh = Self {
-            id: MeshId::legacy(key.public()),
-            name: name.into(),
-            founder: None,
-            admissions: Vec::new(),
-            departures: Vec::new(),
-        };
-        mesh.admissions
-            .push(Admission::signed(&mesh, member, 0, key)?);
-        mesh.verify()?;
-        Ok(mesh)
-    }
-
     pub(crate) fn create_with_id(
+        id: MeshId,
         name: &str,
         member: Member,
         key: &SecretKey,
-        id: MeshId,
     ) -> Result<Self> {
+        Self::with_id(id, name, member, key)
+    }
+
+    fn with_id(id: MeshId, name: &str, member: Member, key: &SecretKey) -> Result<Self> {
         validate_name(name)?;
         ensure!(
             member.id == key.public(),
@@ -233,6 +218,21 @@ impl Mesh {
             id,
             name: name.to_owned(),
             founder: Some(member.id),
+            admissions: Vec::new(),
+            departures: Vec::new(),
+        };
+        mesh.admissions
+            .push(Admission::signed(&mesh, member, 0, key)?);
+        mesh.verify()?;
+        Ok(mesh)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_legacy(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
+        let mut mesh = Self {
+            id: MeshId::legacy(key.public()),
+            name: name.into(),
+            founder: None,
             admissions: Vec::new(),
             departures: Vec::new(),
         };

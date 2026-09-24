@@ -751,10 +751,10 @@ mod tests {
             .unwrap();
         b.leave(id).await.unwrap();
         let forged = Mesh::create_with_id(
+            id,
             "decoy",
             c.shared.state.lock().unwrap().member.clone(),
             &c.shared.storage.key,
-            id,
         )
         .unwrap();
         let forged = Snapshot::without_addresses(forged);
@@ -1261,6 +1261,59 @@ mod tests {
             .await
             .unwrap();
         assert!(a.info().members.iter().any(|member| member.id == b_id));
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn departed_copy_is_not_sent_to_a_self_founded_mesh_reusing_its_id() {
+        let (_a_dir, a) = device("founder-private-unique").await;
+        let (_b_dir, b) = device("departed-private-unique").await;
+        let (_c_dir, c) = device("c outsider nickname").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        let mesh_id = a.new_mesh("private mesh name").unwrap();
+        a.add(mesh_id, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        b.leave(mesh_id).await.unwrap();
+        let forged = Mesh::create_with_id(
+            mesh_id,
+            "outsider mesh",
+            c.shared.state.lock().unwrap().member.clone(),
+            &c.shared.storage.key,
+        )
+        .unwrap();
+        assert_ne!(
+            forged.founder,
+            b.shared.state.lock().unwrap().departed[&mesh_id].founder
+        );
+        c.shared
+            .update(|state| {
+                state.meshes.insert(mesh_id, forged);
+                Ok(((), true))
+            })
+            .unwrap();
+        let snapshot = c.shared.snapshot(mesh_id).unwrap();
+        assert!(snapshot.verify().is_ok());
+        assert_eq!(
+            b.shared
+                .answer_sync(&snapshot, c.info().id)
+                .unwrap_err()
+                .to_string(),
+            "mesh unavailable"
+        );
+        let response: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &snapshot)
+            .await;
+        let error = response.unwrap_err().to_string();
+        assert!(!error.contains("private mesh name"));
+        assert!(!error.contains("founder-private-unique"));
+        assert!(!error.contains("departed-private-unique"));
+        assert!(!b.shared.state.lock().unwrap().meshes.contains_key(&mesh_id));
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
         }
