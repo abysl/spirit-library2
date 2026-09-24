@@ -515,10 +515,13 @@ impl Protocol {
                         joined: Err("could not join this mesh".into()),
                         departure: Some(departure),
                     },
-                    Err(_error) => EnrollmentReply {
-                        joined: Err("could not join this mesh".into()),
-                        departure: None,
-                    },
+                    Err(error) => {
+                        self.shared.failed(remote, &error);
+                        EnrollmentReply {
+                            joined: Err("could not join this mesh".into()),
+                            departure: None,
+                        }
+                    }
                 })?
             }
             Kind::Sync => {
@@ -665,6 +668,36 @@ mod tests {
             .accept(alpn, FakeResponder { response, hang })
             .spawn();
         (endpoint, router)
+    }
+
+    #[tokio::test]
+    async fn refused_pairing_records_a_known_peers_local_error() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let mesh_id = a.new_mesh("shared").unwrap();
+        a.add(mesh_id, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        b.pair(Duration::from_secs(60)).await.unwrap();
+        let invalid = Enrollment {
+            secret: [0; 32],
+            snapshot: a.shared.snapshot(mesh_id).unwrap(),
+        };
+        let reply: EnrollmentReply = a
+            .shared
+            .request(b.shared.endpoint.addr(), PAIR_ALPN, &invalid)
+            .await
+            .unwrap();
+        assert_eq!(reply.joined.unwrap_err(), "could not join this mesh");
+        assert!(b.peers()[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("invalid pairing secret"));
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     #[tokio::test]
