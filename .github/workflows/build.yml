@@ -70,9 +70,9 @@ jobs:
       - name: Build native library, bindings, and CLI
         working-directory: kmp
         run: ./gradlew prepareNative -ParchiveTarget='${{ matrix.target }}' --console=plain --max-workers=2
-      - name: Test JVM SDK and app
+      - name: Test mesh, JVM SDK, and app
         working-directory: kmp
-        run: ./gradlew :sdk:jvmTest :demo:shared:jvmTest --console=plain --max-workers=2
+        run: ./gradlew :mesh:jvmTest :sdk:jvmTest :demo:shared:jvmTest --console=plain --max-workers=2
       - name: Package desktop app
         working-directory: kmp
         run: ./gradlew :demo:desktopApp:packageDistributionForCurrentOS --console=plain --max-workers=2
@@ -100,6 +100,7 @@ jobs:
           path: |
             kmp/demo/desktopApp/build/compose/logs/
             kmp/demo/desktopApp/build/compose/tmp/*.args.txt
+            kmp/mesh/build/test-results/
             kmp/sdk/build/test-results/
             kmp/demo/shared/build/test-results/
           retention-days: 7
@@ -166,9 +167,9 @@ jobs:
           distribution: temurin
           java-version: '25'
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
-      - name: Build web distributions
+      - name: Compile mesh tests and build web distributions
         working-directory: kmp
-        run: ./gradlew :demo:webApp:jsBrowserDistribution :demo:webApp:wasmJsBrowserDistribution --console=plain --max-workers=2
+        run: ./gradlew :mesh:compileTestKotlinJs :mesh:compileTestKotlinWasmJs :demo:webApp:jsBrowserDistribution :demo:webApp:wasmJsBrowserDistribution --console=plain --max-workers=2
       - name: Upload JavaScript web app
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
