@@ -5,6 +5,9 @@ use anyhow::{ensure, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 const MAX_DEPARTED_MESHES: usize = 64;
 
@@ -23,9 +26,6 @@ fn read_departed<'de, D: Deserializer<'de>>(
         None => BTreeMap::new(),
     })
 }
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
@@ -154,7 +154,7 @@ impl Storage {
     }
 
     pub fn read(root: &Path) -> Result<State> {
-        let state: State = serde_json::from_slice(
+        let mut state: State = serde_json::from_slice(
             &std::fs::read(root.join("state.json"))
                 .context("node is not initialized; run spirit node init")?,
         )?;
@@ -176,6 +176,11 @@ impl Storage {
                 state.departed.contains_key(id) && seen.insert(*id),
                 "invalid departure order"
             );
+        }
+        for id in state.departed.keys() {
+            if !seen.contains(id) {
+                state.departure_order.push(*id);
+            }
         }
         for (id, departed) in &state.departed {
             ensure!(
@@ -281,12 +286,9 @@ impl State {
         if mesh.members().next().is_some() {
             self.departure_order.retain(|id| *id != mesh.id);
             if self.departed.len() == MAX_DEPARTED_MESHES && !self.departed.contains_key(&mesh.id) {
-                let oldest = self
-                    .departed
-                    .keys()
-                    .find(|id| !self.departure_order.contains(id))
-                    .copied()
-                    .or_else(|| self.departure_order.first().copied())
+                let oldest = *self
+                    .departure_order
+                    .first()
                     .context("missing oldest departure")?;
                 self.departed.remove(&oldest);
                 self.departure_order.retain(|id| *id != oldest);
@@ -367,11 +369,9 @@ mod tests {
         .unwrap();
         let reopened = Storage::read(dir.path()).unwrap();
         assert!(reopened.departed.contains_key(&id));
+        assert_eq!(reopened.departure_order, [id]);
         storage.save(&reopened).unwrap();
-        assert!(Storage::read(dir.path())
-            .unwrap()
-            .departed
-            .contains_key(&id));
+        assert_eq!(Storage::read(dir.path()).unwrap().departure_order, [id]);
     }
 
     #[test]
@@ -399,7 +399,10 @@ mod tests {
         let mut invalid = valid.clone();
         invalid.departed.get_mut(&id).unwrap().name = "tampered".into();
         storage.save(&invalid).unwrap();
-        assert!(Storage::read(dir.path()).is_err());
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid admission signature"));
         let mut invalid = valid.clone();
         let wrong = MeshId::generate().unwrap();
         let copy = invalid.departed.remove(&id).unwrap();
@@ -410,6 +413,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match its key"));
+    }
+
+    #[test]
+    fn reading_rejects_duplicate_and_dangling_departure_order_ids() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let id = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        let mut duplicate = state.clone();
+        duplicate.departure_order.push(id);
+        storage.save(&duplicate).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid departure order"));
+        state.departure_order.push(MeshId::generate().unwrap());
+        storage.save(&state).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid departure order"));
+    }
+
+    #[test]
+    fn migrated_departures_are_appended_after_recorded_order() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let first = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        let second = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        state.departure_order.remove(0);
+        storage.save(&state).unwrap();
+        let reopened = Storage::read(dir.path()).unwrap();
+        assert_eq!(reopened.departure_order, [second, first]);
+        let mut reopened = reopened;
+        for _ in 0..MAX_DEPARTED_MESHES - 1 {
+            joined_mesh(&mut reopened, &storage.key, &peer);
+            reopened.leave(&storage.key).unwrap();
+        }
+        assert!(!reopened.departed.contains_key(&second));
+        assert!(reopened.departed.contains_key(&first));
     }
 
     #[test]
@@ -425,7 +470,7 @@ mod tests {
         assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
         assert!(!state.departed.contains_key(&first));
         let mut invalid = state.clone();
-        let extra = joined_mesh(&mut invalid, &storage.key, &peer);
+        joined_mesh(&mut invalid, &storage.key, &peer);
         invalid.leave(&storage.key).unwrap();
         invalid.departed.insert(
             first,
@@ -436,9 +481,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("too many departed meshes"));
-        assert!(state.departure(extra).is_none());
-        state.mesh = Some(Mesh::create("solo", state.member.clone(), &storage.key).unwrap());
+        let solo = Mesh::create("solo", state.member.clone(), &storage.key).unwrap();
+        let solo_id = solo.id;
+        state.mesh = Some(solo);
         state.leave(&storage.key).unwrap();
         assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
+        assert!(!state.departed.contains_key(&solo_id));
     }
 }

@@ -673,44 +673,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn measure_members_at_admission_cap() {
-        use std::hint::black_box;
-        use std::time::Instant;
-        let root = SecretKey::generate();
-        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
-        let keys: Vec<_> = (0..MAX_ADMISSIONS - 1)
-            .map(|_| SecretKey::generate())
-            .collect();
-        for (index, key) in keys.iter().enumerate() {
-            mesh.admit(member(key, &index.to_string()), &root).unwrap();
-        }
-        for key in keys.iter().take(127) {
-            mesh.depart(key).unwrap();
-        }
-        let rounds = 1000;
-        let before = Instant::now();
-        for _ in 0..rounds {
-            black_box(
-                mesh.admissions
-                    .iter()
-                    .filter(|admission| {
-                        mesh.latest_admission(admission.member.id)
-                            .is_some_and(|latest| latest.generation == admission.generation)
-                            && !mesh.departed_generation(admission.member.id, admission.generation)
-                    })
-                    .count(),
-            );
-        }
-        let old = before.elapsed();
-        let after = Instant::now();
-        for _ in 0..rounds {
-            black_box(mesh.members().count());
-        }
-        println!("256 admissions, 127 departures: previous members(): {:?}/call; current members(): {:?}/call", old / rounds, after.elapsed() / rounds);
-    }
-
-    #[test]
     fn remaining_members_keep_admitting_after_the_founder_leaves() {
         let root = SecretKey::generate();
         let middle = SecretKey::generate();

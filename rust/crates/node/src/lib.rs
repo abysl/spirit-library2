@@ -136,14 +136,6 @@ pub struct Node {
     gossip: JoinHandle<()>,
 }
 
-fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::Snapshot> {
-    ensure!(
-        response.departure.is_none(),
-        "device refused readmission twice; update the introducing device if it runs an older Spirit"
-    );
-    response.joined.map_err(anyhow::Error::msg)
-}
-
 impl Node {
     pub fn init(root: impl AsRef<Path>, name: &str) -> Result<NodeInfo> {
         Storage::init(root.as_ref(), name)
@@ -331,7 +323,6 @@ impl Node {
                 Ok((state.leave(&self.shared.storage.key)?, peers))
             })?;
             *pending = None;
-            self.shared.presence.lock().unwrap().clear();
             (departure, peers)
         };
         let remaining_members = peers.len();
@@ -369,6 +360,14 @@ impl Node {
         self.router.shutdown().await?;
         Ok(())
     }
+}
+
+fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::Snapshot> {
+    ensure!(
+        response.departure.is_none(),
+        "device refused readmission twice; update the introducing device if it runs an older Spirit"
+    );
+    response.joined.map_err(anyhow::Error::msg)
 }
 
 impl Drop for Node {

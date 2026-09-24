@@ -84,14 +84,20 @@ impl Shared {
     }
 
     fn failed(&self, id: NodeId, error: &anyhow::Error) {
-        if self.is_member(id) {
-            self.presence
-                .lock()
-                .unwrap()
-                .entry(id)
-                .or_default()
-                .failed(format!("{error:#}"));
+        let state = self.state.lock().unwrap();
+        if !state
+            .mesh
+            .as_ref()
+            .is_some_and(|mesh| mesh.member(id).is_some())
+        {
+            return;
         }
+        self.presence
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .failed(format!("{error:#}"));
     }
 
     fn record_failure<T>(&self, id: NodeId, result: &Result<T>) {
@@ -689,6 +695,12 @@ mod tests {
             .shared
             .request(a.shared.endpoint.addr(), DEPART_ALPN, &departure)
             .await;
+        assert!(a
+            .shared
+            .record_departure(&departure, c.info().id)
+            .unwrap_err()
+            .to_string()
+            .contains("peer has not left this mesh"));
         assert!(relayed.is_err());
         let different = Mesh::create(
             "different",
@@ -709,9 +721,15 @@ mod tests {
             .request(
                 a.shared.endpoint.addr(),
                 DEPART_ALPN,
-                &Snapshot::without_addresses(different),
+                &Snapshot::without_addresses(different.clone()),
             )
             .await;
+        assert!(a
+            .shared
+            .record_departure(&Snapshot::without_addresses(different), b.info().id)
+            .unwrap_err()
+            .to_string()
+            .contains("device is not a member of this mesh"));
         assert!(other.is_err());
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
@@ -721,9 +739,11 @@ mod tests {
     #[tokio::test]
     async fn multiple_departures_keep_old_mesh_available_for_pull_and_readmission() {
         let (_a_dir, a) = device("a").await;
-        let (b_dir, b) = device("b").await;
-        a.gossip.abort();
-        b.gossip.abort();
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
         a.new_mesh("one").unwrap();
         a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
             .await
@@ -734,45 +754,132 @@ mod tests {
         drop(a);
         b.leave().await.unwrap();
         b.new_mesh("two").unwrap();
+        b.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second_id = b.info().mesh_id.unwrap();
         b.leave().await.unwrap();
-        assert!(b
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .departed
-            .contains_key(&original_id));
+        {
+            let state = b.shared.state.lock().unwrap();
+            assert!(state.departed.contains_key(&original_id));
+            assert!(state.departed.contains_key(&second_id));
+            assert_eq!(state.departure_order, [original_id, second_id]);
+        }
         let a = Node::bind(_a_dir.path(), NodeConfig::local())
             .await
             .unwrap();
         a.gossip.abort();
         assert!(a.info().members.iter().any(|member| member.id == b_id));
-        let pull: Snapshot = a
-            .shared
-            .request(
-                b.shared.endpoint.addr(),
-                SYNC_ALPN,
-                &a.shared.snapshot().unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(pull.mesh.departed(b_id));
-        a.shared.record_departure(&pull, b_id).unwrap();
+        a.shared.sync(b.shared.endpoint.addr()).await.unwrap();
         assert!(!a.info().members.iter().any(|member| member.id == b_id));
         a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
             .await
             .unwrap();
         assert_eq!(b.info().mesh_id, Some(original_id));
-        assert!(!b
-            .shared
-            .state
-            .lock()
-            .unwrap()
-            .departed
-            .contains_key(&original_id));
+        {
+            let state = b.shared.state.lock().unwrap();
+            assert!(!state.departed.contains_key(&original_id));
+            assert!(state.departed.contains_key(&second_id));
+            assert_eq!(state.departure_order, [second_id]);
+        }
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_departure_no_longer_prevents_stale_readmission() {
+        let (a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.shared.sync(b.shared.endpoint.addr()).await.unwrap();
+        let mesh_id = a.info().mesh_id.unwrap();
+        let b_id = b.info().id;
         a.shutdown().await.unwrap();
-        b.shutdown().await.unwrap();
-        drop(b_dir);
+        drop(a);
+
+        assert_eq!(b.leave().await.unwrap().notified_members, 1);
+        assert!(!c.info().members.iter().any(|member| member.id == b_id));
+        let peer = c.shared.state.lock().unwrap().member.clone();
+        for _ in 0..64 {
+            b.shared
+                .update(|state| {
+                    let mut mesh =
+                        Mesh::create("later", state.member.clone(), &b.shared.storage.key)?;
+                    mesh.admit(peer.clone(), &b.shared.storage.key)?;
+                    state.mesh = Some(mesh);
+                    state.leave(&b.shared.storage.key)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(b.shared.state.lock().unwrap().departure(mesh_id).is_none());
+        let a = Node::bind(a_dir.path(), NodeConfig::local()).await.unwrap();
+        a.gossip.abort();
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+        assert!(a.shared.sync(b.shared.endpoint.addr()).await.is_err());
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(b.info().mesh_id, Some(mesh_id));
+        for node in [&a, &b] {
+            let state = node.shared.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .mesh
+                    .as_ref()
+                    .unwrap()
+                    .admissions
+                    .iter()
+                    .filter(|admission| admission.member.id == b_id)
+                    .map(|admission| admission.generation)
+                    .max(),
+                Some(0)
+            );
+        }
+        assert!(!c.info().members.iter().any(|member| member.id == b_id));
+        assert!(c
+            .ping(b_id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a member"));
+        b.leave().await.unwrap();
+        assert!(b.shared.state.lock().unwrap().departure(mesh_id).is_some());
+        c.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(c.info().members.iter().any(|member| member.id == b_id));
+        assert_eq!(
+            c.shared
+                .state
+                .lock()
+                .unwrap()
+                .mesh
+                .as_ref()
+                .unwrap()
+                .admissions
+                .iter()
+                .filter(|admission| admission.member.id == b_id)
+                .map(|admission| admission.generation)
+                .max(),
+            Some(1)
+        );
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
