@@ -170,7 +170,7 @@ fn a_device_leaves_its_mesh_and_is_enrolled_again() {
 
     assert_eq!(
         laptop.ok(&["mesh", "leave"]),
-        "Left personal and notified its 1 remaining members.\n"
+        "Left personal and notified its 1 remaining member.\n"
     );
     assert!(laptop
         .ok(&["mesh", "status"])
@@ -191,6 +191,6 @@ fn a_device_leaves_its_mesh_and_is_enrolled_again() {
     desktop.stop();
     assert_eq!(
         desktop.ok(&["mesh", "leave"]),
-        "Left personal. Notified 0 of 1 remaining members; the others learn this when they next reach this device while it is serving.\n"
+        "Left personal. Notified 0 of 1 remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving.\n"
     );
 }

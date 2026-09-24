@@ -50,7 +50,7 @@ class SpiritNodeLeaveTest {
                 member.createMesh("personal")
                 assertEquals("phone", member.add(leaver.pair().ticket))
                 val left = leaver.leaveMesh()
-                assertEquals(LeftMesh("personal", 1, 1, member.status().meshId!!), left)
+                assertEquals(LeftMesh(member.status().meshId!!, "personal", 1, 1), left)
                 assertEquals(null, leaver.status().meshName)
                 assertTrue(leaver.status().peers.isEmpty())
                 assertTrue(member.status().peers.isEmpty())

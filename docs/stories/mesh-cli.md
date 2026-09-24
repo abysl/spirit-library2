@@ -116,7 +116,7 @@ Expected output while the service is running and every other member is reachable
 Left personal and notified its 2 remaining members.
 ```
 
-The device keeps its identity and nickname but is no longer a member: it stops heartbeats, other members stop listing and pinging it, and outstanding pairing tickets are invalidated. Leaving also works while the service is stopped. Unreached members learn of the departure from any notified member, or from this device when they next reach it while it is serving.
+The device keeps its identity and nickname but is no longer a member: it stops heartbeats, other members stop listing and pinging it, and outstanding pairing tickets are invalidated. Leaving also works while the service is stopped. Unreached members learn of the departure from any notified member, or from this device when they next reach it while it is serving and still retains the departed mesh copy. The device retains at most 64 departed meshes, evicting the oldest departure first.
 
 To return, generate a fresh ticket on the device and redeem it from a remaining member with `mesh add`, as for a new device. It rejoins the same mesh with its original device ID. The device can instead create or join a different mesh. Leaving does not revoke its key, and there is no command to remove a different device.
 

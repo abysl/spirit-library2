@@ -333,10 +333,25 @@ class PairingSessionTest {
         session.leaveMesh()
 
         assertEquals(
-            "Left personal. Notified 0 of 1 devices; the rest learn this when they next reach this device",
+            "Left personal. Notified 0 of 1 devices; notified devices relay the departure; the rest can also learn it when they next reach this device",
             session.state.value.notice,
         )
         running.cancelAndJoin()
+    }
+
+    @Test
+    fun `cancelling the fresh ticket after leave does not hold up teardown`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        node.pairGate = CompletableDeferred()
+        val leaving = backgroundScope.launch { session.leaveMesh() }
+        runCurrent()
+        assertEquals(1, node.leaves)
+        assertNull(session.state.value.meshName)
+        leaving.cancelAndJoin()
+        running.cancelAndJoin()
+        assertEquals(1, node.shutdowns)
     }
 
     @Test
@@ -412,7 +427,7 @@ class PairingSessionTest {
             val remaining = snapshot.peers.size
             snapshot = snapshot.copy(meshName = null, meshId = null, peers = emptyList())
             leaves++
-            return LeftMesh(meshName, remaining, notifiedOnLeave ?: remaining, "mesh1_example")
+            return LeftMesh("mesh1_example", meshName, remaining, notifiedOnLeave ?: remaining)
         }
 
         override suspend fun shutdown() {

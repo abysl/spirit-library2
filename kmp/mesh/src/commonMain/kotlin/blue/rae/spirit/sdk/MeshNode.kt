@@ -11,7 +11,7 @@ data class NodePeer(
 data class NodeStatus(val id: String, val name: String, val meshName: String?, val peers: List<NodePeer>, val meshId: String? = null)
 data class PairingInvitation(val ticket: String, val width: Int, val modules: ByteArray, val lifetimeSeconds: Int)
 data class NodePong(val name: String, val elapsedMs: Long)
-data class LeftMesh(val meshName: String, val remainingMembers: Int, val notifiedMembers: Int, val meshId: String)
+data class LeftMesh(val meshId: String, val meshName: String, val remainingMembers: Int, val notifiedMembers: Int)
 
 interface MeshNode {
     suspend fun status(): NodeStatus

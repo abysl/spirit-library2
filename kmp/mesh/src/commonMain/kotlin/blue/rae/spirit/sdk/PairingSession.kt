@@ -153,13 +153,15 @@ class PairingSession(
                         )
                     }
                 }
-                try {
-                    offerTicket(activeNode, notice)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    mutableState.update { it.copy(error = TICKET_ERROR) }
+            }
+            try {
+                withActiveNode(cancellable = true) { activeNode ->
+                    offerTicket(activeNode, mutableState.value.notice)
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                mutableState.update { it.copy(error = TICKET_ERROR) }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -196,7 +198,7 @@ class PairingSession(
     private fun departureNotice(left: LeftMesh): String = when {
         left.remainingMembers <= 0 -> "Left ${left.meshName}"
         left.notifiedMembers >= left.remainingMembers -> "Left ${left.meshName} and notified its other devices"
-        else -> "Left ${left.meshName}. Notified ${left.notifiedMembers} of ${left.remainingMembers} devices; the rest learn this when they next reach this device"
+        else -> "Left ${left.meshName}. Notified ${left.notifiedMembers} of ${left.remainingMembers} devices; notified devices relay the departure; the rest can also learn it when they next reach this device"
     }
 
     private suspend fun openNode(): Boolean {
@@ -327,12 +329,12 @@ class PairingSession(
         actions.unlock()
     }
 
-    private suspend fun <T> withActiveNode(block: suspend (MeshNode) -> T): T {
+    private suspend fun <T> withActiveNode(cancellable: Boolean = false, block: suspend (MeshNode) -> T): T {
         currentCoroutineContext().ensureActive()
         return operations.withLock {
             currentCoroutineContext().ensureActive()
             val activeNode = checkNotNull(node) { "PairingSession node is not open" }
-            withContext(NonCancellable) { block(activeNode) }
+            if (cancellable) block(activeNode) else withContext(NonCancellable) { block(activeNode) }
         }
     }
     private fun devicesAt(now: Long, peers: Collection<PeerSample>): List<DeviceStatus> = peers.map { peer ->

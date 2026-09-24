@@ -64,7 +64,7 @@ class SpiritNode private constructor(
 
     override suspend fun leaveMesh(): LeftMesh = io {
         val left = ffi.leaveMesh()
-        LeftMesh(left.meshName, left.remainingMembers.toInt(), left.notifiedMembers.toInt(), left.meshId)
+        LeftMesh(left.meshId, left.meshName, left.remainingMembers.toInt(), left.notifiedMembers.toInt())
     }
 
     override suspend fun shutdown() = withContext(NonCancellable + dispatcher) { close() }

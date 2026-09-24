@@ -29,7 +29,7 @@ class PairingSessionPublicationTest {
             override suspend fun pair() = PairingInvitation("spirit1own", 1, byteArrayOf(1), 300)
             override suspend fun add(ticket: String) = "peer"
             override suspend fun ping(device: String) = NodePong(device, 0)
-            override suspend fun leaveMesh() = LeftMesh("personal", 0, 0, "mesh1_example")
+            override suspend fun leaveMesh() = LeftMesh("mesh1_example", "personal", 0, 0)
             override suspend fun shutdown() {
                 shutdowns.incrementAndGet()
             }

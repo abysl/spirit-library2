@@ -142,10 +142,11 @@ fn departure_message(left: &LeftMesh) -> String {
     match (left.notified_members, left.remaining_members) {
         (_, 0) => format!("Left {name}. No other members remained."),
         (notified, remaining) if notified == remaining => {
-            format!("Left {name} and notified its {remaining} remaining members.")
+            let members = if remaining == 1 { "member" } else { "members" };
+            format!("Left {name} and notified its {remaining} remaining {members}.")
         }
         (notified, remaining) => format!(
-            "Left {name}. Notified {notified} of {remaining} remaining members; the others learn this when they next reach this device while it is serving."
+            "Left {name}. Notified {notified} of {remaining} remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving."
         ),
     }
 }
