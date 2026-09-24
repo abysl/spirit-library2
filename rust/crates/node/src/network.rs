@@ -727,6 +727,19 @@ mod tests {
         let (_dir, a) = device("a").await;
         a.gossip.abort();
         let fake_key = SecretKey::generate();
+        let current = a.new_mesh("current").unwrap();
+        a.shared
+            .update(|state| {
+                state.meshes.get_mut(&current).unwrap().admit(
+                    crate::Member {
+                        id: fake_key.public(),
+                        name: "peer".into(),
+                    },
+                    &a.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
         let mut mesh = Mesh::create(
             "remote",
             crate::Member {
@@ -750,8 +763,10 @@ mod tests {
             false,
         )
         .await;
-        assert!(a.shared.sync(endpoint.addr(), mesh.id).await.is_err());
-        assert!(a.info().meshes.is_empty());
+        assert!(a.shared.sync(endpoint.addr(), current).await.is_err());
+        assert_eq!(a.info().meshes.len(), 1);
+        assert!(a.shared.state.lock().unwrap().meshes.contains_key(&current));
+        assert!(!a.shared.state.lock().unwrap().meshes.contains_key(&mesh.id));
         router.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
     }
