@@ -40,6 +40,28 @@ class SpiritNodeTest {
     }
 }
 
+class SpiritNodeLeaveTest {
+    @Test
+    fun `a device leaves, members drop it, and a member readmits it`() = runBlocking {
+        val memberDir = Files.createTempDirectory("spirit-kmp-node-a").toString()
+        val leaverDir = Files.createTempDirectory("spirit-kmp-node-b").toString()
+        SpiritNode.open(memberDir, "desktop", local = true).use { member ->
+            SpiritNode.open(leaverDir, "phone", local = true).use { leaver ->
+                member.createMesh("personal")
+                assertEquals("phone", member.add(leaver.pair().ticket))
+                val left = leaver.leaveMesh()
+                assertEquals(LeftMesh("personal", 1, 1, member.status().meshId!!), left)
+                assertEquals(null, leaver.status().meshName)
+                assertTrue(leaver.status().peers.isEmpty())
+                assertTrue(member.status().peers.isEmpty())
+                assertEquals("phone", member.add(leaver.pair().ticket))
+                assertEquals("personal", leaver.status().meshName)
+                assertEquals("phone", member.ping("phone").name)
+            }
+        }
+    }
+}
+
 class SpiritNodeNoIntroducerTest {
     @Test
     fun `third node enrolls through a member while the original inviter is offline`() = runBlocking {

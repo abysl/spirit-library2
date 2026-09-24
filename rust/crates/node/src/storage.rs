@@ -1,4 +1,5 @@
 use crate::membership::{validate_name, Member, Mesh, Snapshot};
+use crate::mesh_id::MeshId;
 use crate::NodeInfo;
 use anyhow::{ensure, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
@@ -13,6 +14,8 @@ pub(crate) struct State {
     pub member: Member,
     pub mesh: Option<Mesh>,
     pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departed: Option<Mesh>,
 }
 
 pub(crate) struct Storage {
@@ -92,6 +95,7 @@ impl Storage {
                 },
                 mesh: None,
                 addresses: BTreeMap::new(),
+                departed: None,
             })?;
         }
         let state = Self::read(root)?;
@@ -137,6 +141,17 @@ impl Storage {
                 "device is missing from its mesh"
             );
         }
+        if let Some(departed) = &state.departed {
+            departed.verify()?;
+            ensure!(
+                departed.departed(state.member.id),
+                "departed mesh does not record this device leaving"
+            );
+            ensure!(
+                state.mesh.as_ref().map(|mesh| mesh.id) != Some(departed.id),
+                "device cannot be a member of the mesh it left"
+            );
+        }
         Ok(state)
     }
 
@@ -158,7 +173,7 @@ impl State {
             members: self
                 .mesh
                 .as_ref()
-                .map(|mesh| mesh.admissions.iter().map(|a| a.member.clone()).collect())
+                .map(|mesh| mesh.members().cloned().collect())
                 .unwrap_or_default(),
         }
     }
@@ -179,15 +194,74 @@ impl State {
             snapshot.mesh.member(self.member.id) == Some(&self.member),
             "membership does not match this device"
         );
-        match &mut self.mesh {
-            Some(mesh) => mesh.merge(&snapshot.mesh)?,
-            None => self.mesh = Some(snapshot.mesh.clone()),
+        let mut mesh = match &self.mesh {
+            Some(mesh) => {
+                let mut mesh = mesh.clone();
+                mesh.merge(&snapshot.mesh)?;
+                mesh
+            }
+            None => snapshot.mesh.clone(),
+        };
+        if let Some(departed) = self.departed.as_ref().filter(|d| d.id == mesh.id) {
+            mesh.merge(departed)?;
+            ensure!(
+                mesh.member(self.member.id).is_some(),
+                "this device left that mesh"
+            );
+            self.departed = None;
         }
+        self.mesh = Some(mesh);
         for (id, addr) in &snapshot.addresses {
             if *id == source || !self.addresses.contains_key(id) {
                 self.addresses.insert(*id, addr.clone());
             }
         }
+        self.retain_member_addresses();
         Ok(())
+    }
+
+    pub fn merge_departure(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<()> {
+        snapshot.verify()?;
+        ensure!(
+            snapshot.mesh.departed(source),
+            "peer has not left this mesh"
+        );
+        self.mesh
+            .as_mut()
+            .context("device is not a mesh member")?
+            .merge(&snapshot.mesh)?;
+        self.retain_member_addresses();
+        Ok(())
+    }
+
+    pub fn leave(&mut self, key: &SecretKey) -> Result<Snapshot> {
+        let mut mesh = self.mesh.clone().context("device is not a mesh member")?;
+        mesh.depart(key)?;
+        self.mesh = None;
+        self.addresses.clear();
+        self.departed = Some(mesh.clone());
+        Ok(Snapshot::without_addresses(mesh))
+    }
+
+    pub fn departure(&self, mesh_id: MeshId) -> Option<Snapshot> {
+        self.departed
+            .as_ref()
+            .filter(|departed| departed.id == mesh_id)
+            .map(|departed| Snapshot::without_addresses(departed.clone()))
+    }
+
+    pub fn rejoin_conflict(&self, mesh: &Mesh) -> Result<Option<Snapshot>> {
+        let Some(departure) = self.departure(mesh.id) else {
+            return Ok(None);
+        };
+        let mut merged = mesh.clone();
+        merged.merge(&departure.mesh)?;
+        Ok(merged.departed(self.member.id).then_some(departure))
+    }
+
+    fn retain_member_addresses(&mut self) {
+        let mesh = self.mesh.as_ref();
+        self.addresses
+            .retain(|id, _| mesh.is_some_and(|mesh| mesh.member(*id).is_some()));
     }
 }

@@ -5,7 +5,7 @@ use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const MAX_MEMBERS: usize = 256;
+pub(crate) const MAX_ADMISSIONS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -17,6 +17,15 @@ pub struct Member {
 pub(crate) struct Admission {
     pub member: Member,
     pub issuer: EndpointId,
+    #[serde(default, skip_serializing_if = "is_first_generation")]
+    pub generation: u32,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Departure {
+    pub member: EndpointId,
+    pub generation: u32,
     signature: String,
 }
 
@@ -27,12 +36,18 @@ pub(crate) struct Mesh {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub founder: Option<EndpointId>,
     pub admissions: Vec<Admission>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub departures: Vec<Departure>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub mesh: Mesh,
     pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+}
+
+fn is_first_generation(generation: &u32) -> bool {
+    *generation == 0
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<()> {
@@ -43,8 +58,27 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn decode_signature(signature: &str) -> Result<Signature> {
+    let bytes: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(signature)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
+    Ok(Signature::from_bytes(&bytes))
+}
+
 impl Admission {
     fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
+        if self.generation > 0 {
+            return Ok(postcard::to_stdvec(&(
+                "spirit/mesh/readmission/1",
+                mesh.id,
+                mesh.founder,
+                &mesh.name,
+                &self.member,
+                self.issuer,
+                self.generation,
+            ))?);
+        }
         match mesh.id.random_bytes() {
             Some(id) => Ok(postcard::to_stdvec(&(
                 "spirit/mesh/admission/2",
@@ -64,10 +98,11 @@ impl Admission {
         }
     }
 
-    fn signed(mesh: &Mesh, member: Member, key: &SecretKey) -> Result<Self> {
+    fn signed(mesh: &Mesh, member: Member, generation: u32, key: &SecretKey) -> Result<Self> {
         let mut admission = Self {
             member,
             issuer: key.public(),
+            generation,
             signature: String::new(),
         };
         admission.signature =
@@ -77,14 +112,49 @@ impl Admission {
 
     fn verify(&self, mesh: &Mesh) -> Result<()> {
         validate_name(&self.member.name)?;
-        let bytes: [u8; 64] = URL_SAFE_NO_PAD
-            .decode(&self.signature)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid admission signature length"))?;
         self.issuer
-            .verify(&self.payload(mesh)?, &Signature::from_bytes(&bytes))
+            .verify(&self.payload(mesh)?, &decode_signature(&self.signature)?)
             .context("invalid admission signature")?;
         Ok(())
+    }
+
+    fn key(&self) -> (EndpointId, u32) {
+        (self.member.id, self.generation)
+    }
+}
+
+impl Departure {
+    fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(&(
+            "spirit/mesh/departure/1",
+            mesh.id,
+            mesh.founder,
+            &mesh.name,
+            self.member,
+            self.generation,
+        ))?)
+    }
+
+    fn signed(mesh: &Mesh, generation: u32, key: &SecretKey) -> Result<Self> {
+        let mut departure = Self {
+            member: key.public(),
+            generation,
+            signature: String::new(),
+        };
+        departure.signature =
+            URL_SAFE_NO_PAD.encode(key.sign(&departure.payload(mesh)?).to_bytes());
+        Ok(departure)
+    }
+
+    fn verify(&self, mesh: &Mesh) -> Result<()> {
+        self.member
+            .verify(&self.payload(mesh)?, &decode_signature(&self.signature)?)
+            .context("invalid departure signature")?;
+        Ok(())
+    }
+
+    fn key(&self) -> (EndpointId, u32) {
+        (self.member, self.generation)
     }
 }
 
@@ -100,8 +170,10 @@ impl Mesh {
             name: name.to_owned(),
             founder: Some(member.id),
             admissions: Vec::new(),
+            departures: Vec::new(),
         };
-        mesh.admissions.push(Admission::signed(&mesh, member, key)?);
+        mesh.admissions
+            .push(Admission::signed(&mesh, member, 0, key)?);
         mesh.verify()?;
         Ok(mesh)
     }
@@ -109,13 +181,33 @@ impl Mesh {
     pub fn verify(&self) -> Result<()> {
         validate_name(&self.name)?;
         ensure!(
-            !self.admissions.is_empty() && self.admissions.len() <= MAX_MEMBERS,
+            !self.admissions.is_empty() && self.admissions.len() <= MAX_ADMISSIONS,
             "invalid mesh size"
         );
-        let mut ids = BTreeSet::new();
+        ensure!(
+            self.departures.len() <= self.admissions.len(),
+            "invalid departure count"
+        );
+        let mut admissions = BTreeSet::new();
         for admission in &self.admissions {
             admission.verify(self)?;
-            ensure!(ids.insert(admission.member.id), "duplicate admission");
+            ensure!(admissions.insert(admission.key()), "duplicate admission");
+        }
+        let mut departures = BTreeSet::new();
+        for departure in &self.departures {
+            departure.verify(self)?;
+            ensure!(
+                admissions.contains(&departure.key()),
+                "departure has no matching admission"
+            );
+            ensure!(departures.insert(departure.key()), "duplicate departure");
+        }
+        for admission in &self.admissions {
+            ensure!(
+                admission.generation == 0
+                    || departures.contains(&(admission.member.id, admission.generation - 1)),
+                "readmission does not follow a departure"
+            );
         }
         let founder = match (self.id.legacy_node(), self.founder) {
             (Some(id), None) => id,
@@ -125,7 +217,7 @@ impl Mesh {
         let root = self
             .admissions
             .iter()
-            .find(|a| a.member.id == founder)
+            .find(|a| a.member.id == founder && a.generation == 0)
             .context("missing mesh founder")?;
         ensure!(root.issuer == founder, "invalid founding admission");
         let mut trusted = BTreeSet::from([founder]);
@@ -136,7 +228,11 @@ impl Mesh {
                     trusted.insert(admission.member.id);
                 }
             }
-            if trusted.len() == self.admissions.len() {
+            if self
+                .admissions
+                .iter()
+                .all(|admission| trusted.contains(&admission.issuer))
+            {
                 return Ok(());
             }
             if trusted.len() == before {
@@ -145,11 +241,39 @@ impl Mesh {
         }
     }
 
-    pub fn member(&self, id: EndpointId) -> Option<&Member> {
+    fn latest_admission(&self, id: EndpointId) -> Option<&Admission> {
         self.admissions
             .iter()
-            .map(|a| &a.member)
-            .find(|member| member.id == id)
+            .filter(|a| a.member.id == id)
+            .max_by_key(|a| a.generation)
+    }
+
+    fn departed_generation(&self, id: EndpointId, generation: u32) -> bool {
+        self.departures
+            .iter()
+            .any(|d| d.member == id && d.generation == generation)
+    }
+
+    pub fn member(&self, id: EndpointId) -> Option<&Member> {
+        self.latest_admission(id)
+            .filter(|admission| !self.departed_generation(id, admission.generation))
+            .map(|admission| &admission.member)
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = &Member> {
+        self.admissions
+            .iter()
+            .filter(|admission| {
+                self.latest_admission(admission.member.id)
+                    .is_some_and(|latest| latest.generation == admission.generation)
+                    && !self.departed_generation(admission.member.id, admission.generation)
+            })
+            .map(|admission| &admission.member)
+    }
+
+    pub fn departed(&self, id: EndpointId) -> bool {
+        self.latest_admission(id)
+            .is_some_and(|admission| self.departed_generation(id, admission.generation))
     }
 
     pub fn admit(&mut self, member: Member, key: &SecretKey) -> Result<()> {
@@ -166,10 +290,28 @@ impl Mesh {
         }
         validate_name(&member.name)?;
         ensure!(
-            self.admissions.len() < MAX_MEMBERS,
-            "mesh member limit reached"
+            self.admissions.len() < MAX_ADMISSIONS,
+            "mesh admission limit reached"
         );
-        self.admissions.push(Admission::signed(self, member, key)?);
+        let generation = match self.latest_admission(member.id) {
+            Some(departed) => departed
+                .generation
+                .checked_add(1)
+                .context("device readmission limit reached")?,
+            None => 0,
+        };
+        self.admissions
+            .push(Admission::signed(self, member, generation, key)?);
+        Ok(())
+    }
+
+    pub fn depart(&mut self, key: &SecretKey) -> Result<()> {
+        let admission = self
+            .latest_admission(key.public())
+            .filter(|admission| !self.departed_generation(key.public(), admission.generation))
+            .context("device is not a mesh member")?;
+        let departure = Departure::signed(self, admission.generation, key)?;
+        self.departures.push(departure);
         Ok(())
     }
 
@@ -181,13 +323,21 @@ impl Mesh {
         );
         let mut merged = self.clone();
         for admission in &other.admissions {
-            if let Some(existing) = merged.member(admission.member.id) {
-                ensure!(
-                    existing.name == admission.member.name,
+            match merged
+                .admissions
+                .iter()
+                .find(|a| a.key() == admission.key())
+            {
+                Some(existing) => ensure!(
+                    existing.member.name == admission.member.name,
                     "conflicting device nickname"
-                );
-            } else {
-                merged.admissions.push(admission.clone());
+                ),
+                None => merged.admissions.push(admission.clone()),
+            }
+        }
+        for departure in &other.departures {
+            if !merged.departures.iter().any(|d| d.key() == departure.key()) {
+                merged.departures.push(departure.clone());
             }
         }
         merged.verify()?;
@@ -197,10 +347,17 @@ impl Mesh {
 }
 
 impl Snapshot {
+    pub fn without_addresses(mesh: Mesh) -> Self {
+        Self {
+            mesh,
+            addresses: BTreeMap::new(),
+        }
+    }
+
     pub fn verify(&self) -> Result<()> {
         self.mesh.verify()?;
         ensure!(
-            self.addresses.len() <= MAX_MEMBERS,
+            self.addresses.len() <= MAX_ADMISSIONS,
             "too many peer addresses"
         );
         for (id, addr) in &self.addresses {
@@ -234,7 +391,7 @@ mod tests {
         let mut forged = mesh.clone();
         forged
             .admissions
-            .push(Admission::signed(&mesh, member(&child, "child"), &outsider).unwrap());
+            .push(Admission::signed(&mesh, member(&child, "child"), 0, &outsider).unwrap());
         assert!(forged.verify().is_err());
         let mut forged = mesh.clone();
         forged.name = "different".into();
@@ -276,6 +433,7 @@ mod tests {
             name: "private".into(),
             founder: None,
             admissions: Vec::new(),
+            departures: Vec::new(),
         };
         let root_member = member(&root, "root");
         let legacy_payload = postcard::to_stdvec(&(
@@ -289,6 +447,7 @@ mod tests {
         old.admissions.push(Admission {
             member: root_member,
             issuer: root.public(),
+            generation: 0,
             signature: URL_SAFE_NO_PAD.encode(root.sign(&legacy_payload).to_bytes()),
         });
         let stored = serde_json::to_value(&old).unwrap();
@@ -333,5 +492,92 @@ mod tests {
         mesh.admit(member(&child, "child"), &middle).unwrap();
         mesh.admissions.reverse();
         mesh.verify().unwrap();
+    }
+
+    #[test]
+    fn departures_hide_members_converge_and_permit_readmission() {
+        let root = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut before = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        before.admit(member(&child, "child"), &root).unwrap();
+        let mut left = before.clone();
+        left.depart(&child).unwrap();
+        left.verify().unwrap();
+        assert!(left.member(child.public()).is_none());
+        assert!(left.departed(child.public()));
+        assert_eq!(left.members().count(), 1);
+        assert!(left.depart(&child).is_err());
+        assert!(left.admit(member(&root, "root"), &child).is_err());
+
+        let mut stale = before.clone();
+        stale.merge(&left).unwrap();
+        assert!(stale.departed(child.public()));
+        left.merge(&before).unwrap();
+        assert!(left.departed(child.public()));
+
+        left.admit(member(&child, "child"), &root).unwrap();
+        left.verify().unwrap();
+        assert_eq!(left.member(child.public()), Some(&member(&child, "child")));
+        assert_eq!(left.members().count(), 2);
+        assert_eq!(left.admissions.last().unwrap().generation, 1);
+        let reopened: Mesh = serde_json::from_slice(&serde_json::to_vec(&left).unwrap()).unwrap();
+        reopened.verify().unwrap();
+        assert!(reopened.member(child.public()).is_some());
+        stale.merge(&reopened).unwrap();
+        assert!(stale.member(child.public()).is_some());
+        let first = serde_json::to_value(&before).unwrap();
+        assert!(first.get("departures").is_none());
+        assert!(first["admissions"][1].get("generation").is_none());
+    }
+
+    #[test]
+    fn departures_and_readmissions_must_be_signed_and_ordered() {
+        let root = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        mesh.admit(member(&child, "child"), &root).unwrap();
+
+        let mut forged = mesh.clone();
+        forged
+            .departures
+            .push(Departure::signed(&forged, 0, &root).unwrap());
+        forged.departures[0].member = child.public();
+        assert!(forged.verify().is_err());
+
+        let mut unmatched = mesh.clone();
+        unmatched
+            .departures
+            .push(Departure::signed(&unmatched, 1, &child).unwrap());
+        assert!(unmatched.verify().is_err());
+
+        let mut early = mesh.clone();
+        early
+            .admissions
+            .push(Admission::signed(&early, member(&child, "child"), 1, &root).unwrap());
+        assert!(early.verify().is_err());
+
+        let mut other = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        other.admit(member(&child, "child"), &root).unwrap();
+        let mut replayed = mesh.clone();
+        replayed
+            .departures
+            .push(Departure::signed(&other, 0, &child).unwrap());
+        assert!(replayed.verify().is_err());
+    }
+
+    #[test]
+    fn remaining_members_keep_admitting_after_the_founder_leaves() {
+        let root = SecretKey::generate();
+        let middle = SecretKey::generate();
+        let child = SecretKey::generate();
+        let mut mesh = Mesh::create("private", member(&root, "root"), &root).unwrap();
+        mesh.admit(member(&middle, "middle"), &root).unwrap();
+        mesh.depart(&root).unwrap();
+        mesh.admit(member(&child, "child"), &middle).unwrap();
+        mesh.verify().unwrap();
+        assert_eq!(
+            mesh.members().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            ["middle", "child"]
+        );
     }
 }

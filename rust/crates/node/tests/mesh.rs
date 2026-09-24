@@ -188,3 +188,83 @@ async fn heartbeat_errors_preserve_presence_until_recovery() {
     b.shutdown().await.unwrap();
     a.shutdown().await.unwrap();
 }
+
+async fn eventually(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn leaving_notifies_members_and_the_device_can_rejoin() {
+    let (a_dir, _) = initialized("a");
+    let (b_dir, b_id) = initialized("b");
+    let (c_dir, c_id) = initialized("c");
+    let mesh_id = Node::create_mesh(a_dir.path(), "personal").unwrap().mesh_id;
+    let a = local(&a_dir).await;
+    let b = local(&b_dir).await;
+    let c = local(&c_dir).await;
+    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+        .await
+        .unwrap();
+    a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+        .await
+        .unwrap();
+    eventually(|| b.info().members.len() == 3 && c.info().members.len() == 3).await;
+
+    let left = b.leave().await.unwrap();
+    assert_eq!(Some(left.mesh_id), mesh_id);
+    assert_eq!(left.mesh_name, "personal");
+    assert_eq!(left.remaining_members, 2);
+    assert_eq!(left.notified_members, 2);
+    assert!(b.info().mesh_id.is_none());
+    assert!(b.info().members.is_empty());
+    assert!(b.peers().is_empty());
+    assert!(a.info().members.iter().all(|member| member.id != b_id));
+    assert!(c.info().members.iter().all(|member| member.id != b_id));
+    assert!(a.ping(b_id).await.is_err());
+    assert!(b.ping(c_id).await.is_err());
+    assert!(b.leave().await.is_err());
+
+    b.shutdown().await.unwrap();
+    drop(b);
+    assert!(Node::read_info(b_dir.path()).unwrap().mesh_id.is_none());
+    let b = local(&b_dir).await;
+    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(b.info().mesh_id, mesh_id);
+    assert_eq!(b.info().members.len(), 3);
+    eventually(|| c.info().members.iter().any(|member| member.id == b_id)).await;
+    assert_eq!(b.ping(c_id).await.unwrap().id, c_id);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_founder_can_leave_without_stopping_the_mesh() {
+    let (a_dir, a_id) = initialized("a");
+    let (b_dir, _) = initialized("b");
+    let (c_dir, c_id) = initialized("c");
+    Node::create_mesh(a_dir.path(), "personal").unwrap();
+    let a = local(&a_dir).await;
+    let b = local(&b_dir).await;
+    let c = local(&c_dir).await;
+    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(a.leave().await.unwrap().notified_members, 1);
+    b.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+        .await
+        .unwrap();
+    assert!(c.info().members.iter().all(|member| member.id != a_id));
+    assert_eq!(b.ping(c_id).await.unwrap().id, c_id);
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    c.shutdown().await.unwrap();
+}

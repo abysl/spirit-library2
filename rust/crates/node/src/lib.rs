@@ -14,7 +14,7 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr, SecretKey};
 use membership::Mesh;
-use network::{Protocol, Shared, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
+use network::{Protocol, Shared, DEPART_ALPN, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -73,6 +73,14 @@ impl NodeConfig {
             request_timeout: Duration::from_secs(3),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LeftMesh {
+    pub mesh_id: MeshId,
+    pub mesh_name: String,
+    pub remaining_members: usize,
+    pub notified_members: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +153,18 @@ impl Node {
         Ok(state.info())
     }
 
+    pub fn leave_mesh(root: impl AsRef<Path>) -> Result<LeftMesh> {
+        let (storage, mut state) = Storage::open(root.as_ref())?;
+        let departure = state.leave(&storage.key)?;
+        storage.save(&state)?;
+        Ok(LeftMesh {
+            mesh_id: departure.mesh.id,
+            mesh_name: departure.mesh.name.clone(),
+            remaining_members: departure.mesh.members().count(),
+            notified_members: 0,
+        })
+    }
+
     pub async fn bind(root: impl AsRef<Path>, config: NodeConfig) -> Result<Self> {
         ensure!(
             !config.request_timeout.is_zero(),
@@ -171,6 +191,7 @@ impl Node {
             .accept(PAIR_ALPN, Protocol::pair(shared.clone()))
             .accept(SYNC_ALPN, Protocol::sync(shared.clone()))
             .accept(PING_ALPN, Protocol::ping(shared.clone()))
+            .accept(DEPART_ALPN, Protocol::depart(shared.clone()))
             .spawn();
         let gossip = tokio::spawn(network::gossip(shared.clone()));
         Ok(Self {
@@ -244,11 +265,30 @@ impl Node {
             ticket.address.id != self.info().id,
             "cannot enroll this device into itself"
         );
-        let mut snapshot = self.shared.snapshot()?;
         let member = Member {
             id: ticket.address.id,
             name: ticket.name.clone(),
         };
+        let mut response = self.enroll(&ticket, &member).await?;
+        if let Some(departure) = response.departure.take() {
+            self.shared.record_departure(&departure, member.id)?;
+            response = self.enroll(&ticket, &member).await?;
+        }
+        let joined = response.joined.map_err(anyhow::Error::msg)?;
+        ensure!(
+            joined.mesh.member(member.id) == Some(&member),
+            "enrollment did not admit the expected device"
+        );
+        self.shared.merge(&joined, member.id)?;
+        Ok(member)
+    }
+
+    async fn enroll(
+        &self,
+        ticket: &PairingTicket,
+        member: &Member,
+    ) -> Result<network::EnrollmentReply> {
+        let mut snapshot = self.shared.snapshot()?;
         snapshot
             .mesh
             .admit(member.clone(), &self.shared.storage.key)?;
@@ -257,17 +297,40 @@ impl Node {
             secret: ticket.secret,
             snapshot,
         };
-        let response: network::EnrollmentReply = self
-            .shared
-            .request(ticket.address, PAIR_ALPN, &request)
-            .await?;
-        let joined = response.joined.map_err(anyhow::Error::msg)?;
-        ensure!(
-            joined.mesh.member(member.id) == Some(&member),
-            "enrollment did not admit the expected device"
-        );
-        self.shared.merge(&joined, member.id)?;
-        Ok(member)
+        self.shared
+            .request(ticket.address.clone(), PAIR_ALPN, &request)
+            .await
+    }
+
+    pub async fn leave(&self) -> Result<LeftMesh> {
+        let (departure, peers) = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            let info = self.info();
+            let peers: Vec<_> = info
+                .members
+                .iter()
+                .filter(|member| member.id != info.id)
+                .map(|member| self.shared.address(member.id))
+                .collect();
+            let departure = self
+                .shared
+                .update(|state| state.leave(&self.shared.storage.key))?;
+            *pending = None;
+            (departure, peers)
+        };
+        self.shared.presence.lock().unwrap().clear();
+        let remaining_members = peers.len();
+        let left = LeftMesh {
+            mesh_id: departure.mesh.id,
+            mesh_name: departure.mesh.name.clone(),
+            remaining_members,
+            notified_members: 0,
+        };
+        let notified_members = self.shared.announce_departure(departure, peers).await;
+        Ok(LeftMesh {
+            notified_members,
+            ..left
+        })
     }
 
     pub async fn ping(&self, id: NodeId) -> Result<Pong> {
