@@ -76,6 +76,14 @@ impl NodeConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LeftMesh {
+    pub mesh_id: MeshId,
+    pub mesh_name: String,
+    pub remaining_members: usize,
+    pub notified_members: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pong {
     pub id: NodeId,
     pub name: String,
@@ -143,6 +151,18 @@ impl Node {
         state.mesh = Some(Mesh::create(name, state.member.clone(), &storage.key)?);
         storage.save(&state)?;
         Ok(state.info())
+    }
+
+    pub fn leave_mesh(root: impl AsRef<Path>) -> Result<LeftMesh> {
+        let (storage, mut state) = Storage::open(root.as_ref())?;
+        let departure = state.leave(&storage.key)?;
+        storage.save(&state)?;
+        Ok(LeftMesh {
+            mesh_id: departure.mesh.id,
+            mesh_name: departure.mesh.name.clone(),
+            remaining_members: departure.mesh.members().count(),
+            notified_members: 0,
+        })
     }
 
     pub async fn bind(root: impl AsRef<Path>, config: NodeConfig) -> Result<Self> {
