@@ -46,6 +46,13 @@ pub(crate) struct Enrollment {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EnrollmentReply {
     pub joined: std::result::Result<Snapshot, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departure: Option<Snapshot>,
+}
+
+pub(crate) enum Enrolled {
+    Joined(Snapshot),
+    Departed(Snapshot),
 }
 
 impl Shared {
@@ -262,7 +269,7 @@ impl Shared {
         result
     }
 
-    fn enroll(&self, request: Enrollment, remote: NodeId) -> Result<Snapshot> {
+    fn enroll(&self, request: Enrollment, remote: NodeId) -> Result<Enrolled> {
         let mut pending = self.pending.lock().unwrap();
         let ticket = pending
             .as_ref()
@@ -277,9 +284,17 @@ impl Shared {
             request.snapshot.mesh.member(remote).is_some(),
             "introducer is not a mesh member"
         );
+        if let Some(departure) = self
+            .state
+            .lock()
+            .unwrap()
+            .rejoin_conflict(&request.snapshot.mesh)?
+        {
+            return Ok(Enrolled::Departed(departure));
+        }
         self.merge(&request.snapshot, remote)?;
         *pending = None;
-        self.snapshot()
+        Ok(Enrolled::Joined(self.snapshot()?))
     }
 
     fn answer_sync(&self, snapshot: &Snapshot, remote: NodeId) -> Result<Snapshot> {
@@ -365,11 +380,19 @@ impl Protocol {
         let response = match self.kind {
             Kind::Pair => {
                 let request: Enrollment = serde_json::from_slice(&bytes)?;
-                serde_json::to_vec(&EnrollmentReply {
-                    joined: self
-                        .shared
-                        .enroll(request, remote)
-                        .map_err(|e| e.to_string()),
+                serde_json::to_vec(&match self.shared.enroll(request, remote) {
+                    Ok(Enrolled::Joined(snapshot)) => EnrollmentReply {
+                        joined: Ok(snapshot),
+                        departure: None,
+                    },
+                    Ok(Enrolled::Departed(departure)) => EnrollmentReply {
+                        joined: Err("this device left the mesh; update the introducing device if it runs an older Spirit, then record the departure before readmitting it".into()),
+                        departure: Some(departure),
+                    },
+                    Err(error) => EnrollmentReply {
+                        joined: Err(error.to_string()),
+                        departure: None,
+                    },
                 })?
             }
             Kind::Sync => {
@@ -557,6 +580,86 @@ mod tests {
         assert!(b.info().mesh_id.is_none());
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stale_member_learns_the_departure_while_readmitting_the_device() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let b_id = b.info().id;
+        assert!(c.info().members.iter().any(|member| member.id == b_id));
+        c.shutdown().await.unwrap();
+        drop(c);
+
+        assert_eq!(b.leave().await.unwrap().notified_members, 1);
+        let c = Node::bind(c_dir.path(), NodeConfig::local()).await.unwrap();
+        c.gossip.abort();
+        assert!(c.info().members.iter().any(|member| member.id == b_id));
+
+        let sync: Result<Snapshot> = c
+            .shared
+            .request(
+                b.shared.endpoint.addr(),
+                SYNC_ALPN,
+                &c.shared.snapshot().unwrap(),
+            )
+            .await;
+        assert!(sync.unwrap().mesh.departed(b_id));
+
+        let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
+        let mut stale = c.shared.snapshot().unwrap();
+        stale
+            .mesh
+            .admit(
+                b.shared.state.lock().unwrap().member.clone(),
+                &c.shared.storage.key,
+            )
+            .unwrap();
+        let refusal: EnrollmentReply = c
+            .shared
+            .request(
+                b.shared.endpoint.addr(),
+                PAIR_ALPN,
+                &Enrollment {
+                    secret: PairingTicket::decode(&ticket).unwrap().secret,
+                    snapshot: stale,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(refusal
+            .joined
+            .unwrap_err()
+            .contains("update the introducing device"));
+        assert!(refusal.departure.unwrap().mesh.departed(b_id));
+        assert!(b.shared.pending.lock().unwrap().is_some());
+        c.add(&ticket).await.unwrap();
+        let joined = b.shared.state.lock().unwrap().mesh.clone().unwrap();
+        assert!(joined
+            .admissions
+            .iter()
+            .any(|admission| admission.member.id == b_id
+                && admission.generation == 1
+                && admission.issuer == c.info().id));
+        assert_eq!(b.info().mesh_id, a.info().mesh_id);
+        assert!(b.shared.state.lock().unwrap().departed.is_empty());
+        assert_eq!(c.ping(b_id).await.unwrap().id, b_id);
+        a.shared.sync(c.shared.endpoint.addr()).await.unwrap();
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

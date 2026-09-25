@@ -305,6 +305,15 @@ impl State {
             .map(|departed| Snapshot::without_addresses(departed.clone()))
     }
 
+    pub fn rejoin_conflict(&self, mesh: &Mesh) -> Result<Option<Snapshot>> {
+        let Some(departure) = self.departure(mesh.id) else {
+            return Ok(None);
+        };
+        let mut merged = mesh.clone();
+        merged.merge(&departure.mesh)?;
+        Ok(merged.departed(self.member.id).then_some(departure))
+    }
+
     fn retain_member_addresses(&mut self) {
         let members: BTreeSet<_> = self
             .mesh
