@@ -11,6 +11,51 @@ use std::path::{Path, PathBuf};
 
 const MAX_DEPARTED_MESHES: usize = 64;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum AddressEntry {
+    Legacy(EndpointAddr),
+    Current {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct: Option<EndpointAddr>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        hints: BTreeMap<MeshId, EndpointAddr>,
+    },
+}
+
+impl AddressEntry {
+    fn preferred(&self, mesh_id: MeshId) -> Option<&EndpointAddr> {
+        match self {
+            Self::Current { direct, hints } => direct.as_ref().or_else(|| hints.get(&mesh_id)),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    pub fn dial(&self) -> Option<&EndpointAddr> {
+        match self {
+            Self::Current { direct, hints } => direct.as_ref().or_else(|| hints.values().next()),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    fn set(&mut self, mesh_id: MeshId, address: EndpointAddr, direct_source: bool) -> bool {
+        let Self::Current { direct, hints } = self else {
+            return false;
+        };
+        if direct_source {
+            if direct.as_ref() == Some(&address) {
+                return false;
+            }
+            *direct = Some(address);
+        } else if hints.get(&mesh_id) != Some(&address) {
+            hints.insert(mesh_id, address);
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
 fn read_departed<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<MeshId, Mesh>, D::Error> {
@@ -31,7 +76,7 @@ fn read_departed<'de, D: Deserializer<'de>>(
 pub(crate) struct State {
     pub member: Member,
     pub mesh: Option<Mesh>,
-    pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+    pub addresses: BTreeMap<EndpointId, AddressEntry>,
     #[serde(
         default,
         deserialize_with = "read_departed",
@@ -159,6 +204,27 @@ impl Storage {
                 .context("node is not initialized; run spirit node init")?,
         )?;
         validate_name(&state.member.name)?;
+        let legacy_mesh_id = state.mesh.as_ref().map(|mesh| mesh.id);
+        state.addresses.retain(|_, entry| {
+            if let AddressEntry::Legacy(address) = entry {
+                let Some(mesh_id) = legacy_mesh_id else {
+                    return false;
+                };
+                *entry = AddressEntry::Current {
+                    direct: None,
+                    hints: BTreeMap::from([(mesh_id, bounded_address(address.clone()))]),
+                };
+            }
+            if let AddressEntry::Current { direct, hints } = entry {
+                if let Some(address) = direct {
+                    *address = bounded_address(address.clone());
+                }
+                for address in hints.values_mut() {
+                    *address = bounded_address(address.clone());
+                }
+            }
+            true
+        });
         if let Some(mesh) = &state.mesh {
             mesh.verify()?;
             ensure!(
@@ -166,6 +232,7 @@ impl Storage {
                 "device is missing from its mesh"
             );
         }
+        state.retain_member_addresses();
         ensure!(
             state.departed.len() <= MAX_DEPARTED_MESHES,
             "too many departed meshes"
@@ -228,7 +295,17 @@ impl State {
             .mesh
             .clone()
             .context("device is not a mesh member; create a mesh or enroll this device first")?;
-        let mut addresses = self.addresses.clone();
+        let mut addresses = self
+            .addresses
+            .iter()
+            .filter_map(|(id, entry)| {
+                mesh.member(*id).and_then(|_| {
+                    entry
+                        .preferred(mesh.id)
+                        .map(|address| (*id, bounded_address(address.clone())))
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         addresses.insert(addr.id, bounded_address(addr));
         Ok(Snapshot { mesh, addresses })
     }
@@ -257,11 +334,7 @@ impl State {
             self.departure_order.retain(|id| *id != mesh.id);
         }
         self.mesh = Some(mesh);
-        for (id, addr) in &snapshot.addresses {
-            if *id == source || !self.addresses.contains_key(id) {
-                self.addresses.insert(*id, addr.clone());
-            }
-        }
+        self.store_addresses(snapshot, source);
         self.retain_member_addresses();
         Ok(())
     }
@@ -282,7 +355,7 @@ impl State {
         let mut mesh = self.mesh.clone().context("device is not a mesh member")?;
         mesh.depart(key)?;
         self.mesh = None;
-        self.addresses.clear();
+        self.retain_member_addresses();
         if mesh.members().next().is_some() {
             self.departure_order.retain(|id| *id != mesh.id);
             if self.departed.len() == MAX_DEPARTED_MESHES && !self.departed.contains_key(&mesh.id) {
@@ -314,13 +387,43 @@ impl State {
         Ok(merged.departed(self.member.id).then_some(departure))
     }
 
+    fn store_addresses(&mut self, snapshot: &Snapshot, source: EndpointId) {
+        for (id, addr) in &snapshot.addresses {
+            if *id == self.member.id {
+                continue;
+            }
+            let entry = self
+                .addresses
+                .entry(*id)
+                .or_insert_with(|| AddressEntry::Current {
+                    direct: None,
+                    hints: BTreeMap::new(),
+                });
+            entry.set(
+                snapshot.mesh.id,
+                bounded_address(addr.clone()),
+                *id == source,
+            );
+        }
+    }
+
     fn retain_member_addresses(&mut self) {
-        let members: BTreeSet<_> = self
-            .mesh
-            .as_ref()
-            .map(|mesh| mesh.members().map(|member| member.id).collect())
-            .unwrap_or_default();
-        self.addresses.retain(|id, _| members.contains(id));
+        let mesh = self.mesh.as_ref();
+        self.addresses.retain(|id, entry| {
+            if *id == self.member.id {
+                return false;
+            }
+            let AddressEntry::Current { direct, hints } = entry else {
+                return false;
+            };
+            hints.retain(|mesh_id, _| {
+                mesh.is_some_and(|mesh| mesh.id == *mesh_id && mesh.member(*id).is_some())
+            });
+            if !mesh.is_some_and(|mesh| mesh.member(*id).is_some()) {
+                *direct = None;
+            }
+            direct.is_some() || !hints.is_empty()
+        });
     }
 }
 
@@ -349,6 +452,62 @@ mod tests {
         let id = mesh.id;
         state.mesh = Some(mesh);
         id
+    }
+
+    #[test]
+    fn direct_addresses_override_hints_and_self_addresses_are_discarded() {
+        let (_dir, storage, mut state) = setup();
+        let introducer = SecretKey::generate();
+        let peer = SecretKey::generate();
+        let mesh_id = joined_mesh(&mut state, &storage.key, &introducer);
+        state
+            .mesh
+            .as_mut()
+            .unwrap()
+            .admit(
+                Member {
+                    id: peer.public(),
+                    name: "other".into(),
+                },
+                &storage.key,
+            )
+            .unwrap();
+        let hint =
+            EndpointAddr::new(peer.public()).with_ip_addr("127.0.0.1:54321".parse().unwrap());
+        let direct =
+            EndpointAddr::new(peer.public()).with_ip_addr("127.0.0.1:54322".parse().unwrap());
+        let mut incoming = Snapshot::without_addresses(state.mesh.clone().unwrap());
+        incoming.addresses.insert(peer.public(), hint.clone());
+        incoming
+            .addresses
+            .insert(state.member.id, EndpointAddr::new(state.member.id));
+        state.merge(&incoming, introducer.public()).unwrap();
+        assert_eq!(
+            state.addresses[&peer.public()].preferred(mesh_id),
+            Some(&hint)
+        );
+        assert!(!state.addresses.contains_key(&state.member.id));
+        incoming.addresses.insert(peer.public(), direct.clone());
+        state.merge(&incoming, peer.public()).unwrap();
+        assert_eq!(
+            state.addresses[&peer.public()].preferred(mesh_id),
+            Some(&direct)
+        );
+        state.addresses.insert(
+            state.member.id,
+            AddressEntry::Current {
+                direct: Some(EndpointAddr::new(state.member.id)),
+                hints: BTreeMap::new(),
+            },
+        );
+        state.retain_member_addresses();
+        assert!(!state.addresses.contains_key(&state.member.id));
+        incoming.addresses.insert(peer.public(), hint);
+        state.merge(&incoming, introducer.public()).unwrap();
+        assert_eq!(
+            state.addresses[&peer.public()].preferred(mesh_id),
+            Some(&direct)
+        );
     }
 
     #[test]

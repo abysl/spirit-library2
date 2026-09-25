@@ -51,6 +51,8 @@ Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON m
 
 Background heartbeats run every five seconds. Each peer is checked independently, with at most one active heartbeat per member and a four-second overall deadline. An unreachable peer cannot delay probing the others. Each heartbeat exchanges membership and then sends a ping. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
 
+Addresses have provenance: a direct address comes from the authenticated device’s own verified snapshot; forwarded addresses are scoped as hints to their mesh and cannot be forwarded into another mesh. A direct address takes priority over hints, and leaving drops the left mesh’s hints. Legacy stored addresses become hints rather than claiming a direct source.
+
 Addresses are routing hints. A newly discovered member's address can be learned from another member. Afterward, that member's own authenticated connection updates its address. Forwarded stale snapshots do not overwrite a directly learned address. iroh still authenticates the intended device key regardless of the address used.
 
 Normal operation uses iroh's N0 relay and address lookup preset. Ticket generation waits for relay readiness so the ticket includes a usable relay address. `node serve --local` instead binds loopback with no relay or external discovery, for same-machine tests. This mode does not connect separate machines.

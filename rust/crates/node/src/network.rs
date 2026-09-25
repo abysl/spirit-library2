@@ -133,7 +133,7 @@ impl Shared {
             .unwrap()
             .addresses
             .get(&id)
-            .cloned()
+            .and_then(|entry| entry.dial().cloned())
             .unwrap_or_else(|| id.into())
     }
 
@@ -1022,12 +1022,13 @@ mod tests {
         assert!(a.shared.presence.lock().unwrap().contains_key(&b_id));
 
         let b = Node::bind(b_dir.path(), NodeConfig::local()).await.unwrap();
-        a.shared
-            .state
-            .lock()
-            .unwrap()
-            .addresses
-            .insert(b_id, b.shared.endpoint.addr());
+        a.shared.state.lock().unwrap().addresses.insert(
+            b_id,
+            crate::storage::AddressEntry::Current {
+                direct: Some(b.shared.endpoint.addr()),
+                hints: BTreeMap::new(),
+            },
+        );
         assert!(a.shared.ping(b_id).await.is_err());
         assert_eq!(a.info().members.len(), 1);
         assert!(a.peers().is_empty());
