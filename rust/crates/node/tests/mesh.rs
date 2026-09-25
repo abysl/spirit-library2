@@ -46,6 +46,28 @@ fn identity_files_are_owner_only() {
     }
 }
 
+#[test]
+fn current_mesh_limit_is_explicit() {
+    let (dir, _) = initialized("desktop");
+    let first = Node::create_mesh(dir.path(), "first").unwrap();
+    for _ in 1..64 {
+        Node::create_mesh(dir.path(), "another").unwrap();
+    }
+    let info = Node::read_info(dir.path()).unwrap();
+    assert_eq!(info.meshes.len(), 64);
+    assert!(info
+        .only_mesh()
+        .unwrap_err()
+        .to_string()
+        .contains("this device is in several meshes; choose one"));
+    assert!(Node::create_mesh(dir.path(), "overflow")
+        .unwrap_err()
+        .to_string()
+        .contains("64-group limit"));
+    assert_eq!(Node::leave_mesh(dir.path(), first).unwrap().mesh_id, first);
+    assert_eq!(Node::read_info(dir.path()).unwrap().meshes.len(), 63);
+}
+
 #[tokio::test]
 async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     let (phone_dir, phone_id) = initialized("phone");

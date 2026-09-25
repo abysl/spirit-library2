@@ -779,6 +779,197 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
+    async fn mesh_sync_failure_timing_at_membership_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        Node::init(directory.path(), "root").unwrap();
+        let (storage, mut state) = Storage::open(directory.path()).unwrap();
+        let peers: Vec<_> = (0..255).map(|_| SecretKey::generate()).collect();
+        let mut request = None;
+        for _ in 0..64 {
+            let mut mesh = Mesh::create("same size", state.member.clone(), &storage.key).unwrap();
+            for key in &peers {
+                mesh.admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "peer".into(),
+                    },
+                    &storage.key,
+                )
+                .unwrap();
+            }
+            if request.is_none() {
+                request = Some(Snapshot::without_addresses(mesh.clone()));
+                mesh.depart(&peers[0]).unwrap();
+            }
+            state.meshes.insert(mesh.id, mesh);
+        }
+        let known = request.unwrap();
+        let mut unknown = Mesh::create(
+            "same size",
+            crate::Member {
+                id: peers[0].public(),
+                name: "peer".into(),
+            },
+            &peers[0],
+        )
+        .unwrap();
+        for key in peers.iter().skip(1) {
+            unknown
+                .admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "peer".into(),
+                    },
+                    &peers[0],
+                )
+                .unwrap();
+        }
+        unknown.admit(state.member.clone(), &peers[0]).unwrap();
+        let unknown = Snapshot::without_addresses(unknown);
+        let mut forged = Mesh::create_with_id(
+            known.mesh.id,
+            "same size",
+            crate::Member {
+                id: peers[0].public(),
+                name: "peer".into(),
+            },
+            &peers[0],
+        )
+        .unwrap();
+        for key in peers.iter().skip(1) {
+            forged
+                .admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "peer".into(),
+                    },
+                    &peers[0],
+                )
+                .unwrap();
+        }
+        forged.admit(state.member.clone(), &peers[0]).unwrap();
+        let forged = Snapshot::without_addresses(forged);
+        let outsider = SecretKey::generate();
+        let mut outsider_forged = Mesh::create_with_id(
+            known.mesh.id,
+            "same size",
+            crate::Member {
+                id: outsider.public(),
+                name: "peer".into(),
+            },
+            &outsider,
+        )
+        .unwrap();
+        for key in peers.iter().take(254) {
+            outsider_forged
+                .admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "peer".into(),
+                    },
+                    &outsider,
+                )
+                .unwrap();
+        }
+        outsider_forged
+            .admit(state.member.clone(), &outsider)
+            .unwrap();
+        let outsider_forged = Snapshot::without_addresses(outsider_forged);
+        storage.save(&state).unwrap();
+        drop(storage);
+        let node = Node::bind(directory.path(), NodeConfig::local())
+            .await
+            .unwrap();
+        node.gossip.abort();
+        for (label, snapshot, remote) in [
+            ("unknown", &unknown, peers[0].public()),
+            ("forged-by-departed", &forged, peers[0].public()),
+            (
+                "outsider-forged-same-id",
+                &outsider_forged,
+                outsider.public(),
+            ),
+            ("known-departed", &known, peers[0].public()),
+        ] {
+            let mut times = Vec::new();
+            for _ in 0..9 {
+                let start = Instant::now();
+                assert_eq!(
+                    node.shared
+                        .answer_sync(snapshot, remote)
+                        .unwrap_err()
+                        .to_string(),
+                    "mesh unavailable"
+                );
+                times.push(start.elapsed());
+            }
+            times.sort_unstable();
+            println!("mesh/2 {label} median: {:?}", times[times.len() / 2]);
+        }
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn timing_at_sixty_four_meshes_with_two_hundred_fifty_six_admissions() {
+        let directory = tempfile::tempdir().unwrap();
+        Node::init(directory.path(), "root").unwrap();
+        let (storage, mut state) = Storage::open(directory.path()).unwrap();
+        let peers: Vec<_> = (0..255).map(|_| SecretKey::generate()).collect();
+        for _ in 0..64 {
+            let mut mesh =
+                Mesh::create(&"\"".repeat(128), state.member.clone(), &storage.key).unwrap();
+            for key in &peers {
+                mesh.admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "\"".repeat(128),
+                    },
+                    &storage.key,
+                )
+                .unwrap();
+            }
+            state.meshes.insert(mesh.id, mesh);
+        }
+        let start = Instant::now();
+        storage.save(&state).unwrap();
+        let save = start.elapsed();
+        let bytes = std::fs::metadata(directory.path().join("state.json"))
+            .unwrap()
+            .len();
+        drop(storage);
+        let node = Node::bind(directory.path(), NodeConfig::local())
+            .await
+            .unwrap();
+        node.gossip.abort();
+        let start = Instant::now();
+        let info = node.info();
+        let info_time = start.elapsed();
+        let start = Instant::now();
+        let statuses = node.peers();
+        let peers_time = start.elapsed();
+        let start = Instant::now();
+        node.shared
+            .update(|state| {
+                state.addresses.insert(
+                    peers[0].public(),
+                    crate::storage::AddressEntry::Current {
+                        direct: Some(EndpointAddr::new(peers[0].public())),
+                        hints: BTreeMap::new(),
+                    },
+                );
+                Ok(((), true))
+            })
+            .unwrap();
+        let update = start.elapsed();
+        assert_eq!(info.meshes.len(), 64);
+        assert_eq!(statuses.len(), 255);
+        println!("64x256: state={bytes} bytes save={save:?} info={info_time:?} peers={peers_time:?} update_save={update:?}");
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn refused_pairing_records_a_known_peers_local_error() {
         let (_a_dir, a) = device("a").await;
         let (_b_dir, b) = device("b").await;
