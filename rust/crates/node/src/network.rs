@@ -1,5 +1,5 @@
 use crate::{
-    membership::Snapshot,
+    membership::{Snapshot, VerifiedSnapshot},
     now,
     presence::{Presence, HEARTBEAT_INTERVAL},
     storage::{State, Storage},
@@ -58,11 +58,7 @@ pub(crate) enum Enrolled {
 impl Shared {
     pub fn heartbeat_received(&self, id: NodeId) {
         let state = self.state.lock().unwrap();
-        if !state
-            .mesh
-            .as_ref()
-            .is_some_and(|mesh| mesh.member(id).is_some())
-        {
+        if !state.meshes.values().any(|mesh| mesh.member(id).is_some()) {
             return;
         }
         self.presence
@@ -77,19 +73,14 @@ impl Shared {
         self.state
             .lock()
             .unwrap()
-            .mesh
-            .as_ref()
-            .and_then(|mesh| mesh.member(id))
-            .is_some()
+            .meshes
+            .values()
+            .any(|mesh| mesh.member(id).is_some())
     }
 
     fn failed(&self, id: NodeId, error: &anyhow::Error) {
         let state = self.state.lock().unwrap();
-        if !state
-            .mesh
-            .as_ref()
-            .is_some_and(|mesh| mesh.member(id).is_some())
-        {
+        if !state.meshes.values().any(|mesh| mesh.member(id).is_some()) {
             return;
         }
         self.presence
@@ -124,7 +115,12 @@ impl Shared {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.state.lock().unwrap().snapshot(self.endpoint.addr())
+        let state = self.state.lock().unwrap();
+        let mesh_id = state
+            .info()
+            .mesh_id
+            .context("device is not a mesh member")?;
+        state.snapshot(mesh_id, self.endpoint.addr())
     }
 
     pub fn address(&self, id: NodeId) -> EndpointAddr {
@@ -138,12 +134,20 @@ impl Shared {
     }
 
     pub fn merge(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
-        snapshot.verify()?;
+        let verified = VerifiedSnapshot::new(snapshot)?;
         ensure!(
             snapshot.mesh.member(source).is_some(),
             "peer is not a mesh member"
         );
-        self.update(|state| state.merge(snapshot, source))
+        self.update(|state| {
+            if state.meshes.contains_key(&snapshot.mesh.id) {
+                state.merge_current(&verified, source)?;
+            } else {
+                ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
+                state.join(&verified, source)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn record_departure(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
@@ -151,17 +155,19 @@ impl Shared {
             self.state
                 .lock()
                 .unwrap()
-                .mesh
-                .as_ref()
-                .is_some_and(|mesh| mesh.id == snapshot.mesh.id),
+                .meshes
+                .contains_key(&snapshot.mesh.id),
             "device is not a member of this mesh"
         );
         ensure!(
             snapshot.mesh.departed(source),
             "peer has not left this mesh"
         );
-        snapshot.verify()?;
-        self.update(|state| state.merge_departure(snapshot, source))
+        let verified = VerifiedSnapshot::new(snapshot)?;
+        self.update(|state| {
+            state.merge_departure(&verified, source)?;
+            Ok(())
+        })
     }
 
     pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
@@ -173,10 +179,10 @@ impl Shared {
             *state = next;
         }
         let members: BTreeSet<_> = state
-            .mesh
-            .as_ref()
-            .map(|mesh| mesh.members().map(|member| member.id).collect())
-            .unwrap_or_default();
+            .meshes
+            .values()
+            .flat_map(|mesh| mesh.members().map(|member| member.id))
+            .collect();
         self.presence
             .lock()
             .unwrap()
@@ -288,7 +294,7 @@ impl Shared {
             .state
             .lock()
             .unwrap()
-            .rejoin_conflict(&request.snapshot.mesh)?
+            .rejoin_conflict(&VerifiedSnapshot::new(&request.snapshot)?)?
         {
             return Ok(Enrolled::Departed(departure));
         }
@@ -309,7 +315,11 @@ impl Shared {
             return Ok(departure);
         }
         ensure!(
-            self.state.lock().unwrap().mesh.is_some(),
+            self.state
+                .lock()
+                .unwrap()
+                .meshes
+                .contains_key(&snapshot.mesh.id),
             "device is not enrolled"
         );
         self.merge(snapshot, remote)?;
@@ -447,9 +457,9 @@ pub(crate) async fn gossip(shared: Arc<Shared>) {
             _ = interval.tick() => {
                 let peers: Vec<_> = {
                     let state = shared.state.lock().unwrap();
-                    state.mesh.as_ref().map(|mesh| mesh.members()
+                    state.meshes.values().flat_map(|mesh| mesh.members())
                         .map(|member| member.id)
-                        .filter(|id| *id != state.member.id).collect()).unwrap_or_default()
+                        .filter(|id| *id != state.member.id).collect()
                 };
                 for id in peers {
                     if !in_flight.insert(id) { continue; }
@@ -512,7 +522,14 @@ mod tests {
             16
         );
         a.add(&ticket).await.unwrap();
-        let snapshot = b.shared.state.lock().unwrap().snapshot(overloaded).unwrap();
+        let mesh_id = b.info().mesh_id.unwrap();
+        let snapshot = b
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .snapshot(mesh_id, overloaded)
+            .unwrap();
         assert_eq!(snapshot.addresses[&b.info().id].addrs.len(), 16);
         let reply: Snapshot = b
             .shared
@@ -690,7 +707,16 @@ mod tests {
         assert!(refusal.departure.unwrap().mesh.departed(b_id));
         assert!(b.shared.pending.lock().unwrap().is_some());
         c.add(&ticket).await.unwrap();
-        let joined = b.shared.state.lock().unwrap().mesh.clone().unwrap();
+        let joined = b
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .meshes
+            .values()
+            .next()
+            .unwrap()
+            .clone();
         assert!(joined
             .admissions
             .iter()
@@ -734,7 +760,7 @@ mod tests {
         );
         c.shared
             .update(|state| {
-                state.mesh = Some(forged);
+                state.meshes.insert(forged.id, forged);
                 Ok(())
             })
             .unwrap();
@@ -755,7 +781,7 @@ mod tests {
         assert!(!error.contains("private mesh name"));
         assert!(!error.contains("founder-private-unique"));
         assert!(!error.contains("departed-private-unique"));
-        assert!(b.shared.state.lock().unwrap().mesh.is_none());
+        assert!(b.shared.state.lock().unwrap().meshes.is_empty());
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
         }
@@ -917,8 +943,8 @@ mod tests {
                     let mut mesh =
                         Mesh::create("later", state.member.clone(), &b.shared.storage.key)?;
                     mesh.admit(peer.clone(), &b.shared.storage.key)?;
-                    state.mesh = Some(mesh);
-                    state.leave(&b.shared.storage.key)?;
+                    state.meshes.insert(mesh.id, mesh.clone());
+                    state.leave(mesh.id, &b.shared.storage.key)?;
                     Ok(())
                 })
                 .unwrap();
@@ -938,8 +964,9 @@ mod tests {
             let state = node.shared.state.lock().unwrap();
             assert_eq!(
                 state
-                    .mesh
-                    .as_ref()
+                    .meshes
+                    .values()
+                    .next()
                     .unwrap()
                     .admissions
                     .iter()
@@ -967,8 +994,9 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
-                .mesh
-                .as_ref()
+                .meshes
+                .values()
+                .next()
                 .unwrap()
                 .admissions
                 .iter()

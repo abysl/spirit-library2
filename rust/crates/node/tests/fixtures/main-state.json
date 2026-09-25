@@ -1,0 +1,38 @@
+{
+  "addresses": {
+    "25a6cfb2ccabb6551dd1fbe138da608456638a79edf35e2b47f2ae45a10f9ff9": {
+      "id": "25a6cfb2ccabb6551dd1fbe138da608456638a79edf35e2b47f2ae45a10f9ff9",
+      "addrs": [
+        {
+          "Ip": "127.0.0.1:54321"
+        }
+      ]
+    }
+  },
+  "member": {
+    "id": "40e68df1f1bf4e047292d65f8554c7630fee15b58f75e8747fa7ea3c7cfedc37",
+    "name": "device"
+  },
+  "mesh": {
+    "admissions": [
+      {
+        "issuer": "40e68df1f1bf4e047292d65f8554c7630fee15b58f75e8747fa7ea3c7cfedc37",
+        "member": {
+          "id": "40e68df1f1bf4e047292d65f8554c7630fee15b58f75e8747fa7ea3c7cfedc37",
+          "name": "device"
+        },
+        "signature": "1JCksYa0q53NOCLNNJKpyRq0ygGhpMAcvs_kapmTFPeroNzF5-LT8BmjEaimmckq5xu_KR9CDPg73fRBU7bXBA"
+      },
+      {
+        "issuer": "40e68df1f1bf4e047292d65f8554c7630fee15b58f75e8747fa7ea3c7cfedc37",
+        "member": {
+          "id": "25a6cfb2ccabb6551dd1fbe138da608456638a79edf35e2b47f2ae45a10f9ff9",
+          "name": "peer"
+        },
+        "signature": "ye5uWCKdpP9dfessP3yPMciupSgkyZRAKlHgIoHSmlWP_DwpKJVZkaCrJydZE9da8PQQzJt2QtBVhvl-VqtnAQ"
+      }
+    ],
+    "id": "40e68df1f1bf4e047292d65f8554c7630fee15b58f75e8747fa7ea3c7cfedc37",
+    "name": "original"
+  }
+}

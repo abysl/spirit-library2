@@ -29,6 +29,22 @@ pub struct NodeInfo {
     pub mesh_id: Option<MeshId>,
     pub mesh_name: Option<String>,
     pub members: Vec<Member>,
+    #[serde(default)]
+    pub meshes: Vec<MeshInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeshInfo {
+    pub id: MeshId,
+    pub name: String,
+    pub members: Vec<MeshMember>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeshMember {
+    pub id: NodeId,
+    pub name: String,
+    pub generation: u32,
 }
 
 impl NodeInfo {
@@ -158,15 +174,20 @@ impl Node {
 
     pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<NodeInfo> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        ensure!(state.mesh.is_none(), "device already belongs to a mesh");
-        state.mesh = Some(Mesh::create(name, state.member.clone(), &storage.key)?);
+        ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
+        let mesh = Mesh::create(name, state.member.clone(), &storage.key)?;
+        state.meshes.insert(mesh.id, mesh);
         storage.save(&state)?;
         Ok(state.info())
     }
 
     pub fn leave_mesh(root: impl AsRef<Path>) -> Result<LeftMesh> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        let departure = state.leave(&storage.key)?;
+        let mesh_id = state
+            .info()
+            .mesh_id
+            .context("device is not a mesh member")?;
+        let departure = state.leave(mesh_id, &storage.key)?;
         storage.save(&state)?;
         Ok(LeftMesh {
             mesh_id: departure.mesh.id,
@@ -234,13 +255,10 @@ impl Node {
 
     pub fn new_mesh(&self, name: &str) -> Result<NodeInfo> {
         let mut state = self.shared.state.lock().unwrap();
-        ensure!(state.mesh.is_none(), "device already belongs to a mesh");
+        ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
         let mut next = state.clone();
-        next.mesh = Some(Mesh::create(
-            name,
-            state.member.clone(),
-            &self.shared.storage.key,
-        )?);
+        let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
+        next.meshes.insert(mesh.id, mesh);
         self.shared.storage.save(&next)?;
         *state = next;
         Ok(state.info())
@@ -323,9 +341,13 @@ impl Node {
         let (departure, peers) = {
             let mut pending = self.shared.pending.lock().unwrap();
             let (departure, peers) = self.shared.update(|state| {
+                let mesh_id = state
+                    .info()
+                    .mesh_id
+                    .context("device is not a mesh member")?;
                 let peers: Vec<_> = state
-                    .mesh
-                    .as_ref()
+                    .meshes
+                    .get(&mesh_id)
                     .context("device is not a mesh member")?
                     .members()
                     .filter(|member| member.id != state.member.id)
@@ -337,7 +359,7 @@ impl Node {
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
-                Ok((state.leave(&self.shared.storage.key)?, peers))
+                Ok((state.leave(mesh_id, &self.shared.storage.key)?, peers))
             })?;
             *pending = None;
             (departure, peers)
@@ -435,6 +457,7 @@ mod tests {
             mesh_id: Some(MeshId::legacy(a.id)),
             mesh_name: Some("home".into()),
             members: vec![a.clone(), b.clone()],
+            meshes: Vec::new(),
         };
         assert!(info
             .resolve("desktop")

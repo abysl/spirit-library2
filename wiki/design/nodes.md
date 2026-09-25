@@ -74,6 +74,8 @@ The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` o
 | `node.lock` | Process ownership lock |
 | `control.json` | Running node's loopback control address and random credential |
 
+On open, legacy single-mesh state migrates to a `meshes` map without changing mesh IDs or signatures. Old address entries become per-mesh hints. The new `"mesh": "spirit/state/multi-mesh"` sentinel makes older releases refuse the directory rather than erase migrated memberships: downgrading is unsupported. The running CLI and enrollment operations remain single-mesh until the subsequent protocol and API steps.
+
 Writes use temporary files and atomic replacement. New secret, state, control, and exported QR files are owner-only on Unix. Malformed or missing existing identities fail rather than silently generating a replacement. A process lock prevents a second service or offline mutation from overwriting the running node's state.
 
 The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit and a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
@@ -101,7 +103,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumer
 
 ## Deferred operations
 
-This version supports one mesh at a time per device. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
+Persisted state holds a map of current meshes; public creation and enrollment still operate on one mesh until the multi-mesh API step. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
 
 The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency.
 

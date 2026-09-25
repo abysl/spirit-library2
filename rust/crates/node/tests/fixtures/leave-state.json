@@ -1,0 +1,66 @@
+{
+  "addresses": {
+    "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e": {
+      "id": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+      "addrs": [
+        {
+          "Relay": "https://relay.example/"
+        }
+      ]
+    }
+  },
+  "departed": {
+    "mesh1_V273VIE7D7aH-rDEIA4mtAlQlqrkPlcPfGumQM4_PuY": {
+      "admissions": [
+        {
+          "issuer": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+          "member": {
+            "id": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+            "name": "device"
+          },
+          "signature": "w-m_IuwuJc7qaDErUBqKQqW4FXud39eI-Yqkgv-vghpWD1yokxxInajYmGsfjLTv48Hla9OGvvNnq6LXk2hkDg"
+        },
+        {
+          "issuer": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+          "member": {
+            "id": "77721615c6c7c8d6e1efdc3ddf813cc2adf234ee07a075219458098e32a30db1",
+            "name": "peer"
+          },
+          "signature": "MuUsyICuWFbY6ePPyfbYjk2Ph5HOBqOi1xdEd0IV4a82YcUR5KcVYSzrfTRF-De6qVKW9NyK0VubTYFq3NnOBw"
+        }
+      ],
+      "departures": [
+        {
+          "generation": 0,
+          "member": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+          "signature": "axgT35xBCOh250BVGN7QkslZK_wNqG7kMiN_yZXX_tEieWCmJ8EZaelbXq4PiWqjTCJCs8aH995Y2eQ_U41xBA"
+        }
+      ],
+      "founder": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+      "id": "mesh1_V273VIE7D7aH-rDEIA4mtAlQlqrkPlcPfGumQM4_PuY",
+      "name": "mesh"
+    }
+  },
+  "departure_order": [
+    "mesh1_V273VIE7D7aH-rDEIA4mtAlQlqrkPlcPfGumQM4_PuY"
+  ],
+  "member": {
+    "id": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+    "name": "device"
+  },
+  "mesh": {
+    "admissions": [
+      {
+        "issuer": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+        "member": {
+          "id": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+          "name": "device"
+        },
+        "signature": "EEbOHtdapRNrpS5l5pSU-NUE9y4cpwRb1L8XmssXgYn4omfNhJNur7ZorGSefqzax4x58iX-ARxrQkRe8Lv-CA"
+      }
+    ],
+    "founder": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
+    "id": "mesh1_odb-hjSKrziFnYxOnekgVjfgsAStSNkm5i6ruTRvGFk",
+    "name": "old group"
+  }
+}

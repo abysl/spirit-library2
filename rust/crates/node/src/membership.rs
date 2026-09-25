@@ -57,6 +57,14 @@ impl<'a> VerifiedSnapshot<'a> {
         Ok(Self(snapshot))
     }
 
+    pub fn caller_vouches_for_local_snapshot(snapshot: &'a Snapshot) -> Self {
+        Self(snapshot)
+    }
+
+    pub fn snapshot(&self) -> &'a Snapshot {
+        self.0
+    }
+
     pub fn merge_into(&self, mesh: &mut Mesh) -> Result<()> {
         mesh.merge_trusted(&self.0.mesh)
     }
@@ -227,6 +235,21 @@ impl Mesh {
         Ok(mesh)
     }
 
+    #[cfg(test)]
+    pub(crate) fn create_legacy(name: &str, member: Member, key: &SecretKey) -> Result<Self> {
+        let mut mesh = Self {
+            id: MeshId::legacy(key.public()),
+            name: name.into(),
+            founder: None,
+            admissions: Vec::new(),
+            departures: Vec::new(),
+        };
+        mesh.admissions
+            .push(Admission::signed(&mesh, member, 0, key)?);
+        mesh.verify()?;
+        Ok(mesh)
+    }
+
     pub fn verify(&self) -> Result<()> {
         self.verify_structure()?;
         for admission in &self.admissions {
@@ -346,6 +369,12 @@ impl Mesh {
             .is_some_and(|admission| self.departed_generation(id, admission.generation))
     }
 
+    pub fn records_departure_at(&self, other: &Self, id: EndpointId) -> bool {
+        other
+            .latest_admission(id)
+            .is_some_and(|admission| self.departed_generation(id, admission.generation))
+    }
+
     pub fn admit(&mut self, member: Member, key: &SecretKey) -> Result<()> {
         ensure!(
             self.member(key.public()).is_some(),
@@ -385,8 +414,10 @@ impl Mesh {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn merge(&mut self, other: &Self) -> Result<()> {
-        VerifiedSnapshot::new(&Snapshot::without_addresses(other.clone()))?.merge_into(self)
+        other.verify()?;
+        self.merge_trusted(other)
     }
 
     pub fn same_identity(&self, other: &Self) -> bool {
@@ -560,7 +591,7 @@ mod tests {
         let mut invalid = reopened.clone();
         invalid.founder = Some(root.public());
         assert!(invalid.verify().is_err());
-        state.mesh = Some(reopened);
+        state.meshes.insert(reopened.id, reopened);
         storage.save(&state).unwrap();
         drop(storage);
         let info = crate::Node::read_info(directory.path()).unwrap();
