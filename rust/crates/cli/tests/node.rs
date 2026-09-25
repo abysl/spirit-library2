@@ -214,3 +214,66 @@ fn partial_departure_notice_counts_multiple_remaining_members() {
         "Left personal. Notified 1 of 2 remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving.\n"
     );
 }
+
+#[test]
+fn mesh_selection_adds_and_leaves_only_the_named_mesh() {
+    let mut a = Device::new("a");
+    let mut b = Device::new("b");
+    let mut c = Device::new("c");
+    let created = b.ok(&["mesh", "create", "--name", "M1"]);
+    let m1 = b
+        .ok(&["mesh", "status"])
+        .lines()
+        .find_map(|line| line.strip_prefix("Mesh ID: "))
+        .unwrap()
+        .to_owned();
+    assert!(created.contains(&format!("Mesh ID: {m1}")));
+    b.ok(&["mesh", "create", "--name", "M2"]);
+    let m2 = b
+        .ok(&["mesh", "status"])
+        .lines()
+        .filter_map(|line| line.strip_prefix("Mesh ID: "))
+        .find(|id| *id != m1)
+        .unwrap()
+        .to_owned();
+    for device in [&mut a, &mut b, &mut c] {
+        device.start();
+    }
+    let status = b.ok(&["mesh", "status"]);
+    assert!(status.contains(&format!("Mesh: M1\nMesh ID: {m1}")));
+    assert!(status.contains(&format!("Mesh: M2\nMesh ID: {m2}")));
+    for args in [vec!["mesh", "add", "not-a-ticket"], vec!["mesh", "leave"]] {
+        let result = b.run(&args);
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("this device is in several meshes; choose one"));
+    }
+    let ticket = a.ok(&["node", "pair", "--no-qr"]);
+    b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m1]);
+    let ticket = c.ok(&["node", "pair", "--no-qr"]);
+    b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m2]);
+    assert!(b.ok(&["mesh", "status"]).contains("Devices: 3"));
+    assert!(b
+        .ok(&["mesh", "members", "--mesh", &m1])
+        .lines()
+        .any(|line| line == "a"));
+    assert!(!b
+        .ok(&["mesh", "members", "--mesh", &m1])
+        .lines()
+        .any(|line| line == "c"));
+    assert!(b
+        .ok(&["mesh", "members", "--mesh", &m2])
+        .lines()
+        .any(|line| line == "c"));
+    let a_members = a.ok(&["mesh", "members"]);
+    let c_members = c.ok(&["mesh", "members"]);
+    assert!(!a_members.lines().any(|line| line == "c"));
+    assert!(!c_members.lines().any(|line| line == "a"));
+    assert!(b.ok(&["mesh", "leave", "--mesh", &m1]).contains("Left M1"));
+    let remaining = b.ok(&["mesh", "status"]);
+    assert!(!remaining.contains(&m1));
+    assert!(remaining.contains(&m2));
+    assert!(!b.ok(&["mesh", "members"]).lines().any(|line| line == "a"));
+    b.stop();
+    assert!(b.ok(&["mesh", "leave", "--mesh", &m2]).contains("Left M2"));
+}
