@@ -3,13 +3,15 @@ use crate::mesh_id::MeshId;
 use crate::NodeInfo;
 use anyhow::{ensure, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub(crate) const MAX_CURRENT_MESHES: usize = 64;
 const MAX_DEPARTED_MESHES: usize = 64;
+const MULTI_MESH_SENTINEL: &str = "spirit/state/multi-mesh";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -56,6 +58,32 @@ impl AddressEntry {
     }
 }
 
+fn write_mesh_sentinel<S: Serializer>(
+    _: &Option<Mesh>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(MULTI_MESH_SENTINEL)
+}
+
+fn legacy_mesh_field<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Mesh>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum LegacyMesh {
+        Mesh(Mesh),
+        Sentinel(String),
+    }
+    match Option::<LegacyMesh>::deserialize(deserializer)? {
+        Some(LegacyMesh::Mesh(mesh)) => Ok(Some(mesh)),
+        Some(LegacyMesh::Sentinel(value)) if value == MULTI_MESH_SENTINEL => Ok(None),
+        Some(LegacyMesh::Sentinel(_)) => {
+            Err(serde::de::Error::custom("invalid state mesh sentinel"))
+        }
+        None => Ok(None),
+    }
+}
+
 fn read_departed<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<MeshId, Mesh>, D::Error> {
@@ -75,8 +103,18 @@ fn read_departed<'de, D: Deserializer<'de>>(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
     pub member: Member,
-    pub mesh: Option<Mesh>,
+    #[serde(default)]
+    pub meshes: BTreeMap<MeshId, Mesh>,
+    #[serde(
+        default,
+        rename = "mesh",
+        deserialize_with = "legacy_mesh_field",
+        serialize_with = "write_mesh_sentinel"
+    )]
+    legacy_mesh: Option<Mesh>,
     pub addresses: BTreeMap<EndpointId, AddressEntry>,
+    #[serde(skip)]
+    needs_migration: bool,
     #[serde(
         default,
         deserialize_with = "read_departed",
@@ -162,8 +200,10 @@ impl Storage {
                     id: storage.key.public(),
                     name: name.into(),
                 },
-                mesh: None,
+                meshes: BTreeMap::new(),
+                legacy_mesh: None,
                 addresses: BTreeMap::new(),
+                needs_migration: false,
                 departed: BTreeMap::new(),
                 departure_order: Vec::new(),
             })?;
@@ -173,6 +213,9 @@ impl Storage {
             state.member.id == storage.key.public(),
             "identity does not match state"
         );
+        if state.legacy_mesh.is_some() || state.needs_migration {
+            storage.save(&state)?;
+        }
         Ok(state.info())
     }
 
@@ -183,19 +226,20 @@ impl Storage {
         );
         let guard = lock(root)?;
         let key = read_key(root)?;
-        let state = Self::read(root)?;
+        let mut state = Self::read(root)?;
         ensure!(
             state.member.id == key.public(),
             "identity does not match state"
         );
-        Ok((
-            Self {
-                root: root.into(),
-                key,
-                _lock: guard,
-            },
-            state,
-        ))
+        let storage = Self {
+            root: root.into(),
+            key,
+            _lock: guard,
+        };
+        if state.legacy_mesh.take().is_some() || state.needs_migration {
+            storage.save(&state)?;
+        }
+        Ok((storage, state))
     }
 
     pub fn read(root: &Path) -> Result<State> {
@@ -204,9 +248,22 @@ impl Storage {
                 .context("node is not initialized; run spirit node init")?,
         )?;
         validate_name(&state.member.name)?;
-        let legacy_mesh_id = state.mesh.as_ref().map(|mesh| mesh.id);
+        if let Some(mesh) = &state.legacy_mesh {
+            ensure!(
+                state.meshes.is_empty(),
+                "legacy mesh cannot coexist with meshes"
+            );
+            state.meshes.insert(mesh.id, mesh.clone());
+        }
+        ensure!(
+            state.meshes.len() <= MAX_CURRENT_MESHES,
+            "device has reached the 64-group limit"
+        );
+        let legacy_mesh_id =
+            (state.meshes.len() == 1).then(|| *state.meshes.keys().next().unwrap());
         state.addresses.retain(|_, entry| {
             if let AddressEntry::Legacy(address) = entry {
+                state.needs_migration = true;
                 let Some(mesh_id) = legacy_mesh_id else {
                     return false;
                 };
@@ -225,7 +282,8 @@ impl Storage {
             }
             true
         });
-        if let Some(mesh) = &state.mesh {
+        for (id, mesh) in &state.meshes {
+            ensure!(*id == mesh.id, "mesh ID does not match its key");
             mesh.verify()?;
             ensure!(
                 mesh.member(state.member.id) == Some(&state.member),
@@ -260,7 +318,7 @@ impl Storage {
                 "departed mesh does not record this device leaving"
             );
             ensure!(
-                state.mesh.as_ref().map(|mesh| mesh.id) != Some(*id),
+                !state.meshes.contains_key(id),
                 "device cannot be a member of the mesh it left"
             );
         }
@@ -277,84 +335,155 @@ impl Storage {
 
 impl State {
     pub fn info(&self) -> NodeInfo {
+        let only = if self.meshes.len() == 1 {
+            self.meshes.values().next()
+        } else {
+            None
+        };
+        let mut members = BTreeMap::new();
+        let meshes = self
+            .meshes
+            .values()
+            .map(|mesh| {
+                let current = mesh
+                    .current_admissions()
+                    .map(|(member, generation)| {
+                        members.insert(member.id, member.clone());
+                        crate::MeshMember {
+                            id: member.id,
+                            name: member.name.clone(),
+                            generation,
+                        }
+                    })
+                    .collect();
+                crate::MeshInfo {
+                    id: mesh.id,
+                    name: mesh.name.clone(),
+                    members: current,
+                }
+            })
+            .collect();
         NodeInfo {
             id: self.member.id,
             name: self.member.name.clone(),
-            mesh_id: self.mesh.as_ref().map(|mesh| mesh.id),
-            mesh_name: self.mesh.as_ref().map(|mesh| mesh.name.clone()),
-            members: self
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.members().cloned().collect())
-                .unwrap_or_default(),
+            mesh_id: only.map(|mesh| mesh.id),
+            mesh_name: only.map(|mesh| mesh.name.clone()),
+            members: members.into_values().collect(),
+            meshes,
         }
     }
 
-    pub fn snapshot(&self, addr: EndpointAddr) -> Result<Snapshot> {
+    pub fn snapshot(&self, mesh_id: MeshId, addr: EndpointAddr) -> Result<Snapshot> {
         let mesh = self
-            .mesh
-            .clone()
-            .context("device is not a mesh member; create a mesh or enroll this device first")?;
-        let mut addresses = self
+            .meshes
+            .get(&mesh_id)
+            .context("device is not a member of this mesh")?
+            .clone();
+        let mut addresses: BTreeMap<_, _> = self
             .addresses
             .iter()
             .filter_map(|(id, entry)| {
                 mesh.member(*id).and_then(|_| {
                     entry
-                        .preferred(mesh.id)
-                        .map(|address| (*id, bounded_address(address.clone())))
+                        .preferred(mesh_id)
+                        .map(|addr| (*id, bounded_address(addr.clone())))
                 })
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect();
         addresses.insert(addr.id, bounded_address(addr));
         Ok(Snapshot { mesh, addresses })
     }
 
-    pub fn merge(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<()> {
-        let verified = VerifiedSnapshot::new(snapshot)?;
+    pub fn join(&mut self, verified: &VerifiedSnapshot<'_>, source: EndpointId) -> Result<bool> {
+        self.merge_inner(verified, source, false)
+    }
+
+    pub fn merge_current(
+        &mut self,
+        verified: &VerifiedSnapshot<'_>,
+        source: EndpointId,
+    ) -> Result<bool> {
+        self.merge_inner(verified, source, true)
+    }
+
+    fn merge_inner(
+        &mut self,
+        verified: &VerifiedSnapshot<'_>,
+        source: EndpointId,
+        current_only: bool,
+    ) -> Result<bool> {
+        let snapshot = verified.snapshot();
         ensure!(
             snapshot.mesh.member(self.member.id) == Some(&self.member),
             "membership does not match this device"
         );
-        let mut mesh = match &self.mesh {
-            Some(mesh) => {
-                let mut mesh = mesh.clone();
-                verified.merge_into(&mut mesh)?;
-                mesh
-            }
-            None => snapshot.mesh.clone(),
+        let (mut mesh, mut changed) = if let Some(current) = self.meshes.get(&snapshot.mesh.id) {
+            ensure!(
+                !current.records_departure_at(&snapshot.mesh, source),
+                "mesh unavailable"
+            );
+            let mut mesh = current.clone();
+            verified.merge_into(&mut mesh)?;
+            let changed = mesh.admissions.len() != current.admissions.len()
+                || mesh.departures.len() != current.departures.len();
+            (mesh, changed)
+        } else {
+            ensure!(!current_only, "mesh unavailable");
+            ensure!(
+                self.meshes.len() < MAX_CURRENT_MESHES,
+                "device has reached the 64-group limit"
+            );
+            (snapshot.mesh.clone(), true)
         };
         if let Some(departed) = self.departed.get(&mesh.id) {
-            mesh.merge(departed)?;
+            ensure!(!current_only, "mesh unavailable");
+            VerifiedSnapshot::caller_vouches_for_local_snapshot(&Snapshot::without_addresses(
+                departed.clone(),
+            ))
+            .merge_into(&mut mesh)?;
             ensure!(
                 mesh.member(self.member.id).is_some(),
                 "this device left that mesh"
             );
             self.departed.remove(&mesh.id);
+            changed = true;
             self.departure_order.retain(|id| *id != mesh.id);
         }
-        self.mesh = Some(mesh);
-        self.store_addresses(snapshot, source);
+        self.meshes.insert(mesh.id, mesh);
+        changed |= self.store_addresses(snapshot, source);
         self.retain_member_addresses();
-        Ok(())
+        Ok(changed)
     }
 
-    pub fn merge_departure(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<()> {
-        let mesh = self.mesh.as_mut().context("device is not a mesh member")?;
-        ensure!(mesh.id == snapshot.mesh.id, "different meshes cannot merge");
+    pub fn merge_departure(
+        &mut self,
+        verified: &VerifiedSnapshot<'_>,
+        source: EndpointId,
+    ) -> Result<bool> {
+        let snapshot = verified.snapshot();
+        let mesh = self
+            .meshes
+            .get_mut(&snapshot.mesh.id)
+            .context("device is not a member of this mesh")?;
         ensure!(
             snapshot.mesh.departed(source),
             "peer has not left this mesh"
         );
-        mesh.merge(&snapshot.mesh)?;
+        let before = (mesh.admissions.len(), mesh.departures.len());
+        verified.merge_into(mesh)?;
+        let changed = before != (mesh.admissions.len(), mesh.departures.len());
         self.retain_member_addresses();
-        Ok(())
+        Ok(changed)
     }
 
-    pub fn leave(&mut self, key: &SecretKey) -> Result<Snapshot> {
-        let mut mesh = self.mesh.clone().context("device is not a mesh member")?;
+    pub fn leave(&mut self, mesh_id: MeshId, key: &SecretKey) -> Result<Snapshot> {
+        let mut mesh = self
+            .meshes
+            .get(&mesh_id)
+            .context("device is not a member of this mesh")?
+            .clone();
         mesh.depart(key)?;
-        self.mesh = None;
+        self.meshes.remove(&mesh_id);
         self.retain_member_addresses();
         if mesh.members().next().is_some() {
             self.departure_order.retain(|id| *id != mesh.id);
@@ -378,16 +507,17 @@ impl State {
             .map(|departed| Snapshot::without_addresses(departed.clone()))
     }
 
-    pub fn rejoin_conflict(&self, mesh: &Mesh) -> Result<Option<Snapshot>> {
-        let Some(departure) = self.departure(mesh.id) else {
+    pub fn rejoin_conflict(&self, verified: &VerifiedSnapshot<'_>) -> Result<Option<Snapshot>> {
+        let Some(departure) = self.departure(verified.snapshot().mesh.id) else {
             return Ok(None);
         };
-        let mut merged = mesh.clone();
-        merged.merge(&departure.mesh)?;
+        let mut merged = verified.snapshot().mesh.clone();
+        VerifiedSnapshot::caller_vouches_for_local_snapshot(&departure).merge_into(&mut merged)?;
         Ok(merged.departed(self.member.id).then_some(departure))
     }
 
-    fn store_addresses(&mut self, snapshot: &Snapshot, source: EndpointId) {
+    fn store_addresses(&mut self, snapshot: &Snapshot, source: EndpointId) -> bool {
+        let mut changed = false;
         for (id, addr) in &snapshot.addresses {
             if *id == self.member.id {
                 continue;
@@ -399,16 +529,17 @@ impl State {
                     direct: None,
                     hints: BTreeMap::new(),
                 });
-            entry.set(
+            changed |= entry.set(
                 snapshot.mesh.id,
                 bounded_address(addr.clone()),
                 *id == source,
             );
         }
+        changed
     }
 
     fn retain_member_addresses(&mut self) {
-        let mesh = self.mesh.as_ref();
+        let meshes = &self.meshes;
         self.addresses.retain(|id, entry| {
             if *id == self.member.id {
                 return false;
@@ -417,9 +548,11 @@ impl State {
                 return false;
             };
             hints.retain(|mesh_id, _| {
-                mesh.is_some_and(|mesh| mesh.id == *mesh_id && mesh.member(*id).is_some())
+                meshes
+                    .get(mesh_id)
+                    .is_some_and(|mesh| mesh.member(*id).is_some())
             });
-            if !mesh.is_some_and(|mesh| mesh.member(*id).is_some()) {
+            if !meshes.values().any(|mesh| mesh.member(*id).is_some()) {
                 *direct = None;
             }
             direct.is_some() || !hints.is_empty()
@@ -450,7 +583,7 @@ mod tests {
         )
         .unwrap();
         let id = mesh.id;
-        state.mesh = Some(mesh);
+        state.meshes.insert(mesh.id, mesh);
         id
     }
 
@@ -461,8 +594,8 @@ mod tests {
         let peer = SecretKey::generate();
         let mesh_id = joined_mesh(&mut state, &storage.key, &introducer);
         state
-            .mesh
-            .as_mut()
+            .meshes
+            .get_mut(&mesh_id)
             .unwrap()
             .admit(
                 Member {
@@ -476,19 +609,26 @@ mod tests {
             EndpointAddr::new(peer.public()).with_ip_addr("127.0.0.1:54321".parse().unwrap());
         let direct =
             EndpointAddr::new(peer.public()).with_ip_addr("127.0.0.1:54322".parse().unwrap());
-        let mut incoming = Snapshot::without_addresses(state.mesh.clone().unwrap());
+        let mut incoming = Snapshot::without_addresses(state.meshes[&mesh_id].clone());
         incoming.addresses.insert(peer.public(), hint.clone());
         incoming
             .addresses
             .insert(state.member.id, EndpointAddr::new(state.member.id));
-        state.merge(&incoming, introducer.public()).unwrap();
+        state
+            .merge_current(
+                &VerifiedSnapshot::new(&incoming).unwrap(),
+                introducer.public(),
+            )
+            .unwrap();
         assert_eq!(
             state.addresses[&peer.public()].preferred(mesh_id),
             Some(&hint)
         );
         assert!(!state.addresses.contains_key(&state.member.id));
         incoming.addresses.insert(peer.public(), direct.clone());
-        state.merge(&incoming, peer.public()).unwrap();
+        state
+            .merge_current(&VerifiedSnapshot::new(&incoming).unwrap(), peer.public())
+            .unwrap();
         assert_eq!(
             state.addresses[&peer.public()].preferred(mesh_id),
             Some(&direct)
@@ -503,7 +643,12 @@ mod tests {
         state.retain_member_addresses();
         assert!(!state.addresses.contains_key(&state.member.id));
         incoming.addresses.insert(peer.public(), hint);
-        state.merge(&incoming, introducer.public()).unwrap();
+        state
+            .merge_current(
+                &VerifiedSnapshot::new(&incoming).unwrap(),
+                introducer.public(),
+            )
+            .unwrap();
         assert_eq!(
             state.addresses[&peer.public()].preferred(mesh_id),
             Some(&direct)
@@ -517,7 +662,9 @@ mod tests {
         assert!(Storage::read(dir.path()).unwrap().departed.is_empty());
         let peer = SecretKey::generate();
         let id = joined_mesh(&mut state, &storage.key, &peer);
-        state.leave(&storage.key).unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         let mut old = serde_json::to_value(&state).unwrap();
         old["departed"] = serde_json::to_value(&state.departed[&id]).unwrap();
         old.as_object_mut().unwrap().remove("departure_order");
@@ -534,12 +681,154 @@ mod tests {
     }
 
     #[test]
+    fn origin_main_state_shape_migrates_without_changing_signatures() {
+        let (dir, storage, state) = setup();
+        let mut mesh = Mesh::create_legacy("original", state.member.clone(), &storage.key).unwrap();
+        let peer = SecretKey::generate();
+        mesh.admit(
+            Member {
+                id: peer.public(),
+                name: "peer".into(),
+            },
+            &storage.key,
+        )
+        .unwrap();
+        let signed = serde_json::to_value(&mesh).unwrap();
+        assert!(signed.get("departures").is_none());
+        assert!(signed["admissions"][0].get("generation").is_none());
+        let legacy = serde_json::json!({"member": state.member, "mesh": signed, "addresses": {}});
+        write_private(
+            &dir.path().join("state.json"),
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        drop(storage);
+        let (storage, reopened) = Storage::open(dir.path()).unwrap();
+        assert_eq!(reopened.meshes.len(), 1);
+        assert_eq!(reopened.info().meshes[0].members.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&reopened.meshes[&mesh.id]).unwrap(),
+            signed
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(dir.path().join("state.json")).unwrap()
+            )
+            .unwrap()["mesh"],
+            MULTI_MESH_SENTINEL
+        );
+        drop(storage);
+    }
+
+    #[test]
+    fn legacy_single_mesh_with_departed_copies_migrates_without_resigning() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let departed_id = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(departed_id, &storage.key).unwrap();
+        let current = Mesh::create("old group", state.member.clone(), &storage.key).unwrap();
+        let id = current.id;
+        let signed = serde_json::to_value(&current).unwrap();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("meshes");
+        legacy["mesh"] = signed.clone();
+        write_private(
+            &dir.path().join("state.json"),
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        drop(storage);
+        let (storage, reopened) = Storage::open(dir.path()).unwrap();
+        assert_eq!(reopened.meshes.len(), 1);
+        assert_eq!(reopened.info().mesh_id, Some(id));
+        assert_eq!(serde_json::to_value(&reopened.meshes[&id]).unwrap(), signed);
+        assert!(reopened.departed.contains_key(&departed_id));
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(migrated["mesh"], MULTI_MESH_SENTINEL);
+        assert_eq!(migrated["meshes"][id.to_string()], signed);
+        drop(storage);
+    }
+
+    #[test]
+    fn historical_state_fixtures_migrate_and_block_old_readers() {
+        #[derive(Deserialize)]
+        struct MainState {
+            member: Member,
+            mesh: Option<Mesh>,
+            addresses: BTreeMap<EndpointId, EndpointAddr>,
+        }
+
+        #[derive(Deserialize)]
+        struct LeaveState {
+            member: Member,
+            mesh: Option<Mesh>,
+            addresses: BTreeMap<EndpointId, EndpointAddr>,
+            #[serde(default, deserialize_with = "read_departed")]
+            departed: BTreeMap<MeshId, Mesh>,
+            #[serde(default)]
+            departure_order: Vec<MeshId>,
+        }
+
+        let main = include_bytes!("../tests/fixtures/main-state.json");
+        let leave = include_bytes!("../tests/fixtures/leave-state.json");
+        let old_main: MainState = serde_json::from_slice(main).unwrap();
+        let old_leave: LeaveState = serde_json::from_slice(leave).unwrap();
+        assert!(old_main.mesh.is_some());
+        assert_eq!(old_main.addresses.len(), 1);
+        assert!(old_leave.mesh.is_some());
+        assert_eq!(old_leave.departed.len(), 1);
+        assert_eq!(old_leave.departure_order.len(), 1);
+        assert_eq!(old_leave.addresses.len(), 1);
+        for (bytes, id) in [
+            (main.as_slice(), old_main.member.id),
+            (leave.as_slice(), old_leave.member.id),
+        ] {
+            let (dir, storage, _) = setup();
+            write_private(&dir.path().join("state.json"), bytes).unwrap();
+            let migrated = Storage::read(dir.path()).unwrap();
+            assert_eq!(migrated.member.id, id);
+            let mesh_id = *migrated.meshes.keys().next().unwrap();
+            let legacy_address = if id == old_main.member.id {
+                &old_main.addresses
+            } else {
+                &old_leave.addresses
+            };
+            for (peer_id, address) in legacy_address {
+                if *peer_id == id {
+                    assert!(!migrated.addresses.contains_key(peer_id));
+                    continue;
+                }
+                match &migrated.addresses[peer_id] {
+                    AddressEntry::Current { direct, hints } => {
+                        assert!(direct.is_none());
+                        assert_eq!(hints.get(&mesh_id), Some(address));
+                    }
+                    AddressEntry::Legacy(_) => panic!("unmigrated address"),
+                }
+            }
+            let signed = serde_json::to_value(migrated.meshes.values().next().unwrap()).unwrap();
+            storage.save(&migrated).unwrap();
+            let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
+            assert!(serde_json::from_slice::<MainState>(&bytes).is_err());
+            assert!(serde_json::from_slice::<LeaveState>(&bytes).is_err());
+            let reopened = Storage::read(dir.path()).unwrap();
+            assert_eq!(
+                serde_json::to_value(reopened.meshes.values().next().unwrap()).unwrap(),
+                signed
+            );
+        }
+    }
+
+    #[test]
     fn reading_rejects_invalid_departed_copies() {
         let (dir, storage, mut state) = setup();
         let peer = SecretKey::generate();
         let id = joined_mesh(&mut state, &storage.key, &peer);
-        let active = state.mesh.clone().unwrap();
-        state.leave(&storage.key).unwrap();
+        let active = state.meshes.values().next().cloned().unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         let valid = state.clone();
         let mut invalid = valid.clone();
         invalid.departed.insert(id, active.clone());
@@ -549,7 +838,7 @@ mod tests {
             .to_string()
             .contains("does not record"));
         let mut invalid = valid.clone();
-        invalid.mesh = Some(active);
+        invalid.meshes.insert(active.id, active);
         storage.save(&invalid).unwrap();
         assert!(Storage::read(dir.path())
             .unwrap_err()
@@ -579,7 +868,9 @@ mod tests {
         let (dir, storage, mut state) = setup();
         let peer = SecretKey::generate();
         let id = joined_mesh(&mut state, &storage.key, &peer);
-        state.leave(&storage.key).unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         let mut duplicate = state.clone();
         duplicate.departure_order.push(id);
         storage.save(&duplicate).unwrap();
@@ -600,9 +891,13 @@ mod tests {
         let (dir, storage, mut state) = setup();
         let peer = SecretKey::generate();
         let first = joined_mesh(&mut state, &storage.key, &peer);
-        state.leave(&storage.key).unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         let second = joined_mesh(&mut state, &storage.key, &peer);
-        state.leave(&storage.key).unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         state.departure_order.remove(0);
         storage.save(&state).unwrap();
         let reopened = Storage::read(dir.path()).unwrap();
@@ -610,7 +905,12 @@ mod tests {
         let mut reopened = reopened;
         for _ in 0..MAX_DEPARTED_MESHES - 1 {
             joined_mesh(&mut reopened, &storage.key, &peer);
-            reopened.leave(&storage.key).unwrap();
+            reopened
+                .leave(
+                    reopened.meshes.keys().next().copied().unwrap(),
+                    &storage.key,
+                )
+                .unwrap();
         }
         assert!(!reopened.departed.contains_key(&second));
         assert!(reopened.departed.contains_key(&first));
@@ -621,16 +921,22 @@ mod tests {
         let (_dir, storage, mut state) = setup();
         let peer = SecretKey::generate();
         let first = joined_mesh(&mut state, &storage.key, &peer);
-        state.leave(&storage.key).unwrap();
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         for _ in 1..=MAX_DEPARTED_MESHES {
             joined_mesh(&mut state, &storage.key, &peer);
-            state.leave(&storage.key).unwrap();
+            state
+                .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+                .unwrap();
         }
         assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
         assert!(!state.departed.contains_key(&first));
         let mut invalid = state.clone();
         joined_mesh(&mut invalid, &storage.key, &peer);
-        invalid.leave(&storage.key).unwrap();
+        invalid
+            .leave(invalid.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         invalid.departed.insert(
             first,
             Mesh::create("bad", invalid.member.clone(), &storage.key).unwrap(),
@@ -642,8 +948,10 @@ mod tests {
             .contains("too many departed meshes"));
         let solo = Mesh::create("solo", state.member.clone(), &storage.key).unwrap();
         let solo_id = solo.id;
-        state.mesh = Some(solo);
-        state.leave(&storage.key).unwrap();
+        state.meshes.insert(solo.id, solo);
+        state
+            .leave(state.meshes.keys().next().copied().unwrap(), &storage.key)
+            .unwrap();
         assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
         assert!(!state.departed.contains_key(&solo_id));
     }
