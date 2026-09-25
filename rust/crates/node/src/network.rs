@@ -27,6 +27,31 @@ pub(crate) const PING_ALPN: &[u8] = b"spirit/ping/1";
 pub(crate) const DEPART_ALPN: &[u8] = b"spirit/depart/1";
 const DEPARTURE_RECORDED: &str = "recorded";
 const MAX_MESSAGE: usize = 1024 * 1024;
+const HEARTBEAT_MARGIN: Duration = Duration::from_secs(1);
+const HEARTBEAT_DEADLINE: Duration = HEARTBEAT_INTERVAL.saturating_sub(HEARTBEAT_MARGIN);
+const PING_RESERVE: Duration = Duration::from_secs(1);
+const HEARTBEAT_SYNC_BUDGET: Duration = HEARTBEAT_DEADLINE.saturating_sub(PING_RESERVE);
+const _: () = assert!(
+    HEARTBEAT_SYNC_BUDGET.as_nanos() + PING_RESERVE.as_nanos() <= HEARTBEAT_DEADLINE.as_nanos()
+);
+#[cfg(test)]
+static TEST_HEARTBEAT_BUDGET: std::sync::OnceLock<Mutex<BTreeMap<NodeId, Duration>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+static TEST_HEARTBEAT_PANIC: std::sync::OnceLock<Mutex<BTreeSet<NodeId>>> =
+    std::sync::OnceLock::new();
+
+fn heartbeat_budget(_local: NodeId) -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = TEST_HEARTBEAT_BUDGET
+        .get()
+        .and_then(|values| values.lock().unwrap().get(&_local).copied())
+    {
+        return budget;
+    }
+    HEARTBEAT_SYNC_BUDGET
+}
+
 const MAX_DIAGNOSTIC_BYTES: usize = 256;
 
 pub(crate) fn bounded_diagnostic(error: &str) -> String {
@@ -114,26 +139,70 @@ impl Shared {
         }
     }
 
-    pub async fn ping(&self, id: NodeId) -> Result<u128> {
+    pub async fn ping(self: &Arc<Self>, id: NodeId) -> Result<u128> {
+        self.ping_with_sync_budget(id, self.config.request_timeout)
+            .await
+    }
+
+    async fn ping_with_sync_budget(self: &Arc<Self>, id: NodeId, budget: Duration) -> Result<u128> {
         let result = async {
             let address = self.address(id);
-            let mesh_id = self
+            let shared: Vec<_> = self
                 .state
                 .lock()
                 .unwrap()
-                .info()
-                .mesh_id
-                .context("device is not a mesh member")?;
-            self.sync(address.clone(), mesh_id).await?;
+                .meshes
+                .values()
+                .filter(|mesh| mesh.member(id).is_some())
+                .map(|mesh| mesh.id)
+                .collect();
+            ensure!(!shared.is_empty(), "peer is not a mesh member");
+            let mut syncs = JoinSet::new();
+            let mut pending = BTreeMap::new();
+            for mesh_id in shared {
+                let peer = self.clone();
+                let address = address.clone();
+                let task = syncs.spawn(async move { peer.sync(address, mesh_id).await });
+                pending.insert(task.id(), mesh_id);
+            }
+            let mut errors = Vec::new();
+            let sync_result = tokio::time::timeout(budget, async {
+                while let Some(result) = syncs.join_next_with_id().await {
+                    match result {
+                        Ok((task_id, result)) => {
+                            let mesh_id = pending.remove(&task_id).unwrap();
+                            if let Err(error) = result {
+                                errors.push(format!("{mesh_id}: {error:#}"));
+                            }
+                        }
+                        Err(error) => {
+                            let mesh_id = pending.remove(&error.id()).unwrap();
+                            errors.push(format!("{mesh_id}: {error}"));
+                        }
+                    }
+                }
+            })
+            .await;
+            if sync_result.is_err() {
+                syncs.abort_all();
+                errors.extend(
+                    pending
+                        .values()
+                        .map(|id| format!("{id}: membership exchange timed out")),
+                );
+            }
             let start = Instant::now();
             let response: String = self.request(address, PING_ALPN, &"ping").await?;
             ensure!(response == "pong", "invalid pong response");
+            self.heartbeat_received(id);
+            if !errors.is_empty() {
+                self.failed(id, &anyhow::anyhow!(errors.join("; ")));
+            }
             Ok(start.elapsed().as_millis())
         }
         .await;
-        match &result {
-            Ok(_) => self.heartbeat_received(id),
-            Err(error) => self.failed(id, error),
+        if let Err(error) = &result {
+            self.failed(id, error);
         }
         result
     }
@@ -496,28 +565,38 @@ pub(crate) async fn gossip(shared: Arc<Shared>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut in_flight = BTreeSet::new();
     let mut tasks = JoinSet::new();
+    let mut task_peers = BTreeMap::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let peers: Vec<_> = {
                     let state = shared.state.lock().unwrap();
-                    state.meshes.values().flat_map(|mesh| mesh.members())
-                        .map(|member| member.id)
-                        .filter(|id| *id != state.member.id).collect()
+                    state.meshes.values().flat_map(|mesh| mesh.members().map(|member| member.id))
+                        .filter(|id| *id != state.member.id).collect::<BTreeSet<_>>().into_iter().collect()
                 };
                 for id in peers {
                     if !in_flight.insert(id) { continue; }
                     let shared = shared.clone();
-                    tasks.spawn(async move {
-                        let result = tokio::time::timeout(HEARTBEAT_INTERVAL - Duration::from_secs(1), shared.ping(id))
+                    let task = tasks.spawn(async move {
+                        #[cfg(test)]
+                        if TEST_HEARTBEAT_PANIC.get().is_some_and(|ids| ids.lock().unwrap().remove(&id)) {
+                            panic!("injected heartbeat panic");
+                        }
+                        let result = tokio::time::timeout(HEARTBEAT_DEADLINE, shared.ping_with_sync_budget(id, heartbeat_budget(shared.endpoint.id())))
                             .await.context("heartbeat timed out").and_then(|result| result);
                         if let Err(error) = result { shared.failed(id, &error); }
-                        id
                     });
+                    task_peers.insert(task.id(), id);
                 }
             }
-            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if let Ok(id) = result { in_flight.remove(&id); }
+            Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                let task_id = match result {
+                    Ok((task_id, ())) => task_id,
+                    Err(error) => error.id(),
+                };
+                if let Some(id) = task_peers.remove(&task_id) {
+                    in_flight.remove(&id);
+                }
             }
         }
     }
@@ -585,7 +664,7 @@ mod tests {
         let (_a_dir, a) = device("a").await;
         a.gossip.abort();
         let key = SecretKey::generate();
-        let mesh = a.new_mesh("mesh").unwrap().mesh_id.unwrap();
+        let mesh = a.new_mesh("mesh").unwrap();
         a.shared
             .update(|state| {
                 state.meshes.get_mut(&mesh).unwrap().admit(
@@ -628,10 +707,13 @@ mod tests {
         let (_b_dir, b) = device("b").await;
         a.gossip.abort();
         b.gossip.abort();
-        let mesh_id = a.new_mesh("shared").unwrap().mesh_id.unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        let mesh_id = a.new_mesh("shared").unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         b.pair(Duration::from_secs(60)).await.unwrap();
         let invalid = Enrollment {
             secret: [0; 32],
@@ -690,11 +772,11 @@ mod tests {
         .encode()
         .unwrap();
         assert!(a
-            .add(&ticket)
+            .add(a.info().only_mesh().unwrap(), &ticket)
             .await
             .unwrap_err()
             .to_string()
-            .contains("mesh unavailable"));
+            .contains("different mesh"));
         assert_eq!(a.info().meshes.len(), 1);
         assert!(!a
             .shared
@@ -712,7 +794,7 @@ mod tests {
         let (_dir, a) = device("a").await;
         a.gossip.abort();
         let fake_key = SecretKey::generate();
-        let current = a.new_mesh("current").unwrap().mesh_id.unwrap();
+        let current = a.new_mesh("current").unwrap();
         a.shared
             .update(|state| {
                 state.meshes.get_mut(&current).unwrap().admit(
@@ -764,11 +846,11 @@ mod tests {
         for node in [&a, &b, &c] {
             node.gossip.abort();
         }
-        let id = a.new_mesh("secret mesh").unwrap().mesh_id.unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+        let id = a.new_mesh("secret mesh").unwrap();
+        a.add(id, &b.pair(Duration::from_secs(60)).await.unwrap())
             .await
             .unwrap();
-        b.leave().await.unwrap();
+        b.leave(id).await.unwrap();
         let forged = Mesh::create_with_id(
             id,
             "decoy",
@@ -827,7 +909,7 @@ mod tests {
     async fn version_one_pairing_and_membership_are_not_served() {
         let (_a_dir, a) = device("a").await;
         let (_b_dir, b) = device("b").await;
-        let mesh_id = a.new_mesh("new").unwrap().mesh_id.unwrap();
+        let mesh_id = a.new_mesh("new").unwrap();
         let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
         let snapshot = a.shared.snapshot(mesh_id).unwrap();
         let enrollment = Enrollment {
@@ -880,14 +962,14 @@ mod tests {
             PairingTicket::decode(&ticket).unwrap().address.addrs.len(),
             16
         );
-        a.add(&ticket).await.unwrap();
-        let mesh_id = b.info().mesh_id.unwrap();
+        a.add(a.info().mesh_id.unwrap(), &ticket).await.unwrap();
+        let b_mesh = b.info().mesh_id.unwrap();
         let snapshot = b
             .shared
             .state
             .lock()
             .unwrap()
-            .snapshot(mesh_id, overloaded)
+            .snapshot(b_mesh, overloaded)
             .unwrap();
         assert_eq!(snapshot.addresses[&b.info().id].addrs.len(), 16);
         let reply: Snapshot = b
@@ -903,6 +985,105 @@ mod tests {
         a.ping(b.info().id).await.unwrap();
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panicked_heartbeat_releases_the_peers_in_flight_slot() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let mesh = a.new_mesh("mesh").unwrap();
+        let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
+        a.add(mesh, &ticket).await.unwrap();
+        let panics = TEST_HEARTBEAT_PANIC.get_or_init(Default::default);
+        panics.lock().unwrap().insert(b.info().id);
+        let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !a.peers()[0].connected {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!panics.lock().unwrap().contains(&b.info().id));
+        heartbeat.abort();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hanging_mesh_sync_expires_before_the_ping_reserve() {
+        let (_dir, a) = device("a").await;
+        a.gossip.abort();
+        let fake_key = SecretKey::generate();
+        let fake_id = fake_key.public();
+        let id = a.new_mesh("with hanging peer").unwrap();
+        a.shared
+            .update(|state| {
+                state.meshes.get_mut(&id).unwrap().admit(
+                    crate::Member {
+                        id: fake_id,
+                        name: "peer".into(),
+                    },
+                    &a.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .secret_key(fake_key)
+            .bind()
+            .await
+            .unwrap();
+        let router = iroh::protocol::Router::builder(endpoint.clone())
+            .accept(
+                SYNC_ALPN,
+                FakeResponder {
+                    response: vec![],
+                    hang: true,
+                },
+            )
+            .accept(
+                PING_ALPN,
+                FakeResponder {
+                    response: serde_json::to_vec("pong").unwrap(),
+                    hang: false,
+                },
+            )
+            .spawn();
+        a.shared.state.lock().unwrap().addresses.insert(
+            fake_id,
+            crate::storage::AddressEntry::Current {
+                direct: Some(endpoint.addr()),
+                hints: BTreeMap::new(),
+            },
+        );
+        TEST_HEARTBEAT_BUDGET
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(a.info().id, Duration::from_millis(200));
+        let start = Instant::now();
+        let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !a.peers()[0].connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        heartbeat.abort();
+        let peer = &a.peers()[0];
+        assert!(peer.connected);
+        let error = peer.last_error.as_deref().unwrap();
+        assert!(error.contains(&id.to_string()) && error.contains("timed out"));
+        router.shutdown().await.unwrap();
+        a.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -926,11 +1107,16 @@ mod tests {
         let valid = c.pair(Duration::from_secs(60)).await.unwrap();
         let mut forged = PairingTicket::decode(&valid).unwrap();
         forged.secret[0] ^= 1;
-        assert!(a.add(&forged.encode().unwrap()).await.is_err());
+        assert!(a
+            .add(a.info().only_mesh().unwrap(), &forged.encode().unwrap())
+            .await
+            .is_err());
         assert!(c.info().mesh_id.is_none());
         let replacement = c.pair(Duration::from_secs(60)).await.unwrap();
-        assert!(a.add(&valid).await.is_err());
-        a.add(&replacement).await.unwrap();
+        assert!(a.add(a.info().only_mesh().unwrap(), &valid).await.is_err());
+        a.add(a.info().only_mesh().unwrap(), &replacement)
+            .await
+            .unwrap();
         assert_eq!(c.ping(a.info().id).await.unwrap().id, a.info().id);
         let reply: Result<String> = c
             .shared
@@ -950,9 +1136,12 @@ mod tests {
         b.gossip.abort();
         a.new_mesh("one").unwrap();
         let b_id = b.info().id;
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(!a.peers()[0].connected);
         assert!(a.peers()[0].last_received_ago_ms.is_none());
         assert!(!b.peers()[0].connected);
@@ -1003,7 +1192,7 @@ mod tests {
             .unwrap()
             .expires_at = now().unwrap() - 1;
         assert!(a
-            .add(&ticket)
+            .add(a.info().only_mesh().unwrap(), &ticket)
             .await
             .unwrap_err()
             .to_string()
@@ -1022,18 +1211,30 @@ mod tests {
             node.gossip.abort();
         }
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
-        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &c.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let b_id = b.info().id;
         assert!(c.info().members.iter().any(|member| member.id == b_id));
         c.shutdown().await.unwrap();
         drop(c);
 
-        assert_eq!(b.leave().await.unwrap().notified_members, 1);
+        assert_eq!(
+            b.leave(b.info().only_mesh().unwrap())
+                .await
+                .unwrap()
+                .notified_members,
+            1
+        );
         let c = Node::bind(c_dir.path(), NodeConfig::local()).await.unwrap();
         c.gossip.abort();
         assert!(c.info().members.iter().any(|member| member.id == b_id));
@@ -1075,7 +1276,7 @@ mod tests {
             .contains("could not join this mesh"));
         assert!(refusal.departure.unwrap().mesh.departed(b_id));
         assert!(b.shared.pending.lock().unwrap().is_some());
-        c.add(&ticket).await.unwrap();
+        c.add(c.info().only_mesh().unwrap(), &ticket).await.unwrap();
         let joined = b
             .shared
             .state
@@ -1114,11 +1315,14 @@ mod tests {
             node.gossip.abort();
         }
         a.new_mesh("private mesh name").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let mesh_id = a.info().mesh_id.unwrap();
-        b.leave().await.unwrap();
+        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         let forged = Mesh::create_with_id(
             mesh_id,
             "outsider mesh",
@@ -1168,12 +1372,18 @@ mod tests {
             node.gossip.abort();
         }
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
-        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &c.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let snapshot = b.shared.snapshot(b.info().mesh_id.unwrap()).unwrap();
         let reply: Result<String> = b
             .shared
@@ -1181,7 +1391,7 @@ mod tests {
             .await;
         assert!(reply.is_err());
         assert_eq!(a.info().members.len(), 3);
-        let left = b.leave().await.unwrap();
+        let left = b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         let departure = b
             .shared
             .state
@@ -1243,20 +1453,26 @@ mod tests {
             node.gossip.abort();
         }
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let original_id = a.info().mesh_id.unwrap();
         let b_id = b.info().id;
         a.shutdown().await.unwrap();
         drop(a);
-        b.leave().await.unwrap();
+        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         b.new_mesh("two").unwrap();
-        b.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        b.add(
+            b.info().only_mesh().unwrap(),
+            &c.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let second_id = b.info().mesh_id.unwrap();
-        b.leave().await.unwrap();
+        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         {
             let state = b.shared.state.lock().unwrap();
             assert!(state.departed.contains_key(&original_id));
@@ -1273,9 +1489,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!a.info().members.iter().any(|member| member.id == b_id));
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(b.info().mesh_id, Some(original_id));
         {
             let state = b.shared.state.lock().unwrap();
@@ -1297,12 +1516,18 @@ mod tests {
             node.gossip.abort();
         }
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
-        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &c.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         a.shared
             .sync(b.shared.endpoint.addr(), a.info().mesh_id.unwrap())
             .await
@@ -1312,7 +1537,13 @@ mod tests {
         a.shutdown().await.unwrap();
         drop(a);
 
-        assert_eq!(b.leave().await.unwrap().notified_members, 1);
+        assert_eq!(
+            b.leave(b.info().only_mesh().unwrap())
+                .await
+                .unwrap()
+                .notified_members,
+            1
+        );
         assert!(!c.info().members.iter().any(|member| member.id == b_id));
         let peer = c.shared.state.lock().unwrap().member.clone();
         for _ in 0..64 {
@@ -1338,9 +1569,12 @@ mod tests {
             .is_err());
         assert!(a.info().members.iter().any(|member| member.id == b_id));
 
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(b.info().mesh_id, Some(mesh_id));
         for node in [&a, &b] {
             let state = node.shared.state.lock().unwrap();
@@ -1365,11 +1599,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a member"));
-        b.leave().await.unwrap();
+        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         assert!(b.shared.state.lock().unwrap().departure(mesh_id).is_some());
-        c.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        c.add(
+            c.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(c.info().members.iter().any(|member| member.id == b_id));
         assert_eq!(
             c.shared
@@ -1399,13 +1636,19 @@ mod tests {
         a.gossip.abort();
         b.gossip.abort();
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let pending = b.pair(Duration::from_secs(60)).await.unwrap();
-        b.leave().await.unwrap();
+        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
         assert!(b.shared.pending.lock().unwrap().is_none());
-        assert!(a.add(&pending).await.is_err());
+        assert!(a
+            .add(a.info().only_mesh().unwrap(), &pending)
+            .await
+            .is_err());
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
     }
@@ -1416,17 +1659,20 @@ mod tests {
         let (b_dir, b) = device("b").await;
         a.gossip.abort();
         a.new_mesh("one").unwrap();
-        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-            .await
-            .unwrap();
+        a.add(
+            a.info().only_mesh().unwrap(),
+            &b.pair(Duration::from_secs(60)).await.unwrap(),
+        )
+        .await
+        .unwrap();
         let b_id = b.info().id;
         b.shutdown().await.unwrap();
         drop(b);
 
-        let left = Node::leave_mesh(b_dir.path()).unwrap();
+        let left = Node::leave_mesh(b_dir.path(), a.info().only_mesh().unwrap()).unwrap();
         assert_eq!(left.remaining_members, 1);
         assert_eq!(left.notified_members, 0);
-        assert!(Node::leave_mesh(b_dir.path()).is_err());
+        assert!(Node::leave_mesh(b_dir.path(), a.info().only_mesh().unwrap()).is_err());
         assert!(a.info().members.iter().any(|member| member.id == b_id));
         a.shared.heartbeat_received(b_id);
         assert!(a.shared.presence.lock().unwrap().contains_key(&b_id));

@@ -5,7 +5,7 @@ use qrcode::{
     render::{svg, unicode::Dense1x2},
     QrCode,
 };
-use spirit_sdk::{LeftMesh, Node, NodeInfo};
+use spirit_sdk::{LeftMesh, MeshId, Node, NodeInfo};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -48,15 +48,24 @@ pub enum MeshCommand {
         name: String,
     },
     #[command(about = "enroll a device using its pairing ticket")]
-    Add { ticket: String },
+    Add {
+        ticket: String,
+        #[arg(long, help = "mesh ID; required if in several meshes")]
+        mesh: Option<MeshId>,
+    },
     #[command(about = "leave this device's mesh; members must enroll it again to readmit it")]
-    Leave,
+    Leave {
+        #[arg(long, help = "mesh ID; required if in several meshes")]
+        mesh: Option<MeshId>,
+    },
     #[command(about = "show this device's membership and service status")]
     Status,
     #[command(about = "list known mesh members")]
     Members {
         #[arg(long, help = "include full device IDs for disambiguation")]
         ids: bool,
+        #[arg(long, help = "list members of this mesh only")]
+        mesh: Option<MeshId>,
     },
 }
 
@@ -162,37 +171,45 @@ fn departure_message(left: &LeftMesh) -> String {
 pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
     match command {
         MeshCommand::Create { name } => {
-            let info =
+            let id =
                 match control::request_if_running(&root, Operation::Create { name: name.clone() })
                     .await?
                 {
-                    Some(Reply::Info(info)) => info,
+                    Some(Reply::Created(id)) => id,
                     None => Node::create_mesh(&root, &name)?,
                     _ => bail!("unexpected node response"),
                 };
             println!(
                 "Created {} with {} as its first member.",
-                info.mesh_name.unwrap(),
-                info.name
+                name,
+                Node::read_info(&root)?.name
             );
+            println!("Mesh ID: {id}");
         }
-        MeshCommand::Add { ticket } => {
-            let Reply::Added(member) = control::request(&root, Operation::Add { ticket }).await?
+        MeshCommand::Add { ticket, mesh } => {
+            let info = info(&root).await?.0;
+            let mesh_id = info.select_mesh(mesh)?;
+            let mesh_name = &info
+                .meshes
+                .iter()
+                .find(|mesh| mesh.id == mesh_id)
+                .unwrap()
+                .name;
+            let Reply::Added(member) =
+                control::request(&root, Operation::Add { mesh_id, ticket }).await?
             else {
                 bail!("unexpected node response");
             };
-            println!(
-                "Added {} to {}.",
-                member.name,
-                info(&root).await?.0.mesh_name.unwrap()
-            );
+            println!("Added {} to {}.", member.name, mesh_name);
         }
-        MeshCommand::Leave => {
-            let left = match control::request_if_running(&root, Operation::Leave).await? {
-                Some(Reply::Left(left)) => left,
-                None => Node::leave_mesh(&root)?,
-                _ => bail!("unexpected node response"),
-            };
+        MeshCommand::Leave { mesh } => {
+            let mesh_id = info(&root).await?.0.select_mesh(mesh)?;
+            let left =
+                match control::request_if_running(&root, Operation::Leave { mesh_id }).await? {
+                    Some(Reply::Left(left)) => left,
+                    None => Node::leave_mesh(&root, mesh_id)?,
+                    _ => bail!("unexpected node response"),
+                };
             println!("{}", departure_message(&left));
         }
         MeshCommand::Status => {
@@ -209,12 +226,18 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
             }
             println!("Devices: {}", info.members.len());
         }
-        MeshCommand::Members { ids } => {
+        MeshCommand::Members { ids, mesh } => {
             let (info, _) = info(&root).await?;
             if info.meshes.is_empty() {
                 bail!("device is not enrolled in a mesh");
             }
-            let selected = &info.meshes;
+            if let Some(id) = mesh {
+                info.select_mesh(Some(id))?;
+            }
+            let selected = info
+                .meshes
+                .iter()
+                .filter(|entry| mesh.is_none_or(|id| entry.id == id));
             for entry in selected {
                 println!("Mesh: {} ({})", entry.name, entry.id);
                 println!(

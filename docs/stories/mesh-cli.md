@@ -50,7 +50,7 @@ This generates a new ticket and invalidates the previous one. Keep the QR image 
 On an existing mesh member, copy the printed ticket into:
 
 ```bash
-spirit mesh add '<ticket>'
+spirit mesh add --mesh mesh1_<mesh-id> '<ticket>'
 ```
 
 Expected output:
@@ -71,7 +71,7 @@ spirit node pair --no-qr --ttl-seconds 60
 
 ```bash
 spirit mesh status
-spirit mesh members
+spirit mesh members --mesh mesh1_<mesh-id>
 spirit node ping laptop
 ```
 
@@ -110,7 +110,7 @@ spirit node ping '<device-id>'
 ## Leave a mesh
 
 ```bash
-spirit mesh leave
+spirit mesh leave --mesh mesh1_<mesh-id>
 ```
 
 Expected output while the service is running and every other member is reachable:
