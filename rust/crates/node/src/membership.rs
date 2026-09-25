@@ -163,6 +163,16 @@ impl Mesh {
         Self::with_id(MeshId::generate()?, name, member, key)
     }
 
+    #[cfg(test)]
+    pub(crate) fn create_with_id(
+        id: MeshId,
+        name: &str,
+        member: Member,
+        key: &SecretKey,
+    ) -> Result<Self> {
+        Self::with_id(id, name, member, key)
+    }
+
     fn with_id(id: MeshId, name: &str, member: Member, key: &SecretKey) -> Result<Self> {
         validate_name(name)?;
         ensure!(

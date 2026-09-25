@@ -30,21 +30,24 @@ A member leaves by signing a departure record for its own current admission. The
 
 A device is a current member when its highest-generation admission has no matching departure. Current members are the only devices listed, pinged, sent heartbeats, answered with pongs, or allowed to admit devices. Departed admissions remain in the signed history because later admissions may trace their trust through them. Consequently the founder, or any introducer, may leave without invalidating the devices it admitted. Departure is a cooperative membership change, not key revocation: a departed key that is later compromised can still sign records that other members accept, and removing a device against its will requires a future policy.
 
-Leaving offline with `Node::leave_mesh` atomically clears the active mesh and its routing addresses. It retains up to 64 departed copies when other members remain; the oldest is evicted when a new departure exceeds that limit. Other members are not told and keep listing the device until departure delivery exists. Re-enrollment into that mesh is refused while the introducer has not learned the departure.
+Leaving atomically clears the local mesh, its routing addresses, presence state, and any outstanding pairing ticket. When other current members remain, it retains a copy of the departed mesh in a map keyed by mesh ID. At most 64 copies are retained; the oldest recorded departure is evicted when a new one exceeds that bound. Eviction takes 64 later departures. After eviction, pull delivery and refusal of a stale introducer's enrollment are lost for that mesh: members must learn the departure from a member who received it earlier. Otherwise a stale introducer's generation-0 enrollment rejoins the device on its side only; informed members continue to reject it. To recover, the device must leave again and be readmitted. The running node announces that copy to every former member over `spirit/depart/1` in parallel, bounded by one request deadline, and reports how many recorded it. One notified member suffices for membership exchange to propagate the departure. `Node::leave_mesh` leaves while stopped and notifies nobody immediately. While retained, the copy answers later membership exchanges only from verified members of the same mesh identity (ID, name, and founder), so they learn of the departure when they next reach the device while it is running.
 
-Signed readmissions use the next generation after a departure, but an introducer must first learn the departure to issue one. Clients from before departures ignore them, so they keep listing a departed device until they upgrade. They reject readmission signatures, so a mixed-version mesh stops exchanging membership with older clients after a device rejoins.
+A departed device can be enrolled again with a fresh ticket. The introducer signs a readmission with the next generation, using `("spirit/mesh/readmission/1", mesh_id, founder, mesh_name, member, issuer, generation)`; a readmission is valid only after a departure from the previous generation. An introducer must learn the departure through announcement or sync before it can readmit the device. Rejoining the same mesh discards that mesh's retained departure copy; joining a different mesh keeps the old copy for its members. The departed device still receives full membership snapshots from stale members' syncs and stale introducers' enrollment attempts, even though it does not persist those snapshots as current membership or rejoin on those attempts.
+
+Clients from before departures ignore them, so they keep listing a departed device until they upgrade. They reject readmission signatures, so a mixed-version mesh stops exchanging membership with older clients after a device rejoins.
 
 ## Networking
 
-`spirit-node` owns the iroh endpoint and router. It serves three versioned protocols:
+`spirit-node` owns the iroh endpoint and router. It serves four versioned protocols:
 
 | ALPN | Request | Response | Authorization |
 |---|---|---|---|
 | `spirit/pair/1` | Enrollment secret and membership snapshot | Committed snapshot or error | Active ticket and introducer's valid membership |
-| `spirit/mesh/1` | Membership and address snapshot | Merged snapshot | Peer has verifiable membership in the same mesh |
+| `spirit/mesh/1` | Membership and address snapshot | Merged snapshot or retained departed copy | Peer has verifiable membership in the same mesh |
 | `spirit/ping/1` | JSON string `"ping"` | JSON string `"pong"` | Authenticated peer is in the local validated membership set |
+| `spirit/depart/1` | Departed mesh copy without addresses | JSON string `"recorded"` | The authenticated peer's own signed departure, for the local mesh |
 
-Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. No mesh metadata is returned for a failed membership exchange.
+Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. A departed device's sync reply includes its retained departed copy for a verified member of the same mesh.
 
 Background heartbeats run every five seconds. Each peer is checked independently, with at most one active heartbeat per member and a four-second overall deadline. An unreachable peer cannot delay probing the others. Each heartbeat exchanges membership and then sends a ping. A member can present a signed admission unknown to its peer; this teaches the peer about the new member before a subsequent ping. The CLI performs a membership exchange before pinging.
 
@@ -80,10 +83,11 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumer
 - `Node::init(directory, nickname)` creates or reopens an identity.
 - `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
 - `Node::bind(directory, config).await` starts networking and background exchange.
-- `Node::leave_mesh(directory)` leaves while stopped and notifies nobody immediately.
+- `Node::leave_mesh(directory)` leaves while stopped; former members learn of it from the running node later while it retains the copy.
 - `node.new_mesh(mesh_name)` creates a mesh while running.
 - `node.pair(lifetime).await` opens an enrollment window and returns a ticket.
 - `node.add(ticket).await` admits the ticket's device.
+- `node.leave().await` leaves the mesh, notifies reachable former members, and returns a `LeftMesh` with the remaining and notified member counts.
 - `node.info().resolve(nickname_or_id)` resolves a member without guessing on duplicates.
 - `node.peers()` returns each other member's connectivity, time since last received message, and last error.
 - `node.ping(member.id).await` returns an authenticated pong and elapsed milliseconds.

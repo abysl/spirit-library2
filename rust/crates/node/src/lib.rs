@@ -14,7 +14,7 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr, SecretKey};
 use membership::Mesh;
-use network::{Protocol, Shared, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
+use network::{Protocol, Shared, DEPART_ALPN, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -191,6 +191,7 @@ impl Node {
             .accept(PAIR_ALPN, Protocol::pair(shared.clone()))
             .accept(SYNC_ALPN, Protocol::sync(shared.clone()))
             .accept(PING_ALPN, Protocol::ping(shared.clone()))
+            .accept(DEPART_ALPN, Protocol::depart(shared.clone()))
             .spawn();
         let gossip = tokio::spawn(network::gossip(shared.clone()));
         Ok(Self {
@@ -288,6 +289,43 @@ impl Node {
         );
         self.shared.merge(&joined, member.id)?;
         Ok(member)
+    }
+
+    pub async fn leave(&self) -> Result<LeftMesh> {
+        let (departure, peers) = {
+            let mut pending = self.shared.pending.lock().unwrap();
+            let (departure, peers) = self.shared.update(|state| {
+                let peers: Vec<_> = state
+                    .mesh
+                    .as_ref()
+                    .context("device is not a mesh member")?
+                    .members()
+                    .filter(|member| member.id != state.member.id)
+                    .map(|member| {
+                        state
+                            .addresses
+                            .get(&member.id)
+                            .cloned()
+                            .unwrap_or_else(|| member.id.into())
+                    })
+                    .collect();
+                Ok((state.leave(&self.shared.storage.key)?, peers))
+            })?;
+            *pending = None;
+            (departure, peers)
+        };
+        let remaining_members = peers.len();
+        let left = LeftMesh {
+            mesh_id: departure.mesh.id,
+            mesh_name: departure.mesh.name.clone(),
+            remaining_members,
+            notified_members: 0,
+        };
+        let notified_members = self.shared.announce_departure(departure, peers).await;
+        Ok(LeftMesh {
+            notified_members,
+            ..left
+        })
     }
 
     pub async fn ping(&self, id: NodeId) -> Result<Pong> {
