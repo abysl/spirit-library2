@@ -482,6 +482,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overloaded_host_address_pairs_and_syncs_after_bounding() {
+        use iroh::{RelayUrl, TransportAddr};
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        a.new_mesh("M1").unwrap();
+        let mut overloaded = b.shared.endpoint.addr();
+        overloaded.addrs.insert(TransportAddr::Relay(
+            format!("https://relay.example/{}", "x".repeat(200))
+                .parse::<RelayUrl>()
+                .unwrap(),
+        ));
+        for index in 0..20 {
+            overloaded.addrs.insert(TransportAddr::Ip(
+                format!("[::1]:{}", 30000 + index).parse().unwrap(),
+            ));
+        }
+        assert!(overloaded.addrs.len() > 16);
+        crate::TEST_PAIR_ADDRESSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(b.info().id, overloaded.clone());
+        let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(
+            PairingTicket::decode(&ticket).unwrap().address.addrs.len(),
+            16
+        );
+        a.add(&ticket).await.unwrap();
+        let snapshot = b.shared.state.lock().unwrap().snapshot(overloaded).unwrap();
+        assert_eq!(snapshot.addresses[&b.info().id].addrs.len(), 16);
+        let reply: Snapshot = b
+            .shared
+            .request(a.shared.endpoint.addr(), SYNC_ALPN, &snapshot)
+            .await
+            .unwrap();
+        reply.verify().unwrap();
+        b.shared.sync(a.shared.endpoint.addr()).await.unwrap();
+        a.ping(b.info().id).await.unwrap();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_rejects_outsider_pings_wrong_mesh_sync_and_bad_secrets() {
         let (_a_dir, a) = device("a").await;
         let (_b_dir, b) = device("b").await;

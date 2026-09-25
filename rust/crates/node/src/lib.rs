@@ -119,9 +119,15 @@ impl PairingTicket {
         membership::validate_name(&ticket.name)?;
         ensure!(ticket.expires_at > now()?, "pairing ticket has expired");
         ensure!(
-            ticket.address.addrs.len() <= 16,
+            ticket.address.addrs.len() <= membership::MAX_ADDRESSES,
             "too many ticket addresses"
         );
+        for transport in &ticket.address.addrs {
+            ensure!(
+                serde_json::to_vec(transport)?.len() <= membership::MAX_TRANSPORT_ADDRESS_BYTES,
+                "transport address is too long"
+            );
+        }
         Ok(ticket)
     }
 }
@@ -129,6 +135,11 @@ impl PairingTicket {
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
+
+#[cfg(test)]
+static TEST_PAIR_ADDRESSES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<NodeId, EndpointAddr>>,
+> = std::sync::OnceLock::new();
 
 pub struct Node {
     shared: Arc<Shared>,
@@ -248,8 +259,14 @@ impl Node {
             .await
             .context("relay is unavailable; use node serve --local for same-machine testing")?;
         }
+        let address = self.shared.endpoint.addr();
+        #[cfg(test)]
+        let address = TEST_PAIR_ADDRESSES
+            .get()
+            .and_then(|addresses| addresses.lock().unwrap().remove(&address.id))
+            .unwrap_or(address);
         let ticket = PairingTicket {
-            address: self.shared.endpoint.addr(),
+            address: membership::bounded_address(address),
             name: self.info().name,
             secret: SecretKey::generate().to_bytes(),
             expires_at: now()? + lifetime.as_secs(),

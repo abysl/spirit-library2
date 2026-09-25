@@ -57,6 +57,8 @@ Normal operation uses iroh's N0 relay and address lookup preset. Ticket generati
 
 Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh holds at most 256 admission records, including readmissions, with at most 16 transport addresses per member. Leave and rejoin cycles consume the admission cap permanently. Two individually valid snapshots whose union exceeds it fail to merge in either direction with `invalid mesh size`; same-generation readmissions with different signed nicknames permanently fail to merge with `conflicting device nickname`. Neither conflict is resolved automatically. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
 
+A mesh holds at most 256 admissions (including readmissions) and 256 current members. Each departure matches an admission, so 512 signed records can be retained. The 256 KiB `/1` membership wire limit still applies; large snapshots may not fit until the `/2` protocol increases it.
+
 Membership propagation is eventual. Peers must have exchanged membership and usable addresses before the introducer goes offline. Once they have, the introducer need not remain online for authentication, pinging, or further enrollment.
 
 ## Persistence and local control
