@@ -266,6 +266,18 @@ impl State {
         Ok(())
     }
 
+    pub fn merge_departure(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<()> {
+        let mesh = self.mesh.as_mut().context("device is not a mesh member")?;
+        ensure!(mesh.id == snapshot.mesh.id, "different meshes cannot merge");
+        ensure!(
+            snapshot.mesh.departed(source),
+            "peer has not left this mesh"
+        );
+        mesh.merge(&snapshot.mesh)?;
+        self.retain_member_addresses();
+        Ok(())
+    }
+
     pub fn leave(&mut self, key: &SecretKey) -> Result<Snapshot> {
         let mut mesh = self.mesh.clone().context("device is not a mesh member")?;
         mesh.depart(key)?;
@@ -285,6 +297,12 @@ impl State {
             self.departure_order.push(mesh.id);
         }
         Ok(Snapshot::without_addresses(mesh))
+    }
+
+    pub fn departure(&self, mesh_id: MeshId) -> Option<Snapshot> {
+        self.departed
+            .get(&mesh_id)
+            .map(|departed| Snapshot::without_addresses(departed.clone()))
     }
 
     fn retain_member_addresses(&mut self) {

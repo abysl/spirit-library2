@@ -24,6 +24,8 @@ use tokio::task::JoinSet;
 pub(crate) const PAIR_ALPN: &[u8] = b"spirit/pair/1";
 pub(crate) const SYNC_ALPN: &[u8] = b"spirit/mesh/1";
 pub(crate) const PING_ALPN: &[u8] = b"spirit/ping/1";
+pub(crate) const DEPART_ALPN: &[u8] = b"spirit/depart/1";
+const DEPARTURE_RECORDED: &str = "recorded";
 const MAX_MESSAGE: usize = 256 * 1024;
 
 pub(crate) struct Shared {
@@ -48,6 +50,14 @@ pub(crate) struct EnrollmentReply {
 
 impl Shared {
     pub fn heartbeat_received(&self, id: NodeId) {
+        let state = self.state.lock().unwrap();
+        if !state
+            .mesh
+            .as_ref()
+            .is_some_and(|mesh| mesh.member(id).is_some())
+        {
+            return;
+        }
         self.presence
             .lock()
             .unwrap()
@@ -56,23 +66,31 @@ impl Shared {
             .heartbeat_received(Instant::now());
     }
 
-    fn failed(&self, id: NodeId, error: &anyhow::Error) {
-        if self
-            .state
+    pub fn is_member(&self, id: NodeId) -> bool {
+        self.state
             .lock()
             .unwrap()
             .mesh
             .as_ref()
             .and_then(|mesh| mesh.member(id))
             .is_some()
+    }
+
+    fn failed(&self, id: NodeId, error: &anyhow::Error) {
+        let state = self.state.lock().unwrap();
+        if !state
+            .mesh
+            .as_ref()
+            .is_some_and(|mesh| mesh.member(id).is_some())
         {
-            self.presence
-                .lock()
-                .unwrap()
-                .entry(id)
-                .or_default()
-                .failed(format!("{error:#}"));
+            return;
         }
+        self.presence
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .failed(format!("{error:#}"));
     }
 
     fn record_failure<T>(&self, id: NodeId, result: &Result<T>) {
@@ -118,14 +136,73 @@ impl Shared {
             snapshot.mesh.member(source).is_some(),
             "peer is not a mesh member"
         );
+        self.update(|state| state.merge(snapshot, source))
+    }
+
+    pub fn record_departure(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
+        ensure!(
+            self.state
+                .lock()
+                .unwrap()
+                .mesh
+                .as_ref()
+                .is_some_and(|mesh| mesh.id == snapshot.mesh.id),
+            "device is not a member of this mesh"
+        );
+        ensure!(
+            snapshot.mesh.departed(source),
+            "peer has not left this mesh"
+        );
+        snapshot.verify()?;
+        self.update(|state| state.merge_departure(snapshot, source))
+    }
+
+    pub fn update<T>(&self, change: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let mut state = self.state.lock().unwrap();
         let mut next = state.clone();
-        next.merge(snapshot, source)?;
+        let result = change(&mut next)?;
         if serde_json::to_vec(&next)? != serde_json::to_vec(&*state)? {
             self.storage.save(&next)?;
             *state = next;
         }
-        Ok(())
+        let members: BTreeSet<_> = state
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.members().map(|member| member.id).collect())
+            .unwrap_or_default();
+        self.presence
+            .lock()
+            .unwrap()
+            .retain(|id, _| members.contains(id));
+        Ok(result)
+    }
+
+    pub async fn announce_departure(
+        self: &Arc<Self>,
+        departure: Snapshot,
+        peers: Vec<EndpointAddr>,
+    ) -> usize {
+        let mut tasks = JoinSet::new();
+        for address in peers {
+            let shared = self.clone();
+            let departure = departure.clone();
+            tasks.spawn(async move {
+                shared
+                    .request::<_, String>(address, DEPART_ALPN, &departure)
+                    .await
+                    .is_ok_and(|reply| reply == DEPARTURE_RECORDED)
+            });
+        }
+        let mut notified = 0;
+        let _ = tokio::time::timeout(self.config.request_timeout, async {
+            while let Some(result) = tasks.join_next().await {
+                if result.unwrap_or(false) {
+                    notified += 1;
+                }
+            }
+        })
+        .await;
+        notified
     }
 
     pub async fn request<T: Serialize, R: DeserializeOwned>(
@@ -174,7 +251,11 @@ impl Shared {
         let result = async {
             let snapshot = self.snapshot()?;
             let response: Snapshot = self.request(address, SYNC_ALPN, &snapshot).await?;
-            self.merge(&response, id)
+            if response.mesh.departed(id) {
+                self.record_departure(&response, id)
+            } else {
+                self.merge(&response, id)
+            }
         }
         .await;
         self.record_failure(id, &result);
@@ -200,6 +281,26 @@ impl Shared {
         *pending = None;
         self.snapshot()
     }
+
+    fn answer_sync(&self, snapshot: &Snapshot, remote: NodeId) -> Result<Snapshot> {
+        let departure = self.state.lock().unwrap().departure(snapshot.mesh.id);
+        if let Some(departure) = departure {
+            ensure!(
+                departure.mesh.same_identity(&snapshot.mesh)
+                    && snapshot.mesh.member(remote).is_some()
+                    && snapshot.verify().is_ok(),
+                "device is not enrolled"
+            );
+            return Ok(departure);
+        }
+        ensure!(
+            self.state.lock().unwrap().mesh.is_some(),
+            "device is not enrolled"
+        );
+        self.merge(snapshot, remote)?;
+        ensure!(self.is_member(remote), "peer is not a mesh member");
+        self.snapshot()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -207,6 +308,7 @@ enum Kind {
     Pair,
     Sync,
     Ping,
+    Depart,
 }
 
 pub(crate) struct Protocol {
@@ -241,15 +343,17 @@ impl Protocol {
             kind: Kind::Ping,
         }
     }
+    pub fn depart(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            kind: Kind::Depart,
+        }
+    }
 
     async fn respond(&self, connection: &Connection) -> Result<()> {
         let remote = connection.remote_id();
         if matches!(self.kind, Kind::Ping) {
-            let state = self.shared.state.lock().unwrap();
-            ensure!(
-                state.mesh.as_ref().and_then(|m| m.member(remote)).is_some(),
-                "peer is not a mesh member"
-            );
+            ensure!(self.shared.is_member(remote), "peer is not a mesh member");
         }
         let (mut send, mut recv) = connection.accept_bi().await?;
         let limit = if matches!(self.kind, Kind::Ping) {
@@ -269,13 +373,13 @@ impl Protocol {
                 })?
             }
             Kind::Sync => {
-                ensure!(
-                    self.shared.state.lock().unwrap().mesh.is_some(),
-                    "device is not enrolled"
-                );
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-                self.shared.merge(&snapshot, remote)?;
-                serde_json::to_vec(&self.shared.snapshot()?)?
+                serde_json::to_vec(&self.shared.answer_sync(&snapshot, remote)?)?
+            }
+            Kind::Depart => {
+                let departure: Snapshot = serde_json::from_slice(&bytes)?;
+                self.shared.record_departure(&departure, remote)?;
+                serde_json::to_vec(DEPARTURE_RECORDED)?
             }
             Kind::Ping => {
                 let request: String = serde_json::from_slice(&bytes)?;
@@ -345,7 +449,7 @@ pub(crate) async fn gossip(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Node, PairingTicket};
+    use crate::{Mesh, Node, PairingTicket};
 
     async fn device(name: &str) -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
@@ -453,5 +557,336 @@ mod tests {
         assert!(b.info().mesh_id.is_none());
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn departed_copy_is_not_sent_to_a_self_founded_mesh_reusing_its_id() {
+        let (_a_dir, a) = device("founder-private-unique").await;
+        let (_b_dir, b) = device("departed-private-unique").await;
+        let (_c_dir, c) = device("c outsider nickname").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("private mesh name").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let mesh_id = a.info().mesh_id.unwrap();
+        b.leave().await.unwrap();
+        let forged = Mesh::create_with_id(
+            mesh_id,
+            "outsider mesh",
+            c.shared.state.lock().unwrap().member.clone(),
+            &c.shared.storage.key,
+        )
+        .unwrap();
+        assert_ne!(
+            forged.founder,
+            b.shared.state.lock().unwrap().departed[&mesh_id].founder
+        );
+        c.shared
+            .update(|state| {
+                state.mesh = Some(forged);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = c.shared.snapshot().unwrap();
+        assert!(snapshot.verify().is_ok());
+        assert_eq!(
+            b.shared
+                .answer_sync(&snapshot, c.info().id)
+                .unwrap_err()
+                .to_string(),
+            "device is not enrolled"
+        );
+        let response: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &snapshot)
+            .await;
+        let error = response.unwrap_err().to_string();
+        assert!(!error.contains("private mesh name"));
+        assert!(!error.contains("founder-private-unique"));
+        assert!(!error.contains("departed-private-unique"));
+        assert!(b.shared.state.lock().unwrap().mesh.is_none());
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn departure_announcements_must_come_from_the_departed_device() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let snapshot = b.shared.snapshot().unwrap();
+        let reply: Result<String> = b
+            .shared
+            .request(a.shared.endpoint.addr(), DEPART_ALPN, &snapshot)
+            .await;
+        assert!(reply.is_err());
+        assert_eq!(a.info().members.len(), 3);
+        let left = b.leave().await.unwrap();
+        let departure = b
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .departure(left.mesh_id)
+            .unwrap();
+        let relayed: Result<String> = c
+            .shared
+            .request(a.shared.endpoint.addr(), DEPART_ALPN, &departure)
+            .await;
+        assert!(a
+            .shared
+            .record_departure(&departure, c.info().id)
+            .unwrap_err()
+            .to_string()
+            .contains("peer has not left this mesh"));
+        assert!(relayed.is_err());
+        let different = Mesh::create(
+            "different",
+            b.shared.state.lock().unwrap().member.clone(),
+            &b.shared.storage.key,
+        )
+        .unwrap();
+        let mut different = different;
+        different
+            .admit(
+                c.shared.state.lock().unwrap().member.clone(),
+                &b.shared.storage.key,
+            )
+            .unwrap();
+        different.depart(&b.shared.storage.key).unwrap();
+        let other: Result<String> = b
+            .shared
+            .request(
+                a.shared.endpoint.addr(),
+                DEPART_ALPN,
+                &Snapshot::without_addresses(different.clone()),
+            )
+            .await;
+        assert!(a
+            .shared
+            .record_departure(&Snapshot::without_addresses(different), b.info().id)
+            .unwrap_err()
+            .to_string()
+            .contains("device is not a member of this mesh"));
+        assert!(other.is_err());
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_departures_keep_old_mesh_available_for_pull_and_readmission() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let original_id = a.info().mesh_id.unwrap();
+        let b_id = b.info().id;
+        a.shutdown().await.unwrap();
+        drop(a);
+        b.leave().await.unwrap();
+        b.new_mesh("two").unwrap();
+        b.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second_id = b.info().mesh_id.unwrap();
+        b.leave().await.unwrap();
+        {
+            let state = b.shared.state.lock().unwrap();
+            assert!(state.departed.contains_key(&original_id));
+            assert!(state.departed.contains_key(&second_id));
+            assert_eq!(state.departure_order, [original_id, second_id]);
+        }
+        let a = Node::bind(_a_dir.path(), NodeConfig::local())
+            .await
+            .unwrap();
+        a.gossip.abort();
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+        a.shared.sync(b.shared.endpoint.addr()).await.unwrap();
+        assert!(!a.info().members.iter().any(|member| member.id == b_id));
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(b.info().mesh_id, Some(original_id));
+        {
+            let state = b.shared.state.lock().unwrap();
+            assert!(!state.departed.contains_key(&original_id));
+            assert!(state.departed.contains_key(&second_id));
+            assert_eq!(state.departure_order, [second_id]);
+        }
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_departure_no_longer_prevents_stale_readmission() {
+        let (a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        let (_c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        a.shared.sync(b.shared.endpoint.addr()).await.unwrap();
+        let mesh_id = a.info().mesh_id.unwrap();
+        let b_id = b.info().id;
+        a.shutdown().await.unwrap();
+        drop(a);
+
+        assert_eq!(b.leave().await.unwrap().notified_members, 1);
+        assert!(!c.info().members.iter().any(|member| member.id == b_id));
+        let peer = c.shared.state.lock().unwrap().member.clone();
+        for _ in 0..64 {
+            b.shared
+                .update(|state| {
+                    let mut mesh =
+                        Mesh::create("later", state.member.clone(), &b.shared.storage.key)?;
+                    mesh.admit(peer.clone(), &b.shared.storage.key)?;
+                    state.mesh = Some(mesh);
+                    state.leave(&b.shared.storage.key)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(b.shared.state.lock().unwrap().departure(mesh_id).is_none());
+        let a = Node::bind(a_dir.path(), NodeConfig::local()).await.unwrap();
+        a.gossip.abort();
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+        assert!(a.shared.sync(b.shared.endpoint.addr()).await.is_err());
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(b.info().mesh_id, Some(mesh_id));
+        for node in [&a, &b] {
+            let state = node.shared.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .mesh
+                    .as_ref()
+                    .unwrap()
+                    .admissions
+                    .iter()
+                    .filter(|admission| admission.member.id == b_id)
+                    .map(|admission| admission.generation)
+                    .max(),
+                Some(0)
+            );
+        }
+        assert!(!c.info().members.iter().any(|member| member.id == b_id));
+        assert!(c
+            .ping(b_id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a member"));
+        b.leave().await.unwrap();
+        assert!(b.shared.state.lock().unwrap().departure(mesh_id).is_some());
+        c.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(c.info().members.iter().any(|member| member.id == b_id));
+        assert_eq!(
+            c.shared
+                .state
+                .lock()
+                .unwrap()
+                .mesh
+                .as_ref()
+                .unwrap()
+                .admissions
+                .iter()
+                .filter(|admission| admission.member.id == b_id)
+                .map(|admission| admission.generation)
+                .max(),
+            Some(1)
+        );
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn leaving_invalidates_a_pending_ticket() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let pending = b.pair(Duration::from_secs(60)).await.unwrap();
+        b.leave().await.unwrap();
+        assert!(b.shared.pending.lock().unwrap().is_none());
+        assert!(a.add(&pending).await.is_err());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn members_learn_an_offline_departure_when_they_next_reach_the_device() {
+        let (_a_dir, a) = device("a").await;
+        let (b_dir, b) = device("b").await;
+        a.gossip.abort();
+        a.new_mesh("one").unwrap();
+        a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let b_id = b.info().id;
+        b.shutdown().await.unwrap();
+        drop(b);
+
+        let left = Node::leave_mesh(b_dir.path()).unwrap();
+        assert_eq!(left.remaining_members, 1);
+        assert_eq!(left.notified_members, 0);
+        assert!(Node::leave_mesh(b_dir.path()).is_err());
+        assert!(a.info().members.iter().any(|member| member.id == b_id));
+        a.shared.heartbeat_received(b_id);
+        assert!(a.shared.presence.lock().unwrap().contains_key(&b_id));
+
+        let b = Node::bind(b_dir.path(), NodeConfig::local()).await.unwrap();
+        a.shared
+            .state
+            .lock()
+            .unwrap()
+            .addresses
+            .insert(b_id, b.shared.endpoint.addr());
+        assert!(a.shared.ping(b_id).await.is_err());
+        assert_eq!(a.info().members.len(), 1);
+        assert!(a.peers().is_empty());
+        assert!(!a.shared.presence.lock().unwrap().contains_key(&b_id));
+        assert!(!a.shared.state.lock().unwrap().addresses.contains_key(&b_id));
+        assert!(b.info().mesh_id.is_none());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 }
