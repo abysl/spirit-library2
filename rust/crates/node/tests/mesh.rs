@@ -51,10 +51,7 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     let (phone_dir, phone_id) = initialized("phone");
     let (desktop_dir, desktop_id) = initialized("desktop");
     let (laptop_dir, laptop_id) = initialized("laptop");
-    let mesh_id = Node::create_mesh(phone_dir.path(), "personal")
-        .unwrap()
-        .mesh_id
-        .unwrap();
+    let mesh_id = Node::create_mesh(phone_dir.path(), "personal").unwrap();
     assert!(mesh_id.to_string().starts_with("mesh1_"));
     assert_ne!(mesh_id.to_string(), phone_id.to_string());
     assert_eq!(
@@ -65,11 +62,17 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     let desktop = local(&desktop_dir).await;
     let laptop = local(&laptop_dir).await;
     phone
-        .add(&desktop.pair(Duration::from_secs(60)).await.unwrap())
+        .add(
+            mesh_id,
+            &desktop.pair(Duration::from_secs(60)).await.unwrap(),
+        )
         .await
         .unwrap();
     phone
-        .add(&laptop.pair(Duration::from_secs(60)).await.unwrap())
+        .add(
+            mesh_id,
+            &laptop.pair(Duration::from_secs(60)).await.unwrap(),
+        )
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -92,7 +95,10 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
     let (fourth_dir, fourth_id) = initialized("fourth");
     let fourth = local(&fourth_dir).await;
     desktop
-        .add(&fourth.pair(Duration::from_secs(60)).await.unwrap())
+        .add(
+            mesh_id,
+            &fourth.pair(Duration::from_secs(60)).await.unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(fourth.info().mesh_id, Some(mesh_id));
@@ -108,22 +114,23 @@ async fn enrollment_rejects_wrong_mesh_replays_and_expired_tickets() {
     let (a_dir, _) = initialized("a");
     let (b_dir, _) = initialized("b");
     let (c_dir, _) = initialized("c");
-    let a_mesh = Node::create_mesh(a_dir.path(), "personal").unwrap().mesh_id;
-    let b_mesh = Node::create_mesh(b_dir.path(), "personal").unwrap().mesh_id;
+    let a_mesh = Some(Node::create_mesh(a_dir.path(), "personal").unwrap());
+    let b_mesh = Some(Node::create_mesh(b_dir.path(), "personal").unwrap());
     assert_ne!(a_mesh, b_mesh);
     let a = local(&a_dir).await;
     let b = local(&b_dir).await;
     let c = local(&c_dir).await;
     let ticket = c.pair(Duration::from_secs(60)).await.unwrap();
-    a.add(&ticket).await.unwrap();
-    assert!(a.add(&ticket).await.is_err());
+    a.add(a.info().only_mesh().unwrap(), &ticket).await.unwrap();
+    assert!(a.add(a.info().only_mesh().unwrap(), &ticket).await.is_err());
     let ticket = c.pair(Duration::from_secs(60)).await.unwrap();
-    assert!(b.add(&ticket).await.is_err());
-    a.add(&ticket).await.unwrap();
+    assert!(b.add(b.info().only_mesh().unwrap(), &ticket).await.is_err());
+    a.add(a.info().only_mesh().unwrap(), &ticket).await.unwrap();
+    assert_eq!(c.info().meshes.len(), 1);
     assert_eq!(a.info().members.len(), 2);
     let ticket = c.pair(Duration::from_secs(1)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert!(a.add(&ticket).await.is_err());
+    assert!(a.add(a.info().only_mesh().unwrap(), &ticket).await.is_err());
     assert!(c.pair(Duration::ZERO).await.is_err());
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -142,7 +149,10 @@ async fn outsiders_cannot_ping_and_one_process_owns_a_node() {
     assert!(a.ping(b_id).await.is_err());
     assert!(b.ping(a_id).await.is_err());
     assert!(b
-        .add(&a.pair(Duration::from_secs(60)).await.unwrap())
+        .add(
+            a.info().only_mesh().unwrap(),
+            &a.pair(Duration::from_secs(60)).await.unwrap()
+        )
         .await
         .is_err());
     a.shutdown().await.unwrap();
@@ -156,9 +166,12 @@ async fn heartbeat_errors_preserve_presence_until_recovery() {
     Node::create_mesh(a_dir.path(), "personal").unwrap();
     let a = local(&a_dir).await;
     let b = local(&b_dir).await;
-    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
+    a.add(
+        a.info().only_mesh().unwrap(),
+        &b.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         while !a.peers()[0].connected || !b.peers()[0].connected {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -204,19 +217,25 @@ async fn leaving_notifies_members_and_the_device_can_rejoin() {
     let (a_dir, _) = initialized("a");
     let (b_dir, b_id) = initialized("b");
     let (c_dir, c_id) = initialized("c");
-    let mesh_id = Node::create_mesh(a_dir.path(), "personal").unwrap().mesh_id;
+    let mesh_id = Some(Node::create_mesh(a_dir.path(), "personal").unwrap());
     let a = local(&a_dir).await;
     let b = local(&b_dir).await;
     let c = local(&c_dir).await;
-    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
-    a.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
+    a.add(
+        a.info().only_mesh().unwrap(),
+        &b.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    a.add(
+        a.info().only_mesh().unwrap(),
+        &c.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
     eventually(|| b.info().members.len() == 3 && c.info().members.len() == 3).await;
 
-    let left = b.leave().await.unwrap();
+    let left = b.leave(b.info().only_mesh().unwrap()).await.unwrap();
     assert_eq!(Some(left.mesh_id), mesh_id);
     assert_eq!(left.mesh_name, "personal");
     assert_eq!(left.remaining_members, 2);
@@ -228,15 +247,18 @@ async fn leaving_notifies_members_and_the_device_can_rejoin() {
     assert!(c.info().members.iter().all(|member| member.id != b_id));
     assert!(a.ping(b_id).await.is_err());
     assert!(b.ping(c_id).await.is_err());
-    assert!(b.leave().await.is_err());
+    assert!(b.leave(a.info().only_mesh().unwrap()).await.is_err());
 
     b.shutdown().await.unwrap();
     drop(b);
     assert!(Node::read_info(b_dir.path()).unwrap().mesh_id.is_none());
     let b = local(&b_dir).await;
-    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
+    a.add(
+        a.info().only_mesh().unwrap(),
+        &b.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(b.info().mesh_id, mesh_id);
     assert_eq!(b.info().members.len(), 3);
     eventually(|| c.info().members.iter().any(|member| member.id == b_id)).await;
@@ -255,13 +277,25 @@ async fn the_founder_can_leave_without_stopping_the_mesh() {
     let a = local(&a_dir).await;
     let b = local(&b_dir).await;
     let c = local(&c_dir).await;
-    a.add(&b.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
-    assert_eq!(a.leave().await.unwrap().notified_members, 1);
-    b.add(&c.pair(Duration::from_secs(60)).await.unwrap())
-        .await
-        .unwrap();
+    a.add(
+        a.info().only_mesh().unwrap(),
+        &b.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        a.leave(a.info().only_mesh().unwrap())
+            .await
+            .unwrap()
+            .notified_members,
+        1
+    );
+    b.add(
+        b.info().only_mesh().unwrap(),
+        &c.pair(Duration::from_secs(60)).await.unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(c.info().members.iter().all(|member| member.id != a_id));
     assert_eq!(b.ping(c_id).await.unwrap().id, c_id);
     a.shutdown().await.unwrap();

@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use spirit_sdk::{LeftMesh, Member, Node, NodeConfig, NodeInfo, Pong};
+use spirit_sdk::{LeftMesh, Member, MeshId, Node, NodeConfig, NodeInfo, Pong};
 use std::{
     io::Write,
     net::SocketAddr,
@@ -24,14 +24,15 @@ pub enum Operation {
     Info,
     Create { name: String },
     Pair { ttl_seconds: u64 },
-    Add { ticket: String },
+    Add { mesh_id: MeshId, ticket: String },
     Ping { device: String },
-    Leave,
+    Leave { mesh_id: MeshId },
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum Reply {
     Info(NodeInfo),
+    Created(MeshId),
     Ticket(String),
     Added(Member),
     Pong(Pong),
@@ -124,16 +125,16 @@ pub async fn request(root: &Path, operation: Operation) -> Result<Reply> {
 async fn execute(node: &Node, operation: Operation) -> Result<Reply> {
     match operation {
         Operation::Info => Ok(Reply::Info(node.info())),
-        Operation::Create { name } => Ok(Reply::Info(node.new_mesh(&name)?)),
+        Operation::Create { name } => Ok(Reply::Created(node.new_mesh(&name)?)),
         Operation::Pair { ttl_seconds } => Ok(Reply::Ticket(
             node.pair(Duration::from_secs(ttl_seconds)).await?,
         )),
-        Operation::Add { ticket } => Ok(Reply::Added(node.add(&ticket).await?)),
+        Operation::Add { mesh_id, ticket } => Ok(Reply::Added(node.add(mesh_id, &ticket).await?)),
         Operation::Ping { device } => {
             let member = node.info().resolve(&device)?;
             Ok(Reply::Pong(node.ping(member.id).await?))
         }
-        Operation::Leave => Ok(Reply::Left(node.leave().await?)),
+        Operation::Leave { mesh_id } => Ok(Reply::Left(node.leave(mesh_id).await?)),
     }
 }
 

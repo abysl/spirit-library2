@@ -98,6 +98,7 @@ impl SpiritNode {
     pub fn status(&self) -> Result<MeshStatus, FfiError> {
         let node = self.active()?;
         let info = node.info();
+        let mesh_id = info.mesh_id;
         let peers = node
             .peers()
             .into_iter()
@@ -112,20 +113,32 @@ impl SpiritNode {
         Ok(MeshStatus {
             id: info.id.to_string(),
             name: info.name,
-            mesh_id: info.mesh_id.map(|id| id.to_string()),
+            mesh_id: mesh_id.map(|id| id.to_string()),
             mesh_name: info.mesh_name,
             peers,
         })
     }
 
     pub fn create_mesh(&self, name: String) -> Result<(), FfiError> {
-        self.active()?.new_mesh(&name).map_err(node_error)?;
+        let guard = self.node.lock().unwrap();
+        let node = guard
+            .as_ref()
+            .ok_or_else(|| FfiError::Node("node is closed".into()))?;
+        if !node.info().meshes.is_empty() {
+            return Err(FfiError::Node(
+                "createMesh is single-mesh until S3; this device already belongs to a mesh".into(),
+            ));
+        }
+        node.new_mesh(&name).map_err(node_error)?;
         Ok(())
     }
 
     pub fn leave_mesh(&self) -> Result<LeftMesh, FfiError> {
         let node = self.active()?;
-        let left = runtime()?.block_on(node.leave()).map_err(node_error)?;
+        let mesh_id = node.info().only_mesh().map_err(node_error)?;
+        let left = runtime()?
+            .block_on(node.leave(mesh_id))
+            .map_err(node_error)?;
         Ok(LeftMesh {
             mesh_id: left.mesh_id.to_string(),
             mesh_name: left.mesh_name,
@@ -155,8 +168,9 @@ impl SpiritNode {
 
     pub fn add(&self, ticket: String) -> Result<String, FfiError> {
         let node = self.active()?;
+        let mesh_id = node.info().only_mesh().map_err(node_error)?;
         let member = runtime()?
-            .block_on(node.add(ticket.trim()))
+            .block_on(node.add(mesh_id, ticket.trim()))
             .map_err(node_error)?;
         Ok(member.name)
     }
@@ -197,6 +211,41 @@ impl Drop for SpiritNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_mesh_refuses_a_second_mesh_and_withdraws_a_ticket() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = SpiritNode::open(a_dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
+        let b = SpiritNode::open(b_dir.path().to_str().unwrap().into(), "b".into(), true).unwrap();
+        a.create_mesh("one".into()).unwrap();
+        let stale = b.pair().unwrap();
+        b.create_mesh("two".into()).unwrap();
+        assert!(a.add(stale.ticket).is_err());
+        assert!(format!("{}", b.create_mesh("three".into()).unwrap_err())
+            .contains("single-mesh until S3"));
+        assert_eq!(b.status().unwrap().mesh_name.as_deref(), Some("two"));
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
+    }
+
+    #[test]
+    fn concurrent_create_mesh_calls_leave_one_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap(),
+        );
+        let results: Vec<_> = (0..2)
+            .map(|index| {
+                let node = node.clone();
+                std::thread::spawn(move || node.create_mesh(format!("mesh-{index}")))
+            })
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(node.status().unwrap().mesh_id.is_some());
+        node.shutdown().unwrap();
+    }
 
     #[test]
     fn node_bindings_enroll_ping_and_close() {

@@ -192,21 +192,18 @@ impl Node {
         Ok(Storage::read(root.as_ref())?.info())
     }
 
-    pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<NodeInfo> {
+    pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<MeshId> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
         ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
         let mesh = Mesh::create(name, state.member.clone(), &storage.key)?;
-        state.meshes.insert(mesh.id, mesh);
+        let id = mesh.id;
+        state.meshes.insert(id, mesh);
         storage.save(&state)?;
-        Ok(state.info())
+        Ok(id)
     }
 
-    pub fn leave_mesh(root: impl AsRef<Path>) -> Result<LeftMesh> {
+    pub fn leave_mesh(root: impl AsRef<Path>, mesh_id: MeshId) -> Result<LeftMesh> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        let mesh_id = state
-            .info()
-            .mesh_id
-            .context("device is not a mesh member")?;
         let departure = state.leave(mesh_id, &storage.key)?;
         storage.save(&state)?;
         Ok(LeftMesh {
@@ -254,12 +251,18 @@ impl Node {
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {
-        let info = self.info();
+        let state = self.shared.state.lock().unwrap();
+        let members: std::collections::BTreeMap<_, _> = state
+            .meshes
+            .values()
+            .flat_map(|mesh| mesh.members())
+            .filter(|member| member.id != state.member.id)
+            .map(|member| (member.id, member.clone()))
+            .collect();
         let presence = self.shared.presence.lock().unwrap();
         let now = Instant::now();
-        info.members
-            .into_iter()
-            .filter(|member| member.id != info.id)
+        members
+            .into_values()
             .map(|member| {
                 presence
                     .get(&member.id)
@@ -273,15 +276,16 @@ impl Node {
         self.shared.state.lock().unwrap().info()
     }
 
-    pub fn new_mesh(&self, name: &str) -> Result<NodeInfo> {
-        let mut state = self.shared.state.lock().unwrap();
-        ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
-        let mut next = state.clone();
-        let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
-        next.meshes.insert(mesh.id, mesh);
-        self.shared.storage.save(&next)?;
-        *state = next;
-        Ok(state.info())
+    pub fn new_mesh(&self, name: &str) -> Result<MeshId> {
+        let id = self.shared.update(|state| {
+            ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
+            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
+            let id = mesh.id;
+            state.meshes.insert(id, mesh);
+            Ok((id, true))
+        })?;
+        *self.shared.pending.lock().unwrap() = None;
+        Ok(id)
     }
 
     pub async fn pair(&self, lifetime: Duration) -> Result<String> {
@@ -314,7 +318,16 @@ impl Node {
         Ok(encoded)
     }
 
-    pub async fn add(&self, ticket: &str) -> Result<Member> {
+    pub async fn add(&self, mesh_id: MeshId, ticket: &str) -> Result<Member> {
+        ensure!(
+            self.shared
+                .state
+                .lock()
+                .unwrap()
+                .meshes
+                .contains_key(&mesh_id),
+            "device is not a member of this mesh"
+        );
         let ticket = PairingTicket::decode(ticket)?;
         ensure!(
             ticket.address.id != self.info().id,
@@ -324,12 +337,30 @@ impl Node {
             id: ticket.address.id,
             name: ticket.name.clone(),
         };
-        let mut response = self.enroll(&ticket, &member).await?;
+        let mut response = self.enroll(mesh_id, &ticket, &member).await?;
         if let Some(departure) = response.departure.take() {
+            ensure!(
+                departure.mesh.id == mesh_id,
+                "departure names a different mesh"
+            );
             self.shared.record_departure(&departure, member.id)?;
-            response = self.enroll(&ticket, &member).await?;
+            response = self.enroll(mesh_id, &ticket, &member).await?;
         }
         let joined = joined_after_retry(response)?;
+        ensure!(
+            joined.mesh.id == mesh_id,
+            "enrollment response names a different mesh"
+        );
+        ensure!(
+            self.shared
+                .state
+                .lock()
+                .unwrap()
+                .meshes
+                .get(&mesh_id)
+                .is_some_and(|mesh| mesh.same_identity(&joined.mesh)),
+            "enrollment response has a different mesh identity"
+        );
         ensure!(
             joined.mesh.member(member.id) == Some(&member),
             "enrollment did not admit the expected device"
@@ -340,10 +371,10 @@ impl Node {
 
     async fn enroll(
         &self,
+        mesh_id: MeshId,
         ticket: &PairingTicket,
         member: &Member,
     ) -> Result<network::EnrollmentReply> {
-        let mesh_id = self.info().mesh_id.context("device is not a mesh member")?;
         let mut snapshot = self.shared.snapshot(mesh_id)?;
         snapshot
             .mesh
@@ -358,18 +389,14 @@ impl Node {
             .await
     }
 
-    pub async fn leave(&self) -> Result<LeftMesh> {
+    pub async fn leave(&self, mesh_id: MeshId) -> Result<LeftMesh> {
         let (departure, peers) = {
             let mut pending = self.shared.pending.lock().unwrap();
             let (departure, peers) = self.shared.update(|state| {
-                let mesh_id = state
-                    .info()
-                    .mesh_id
-                    .context("device is not a mesh member")?;
                 let peers: Vec<_> = state
                     .meshes
                     .get(&mesh_id)
-                    .context("device is not a mesh member")?
+                    .context("device is not a member of this mesh")?
                     .members()
                     .filter(|member| member.id != state.member.id)
                     .map(|member| {

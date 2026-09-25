@@ -30,7 +30,7 @@ A member leaves by signing a departure record for its own current admission. The
 
 A device is a current member when its highest-generation admission has no matching departure. Current members are the only devices listed, pinged, sent heartbeats, answered with pongs, or allowed to admit devices. Departed admissions remain in the signed history because later admissions may trace their trust through them. Consequently the founder, or any introducer, may leave without invalidating the devices it admitted. Departure is a cooperative membership change, not key revocation: a departed key that is later compromised can still sign records that other members accept, and removing a device against its will requires a future policy.
 
-Leaving atomically clears the local mesh, its routing addresses, presence state, and any outstanding pairing ticket. When other current members remain, it retains a copy of the departed mesh in a map keyed by mesh ID. At most 64 copies are retained; the oldest recorded departure is evicted when a new one exceeds that bound. Eviction takes 64 later departures. After eviction, pull delivery and refusal of a stale introducer's enrollment are lost for that mesh: members must learn the departure from a member who received it earlier. Otherwise a stale introducer's generation-0 enrollment rejoins the device on its side only; informed members continue to reject it. To recover, the device must leave again and be readmitted. The running node announces that copy to every former member over `spirit/depart/1` in parallel, bounded by one request deadline, and reports how many recorded it. One notified member suffices for membership exchange to propagate the departure. `Node::leave_mesh` leaves while stopped and notifies nobody immediately. While retained, the copy answers later membership exchanges only from verified members of the same mesh identity (ID, name, and founder), so they learn of the departure when they next reach the device while it is running.
+Leaving atomically removes the selected mesh, drops all of that mesh’s hints, prunes addresses and presence of devices no longer in any current mesh, and invalidates any outstanding pairing ticket. When other current members remain, it retains a copy of the departed mesh in a map keyed by mesh ID. At most 64 copies are retained; the oldest recorded departure is evicted when a new one exceeds that bound. Eviction takes 64 later departures. After eviction, pull delivery and refusal of a stale introducer's enrollment are lost for that mesh: members must learn the departure from a member who received it earlier. Otherwise a stale introducer's generation-0 enrollment rejoins the device on its side only; informed members continue to reject it. To recover, the device must leave again and be readmitted. The running node announces that copy to every former member over `spirit/depart/1` in parallel, bounded by one request deadline, and reports how many recorded it. One notified member suffices for membership exchange to propagate the departure. `Node::leave_mesh` leaves while stopped and notifies nobody immediately. While retained, the copy answers later membership exchanges only from verified members of the same mesh identity (ID, name, and founder), so they learn of the departure when they next reach the device while it is running.
 
 A departed device can be enrolled again with a fresh ticket. The introducer signs a readmission with the next generation, using `("spirit/mesh/readmission/1", mesh_id, founder, mesh_name, member, issuer, generation)`; a readmission is valid only after a departure from the previous generation. If the introducer has not yet learned of the departure, the receiving device refuses the stale enrollment and returns its departure record without consuming the ticket. The introducer records it and retries once with a readmission. Rejoining the same mesh discards that mesh's retained departure copy; joining a different mesh keeps the old copy for its members. The departed device still receives full membership snapshots from stale members' syncs and stale introducers' enrollment attempts, even though it does not persist those snapshots as current membership or rejoin on those attempts.
 
@@ -74,7 +74,7 @@ The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` o
 | `node.lock` | Process ownership lock |
 | `control.json` | Running node's loopback control address and random credential |
 
-On open, legacy single-mesh state migrates to a `meshes` map without changing mesh IDs or signatures. Old address entries become per-mesh hints. The new `"mesh": "spirit/state/multi-mesh"` sentinel makes older releases refuse the directory rather than erase migrated memberships: downgrading is unsupported. The running CLI and enrollment operations remain single-mesh until the subsequent protocol and API steps.
+On open, legacy single-mesh state migrates to a `meshes` map without changing mesh IDs or signatures. Old address entries become per-mesh hints. The new `"mesh": "spirit/state/multi-mesh"` sentinel makes older releases refuse the directory rather than erase migrated memberships: downgrading is unsupported. The Rust and CLI APIs accept selected mesh IDs, but creation and enrollment still refuse a second mesh until the next PR.
 
 Writes use temporary files and atomic replacement. New secret, state, control, and exported QR files are owner-only on Unix. Malformed or missing existing identities fail rather than silently generating a replacement. A process lock prevents a second service or offline mutation from overwriting the running node's state.
 
@@ -87,13 +87,13 @@ The CLI contacts the service through a loopback TCP listener authenticated by a 
 Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types include `Node`, `NodeConfig`, `NodeId`, `MeshId`, `NodeInfo`, `Member`, `LeftMesh`, and `Pong`. `NodeInfo.mesh_id` is an optional `MeshId`, not a `NodeId`; `mesh status` prints it separately from the mesh name.
 
 - `Node::init(directory, nickname)` creates or reopens an identity.
-- `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
+- `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped and returns its `MeshId`.
 - `Node::bind(directory, config).await` starts networking and background exchange.
-- `Node::leave_mesh(directory)` leaves while stopped; former members learn of it from the running node later while it retains the copy.
-- `node.new_mesh(mesh_name)` creates a mesh while running.
+- `Node::leave_mesh(directory, mesh_id)` leaves while stopped; former members learn of it from the running node later while it retains the copy.
+- `node.new_mesh(mesh_name)` creates a mesh while running and returns its `MeshId`.
 - `node.pair(lifetime).await` opens an enrollment window and returns a ticket.
-- `node.add(ticket).await` admits the ticket's device.
-- `node.leave().await` leaves the mesh, notifies reachable former members, and returns a `LeftMesh` with the remaining and notified member counts.
+- `node.add(mesh_id, ticket).await` admits the ticket's device.
+- `node.leave(mesh_id).await` leaves the selected mesh, notifies reachable former members, and returns a `LeftMesh` with the remaining and notified member counts.
 - `node.info().resolve(nickname_or_id)` resolves a member without guessing on duplicates.
 - `node.peers()` returns each other member's connectivity, time since last received message, and last error.
 - `node.ping(member.id).await` returns an authenticated pong and elapsed milliseconds.
@@ -103,7 +103,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumer
 
 ## Deferred operations
 
-Persisted state holds a map of current meshes; public creation and enrollment still operate on one mesh until the multi-mesh API step. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
+Rust and CLI mesh-selected operations are prepared, while creation and enrollment still reject a second mesh until the next PR. FFI and KMP remain single-mesh until S3: `createMesh` refuses a second mesh and creation of a first mesh withdraws any outstanding fresh-device ticket. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
 
 The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency.
 
