@@ -157,3 +157,60 @@ fn initialization_defaults_to_hostname_and_persists_identity() {
     assert!(device.ok(&["mesh", "status"]).contains("not enrolled"));
     assert!(!device.dir.path().join("store").exists());
 }
+
+#[test]
+fn a_device_leaves_its_mesh_and_is_enrolled_again() {
+    let mut desktop = Device::new("desktop");
+    let mut laptop = Device::new("laptop");
+    desktop.ok(&["mesh", "create", "--name", "personal"]);
+    desktop.start();
+    laptop.start();
+    let ticket = laptop.ok(&["node", "pair", "--no-qr"]);
+    desktop.ok(&["mesh", "add", ticket.trim()]);
+
+    assert_eq!(
+        laptop.ok(&["mesh", "leave"]),
+        "Left personal and notified its 1 remaining member.\n"
+    );
+    assert!(laptop
+        .ok(&["mesh", "status"])
+        .contains("Mesh: not enrolled"));
+    assert!(!desktop.ok(&["mesh", "members"]).contains("laptop"));
+    assert!(!laptop.run(&["mesh", "leave"]).status.success());
+    assert!(!desktop.run(&["node", "ping", "laptop"]).status.success());
+
+    let ticket = laptop.ok(&["node", "pair", "--no-qr"]);
+    desktop.ok(&["mesh", "add", ticket.trim()]);
+    assert!(desktop.ok(&["mesh", "members"]).contains("laptop"));
+    assert!(laptop.ok(&["mesh", "status"]).contains("Mesh: personal"));
+    assert!(desktop
+        .ok(&["node", "ping", "laptop"])
+        .starts_with("pong from laptop"));
+
+    laptop.stop();
+    desktop.stop();
+    assert_eq!(
+        desktop.ok(&["mesh", "leave"]),
+        "Left personal. Notified 0 of 1 remaining member; the others can also learn it when they next reach this device while it is serving.\n"
+    );
+}
+
+#[test]
+fn partial_departure_notice_counts_multiple_remaining_members() {
+    let mut desktop = Device::new("desktop");
+    let mut laptop = Device::new("laptop");
+    let mut tablet = Device::new("tablet");
+    desktop.ok(&["mesh", "create", "--name", "personal"]);
+    for device in [&mut desktop, &mut laptop, &mut tablet] {
+        device.start();
+    }
+    for device in [&laptop, &tablet] {
+        let ticket = device.ok(&["node", "pair", "--no-qr"]);
+        desktop.ok(&["mesh", "add", ticket.trim()]);
+    }
+    tablet.stop();
+    assert_eq!(
+        desktop.ok(&["mesh", "leave"]),
+        "Left personal. Notified 1 of 2 remaining members; notified members relay the departure; the others can also learn it when they next reach this device while it is serving.\n"
+    );
+}

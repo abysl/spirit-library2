@@ -296,6 +296,100 @@ class PairingSessionTest {
         running.cancelAndJoin()
     }
 
+    @Test
+    fun `leaving clears membership offers a fresh ticket and a later scan founds a new mesh`() = runTest {
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        session.pair("spirit1member")
+        assertNull(session.state.value.invitation)
+
+        session.leaveMesh()
+
+        assertEquals(1, node.leaves)
+        assertNull(session.state.value.meshName)
+        assertNull(session.state.value.meshId)
+        assertTrue(session.state.value.peers.isEmpty())
+        assertTrue(session.state.value.invitation != null)
+        assertEquals("Left personal and notified its other devices", session.state.value.notice)
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertNull(session.state.value.meshName)
+        assertEquals("Left personal and notified its other devices", session.state.value.notice)
+
+        session.pair("spirit1next")
+        assertEquals(listOf("personal"), node.createdMeshes)
+        assertEquals("personal", session.state.value.meshName)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `leaving reports devices that were not notified`() = runTest {
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        node.notifiedOnLeave = 0
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        session.leaveMesh()
+
+        assertEquals(
+            "Left personal. Notified 0 of 1 device; the rest can also learn it when they next reach this device",
+            session.state.value.notice,
+        )
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `leaving reports partial notification to multiple devices`() = runTest {
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        node.snapshot = node.snapshot.copy(peers = listOf(
+            NodePeer("first", "first", false, 0, null),
+            NodePeer("second", "second", false, 0, null),
+        ))
+        node.notifiedOnLeave = 1
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        session.leaveMesh()
+
+        assertEquals(
+            "Left personal. Notified 1 of 2 devices; notified devices relay the departure; the rest can also learn it when they next reach this device",
+            session.state.value.notice,
+        )
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `cancelling a suspending node ticket refresh after leave does not hold up teardown`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        node.pairGate = CompletableDeferred()
+        val leaving = backgroundScope.launch { session.leaveMesh() }
+        runCurrent()
+        assertEquals(1, node.leaves)
+        assertNull(session.state.value.meshName)
+        leaving.cancelAndJoin()
+        running.cancelAndJoin()
+        assertEquals(1, node.shutdowns)
+    }
+
+    @Test
+    fun `a failed leave keeps the membership and reports an error`() = runTest {
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        node.leaveFailure = IllegalStateException("device is not a mesh member")
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+
+        session.leaveMesh()
+
+        assertEquals("Could not leave mesh", session.state.value.error)
+        assertEquals("personal", session.state.value.meshName)
+        assertEquals(1, session.state.value.peers.size)
+        assertFalse(session.state.value.busy)
+        running.cancelAndJoin()
+    }
+
     private fun TestScope.start(session: PairingSession) = backgroundScope.launch { session.run() }.also { runCurrent() }
 
     private class FakeNode(
@@ -314,6 +408,9 @@ class PairingSessionTest {
         var pairGate: CompletableDeferred<Unit>? = null
         var addGate: CompletableDeferred<Unit>? = null
         var addFailure: Throwable? = null
+        var leaveFailure: Throwable? = null
+        var notifiedOnLeave: Int? = null
+        var leaves = 0
         var shutdowns = 0
         val createdMeshes = mutableListOf<String>()
         val adds = mutableListOf<String>()
@@ -343,6 +440,15 @@ class PairingSessionTest {
         }
 
         override suspend fun ping(device: String): NodePong = NodePong(device, 0)
+
+        override suspend fun leaveMesh(): LeftMesh {
+            leaveFailure?.let { throw it }
+            val meshName = checkNotNull(snapshot.meshName)
+            val remaining = snapshot.peers.size
+            snapshot = snapshot.copy(meshName = null, meshId = null, peers = emptyList())
+            leaves++
+            return LeftMesh("mesh1_example", meshName, remaining, notifiedOnLeave ?: remaining)
+        }
 
         override suspend fun shutdown() {
             shutdowns++

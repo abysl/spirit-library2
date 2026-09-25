@@ -49,6 +49,14 @@ pub struct PairingCode {
 }
 
 #[derive(uniffi::Record)]
+pub struct LeftMesh {
+    pub mesh_id: String,
+    pub mesh_name: String,
+    pub remaining_members: u32,
+    pub notified_members: u32,
+}
+
+#[derive(uniffi::Record)]
 pub struct PingReply {
     pub name: String,
     pub elapsed_ms: u64,
@@ -113,6 +121,17 @@ impl SpiritNode {
     pub fn create_mesh(&self, name: String) -> Result<(), FfiError> {
         self.active()?.new_mesh(&name).map_err(node_error)?;
         Ok(())
+    }
+
+    pub fn leave_mesh(&self) -> Result<LeftMesh, FfiError> {
+        let node = self.active()?;
+        let left = runtime()?.block_on(node.leave()).map_err(node_error)?;
+        Ok(LeftMesh {
+            mesh_id: left.mesh_id.to_string(),
+            mesh_name: left.mesh_name,
+            remaining_members: left.remaining_members as u32,
+            notified_members: left.notified_members as u32,
+        })
     }
 
     pub fn pair(&self) -> Result<PairingCode, FfiError> {
@@ -198,6 +217,12 @@ mod tests {
         assert_eq!(a.ping("phone".into()).unwrap().name, "phone");
         assert!(a.status().unwrap().peers[0].connected);
         assert!(b.status().unwrap().peers[0].connected);
+        let left = b.leave_mesh().unwrap();
+        assert_eq!(left.mesh_name, "personal");
+        assert_eq!((left.remaining_members, left.notified_members), (1, 1));
+        assert!(b.status().unwrap().mesh_id.is_none());
+        assert!(a.status().unwrap().peers.is_empty());
+        assert!(b.leave_mesh().is_err());
         a.shutdown().unwrap();
         b.shutdown().unwrap();
         assert!(a.status().is_err());

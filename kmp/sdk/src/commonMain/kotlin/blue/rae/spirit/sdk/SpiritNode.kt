@@ -62,6 +62,11 @@ class SpiritNode private constructor(
         NodePong(pong.name, pong.elapsedMs.toLong())
     }
 
+    override suspend fun leaveMesh(): LeftMesh = io {
+        val left = ffi.leaveMesh()
+        LeftMesh(left.meshId, left.meshName, left.remainingMembers.toInt(), left.notifiedMembers.toInt())
+    }
+
     override suspend fun shutdown() = withContext(NonCancellable + dispatcher) { close() }
 
     override fun close() {
