@@ -110,7 +110,7 @@ async fn members_communicate_after_introducer_shuts_down_and_after_restart() {
 }
 
 #[tokio::test]
-async fn enrollment_rejects_wrong_mesh_replays_and_expired_tickets() {
+async fn enrollment_into_a_second_mesh_preserves_the_first_and_tickets_expire() {
     let (a_dir, _) = initialized("a");
     let (b_dir, _) = initialized("b");
     let (c_dir, _) = initialized("c");
@@ -124,9 +124,16 @@ async fn enrollment_rejects_wrong_mesh_replays_and_expired_tickets() {
     a.add(a.info().only_mesh().unwrap(), &ticket).await.unwrap();
     assert!(a.add(a.info().only_mesh().unwrap(), &ticket).await.is_err());
     let ticket = c.pair(Duration::from_secs(60)).await.unwrap();
-    assert!(b.add(b.info().only_mesh().unwrap(), &ticket).await.is_err());
-    a.add(a.info().only_mesh().unwrap(), &ticket).await.unwrap();
-    assert_eq!(c.info().meshes.len(), 1);
+    b.add(b.info().only_mesh().unwrap(), &ticket).await.unwrap();
+    assert_eq!(c.info().meshes.len(), 2);
+    let counts: Vec<_> = c
+        .info()
+        .meshes
+        .iter()
+        .map(|mesh| mesh.members.len())
+        .collect();
+    assert_eq!(counts, [2, 2]);
+    assert!(a.add(a.info().only_mesh().unwrap(), &ticket).await.is_err());
     assert_eq!(a.info().members.len(), 2);
     let ticket = c.pair(Duration::from_secs(1)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;

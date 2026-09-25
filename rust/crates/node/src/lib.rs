@@ -194,7 +194,10 @@ impl Node {
 
     pub fn create_mesh(root: impl AsRef<Path>, name: &str) -> Result<MeshId> {
         let (storage, mut state) = Storage::open(root.as_ref())?;
-        ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
+        ensure!(
+            state.meshes.len() < storage::MAX_CURRENT_MESHES,
+            "device has reached the 64-group limit"
+        );
         let mesh = Mesh::create(name, state.member.clone(), &storage.key)?;
         let id = mesh.id;
         state.meshes.insert(id, mesh);
@@ -278,7 +281,10 @@ impl Node {
 
     pub fn new_mesh(&self, name: &str) -> Result<MeshId> {
         let id = self.shared.update(|state| {
-            ensure!(state.meshes.is_empty(), "device already belongs to a mesh");
+            ensure!(
+                state.meshes.len() < storage::MAX_CURRENT_MESHES,
+                "device has reached the 64-group limit"
+            );
             let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
             let id = mesh.id;
             state.meshes.insert(id, mesh);
@@ -288,7 +294,31 @@ impl Node {
         Ok(id)
     }
 
+    pub fn create_first_mesh(&self, name: &str) -> Result<MeshId> {
+        let mut pending = self.shared.pending.lock().unwrap();
+        let id = self.shared.update(|state| {
+            ensure!(
+                state.meshes.is_empty(),
+                "createMesh is single-mesh until S3; this device already belongs to a mesh"
+            );
+            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
+            let id = mesh.id;
+            state.meshes.insert(id, mesh);
+            Ok((id, true))
+        })?;
+        *pending = None;
+        Ok(id)
+    }
+
     pub async fn pair(&self, lifetime: Duration) -> Result<String> {
+        self.pair_inner(lifetime, false).await
+    }
+
+    pub async fn pair_when_unenrolled(&self, lifetime: Duration) -> Result<String> {
+        self.pair_inner(lifetime, true).await
+    }
+
+    async fn pair_inner(&self, lifetime: Duration, unenrolled_only: bool) -> Result<String> {
         ensure!(
             (1..=3600).contains(&lifetime.as_secs()),
             "ticket lifetime must be 1–3600 seconds"
@@ -314,7 +344,14 @@ impl Node {
             expires_at: now()? + lifetime.as_secs(),
         };
         let encoded = ticket.encode()?;
-        *self.shared.pending.lock().unwrap() = Some(ticket);
+        let mut pending = self.shared.pending.lock().unwrap();
+        if unenrolled_only {
+            ensure!(
+                self.shared.state.lock().unwrap().meshes.is_empty(),
+                "pair is single-mesh until S3; this device already belongs to a mesh"
+            );
+        }
+        *pending = Some(ticket);
         Ok(encoded)
     }
 

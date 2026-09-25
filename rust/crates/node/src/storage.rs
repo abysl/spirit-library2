@@ -26,7 +26,7 @@ pub(crate) enum AddressEntry {
 }
 
 impl AddressEntry {
-    fn preferred(&self, mesh_id: MeshId) -> Option<&EndpointAddr> {
+    pub(crate) fn preferred(&self, mesh_id: MeshId) -> Option<&EndpointAddr> {
         match self {
             Self::Current { direct, hints } => direct.as_ref().or_else(|| hints.get(&mesh_id)),
             Self::Legacy(_) => None,
