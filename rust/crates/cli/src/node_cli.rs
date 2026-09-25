@@ -199,40 +199,45 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
             let (info, running) = info(&root).await?;
             println!("Device: {}", info.name);
             println!("Node: {}", if running { "running" } else { "stopped" });
-            println!(
-                "Mesh: {}",
-                info.mesh_name.as_deref().unwrap_or("not enrolled")
-            );
-            if let Some(mesh_id) = info.mesh_id {
-                println!("Mesh ID: {mesh_id}");
+            if info.meshes.is_empty() {
+                println!("Mesh: not enrolled");
             }
-            println!("Members: {}", info.members.len());
+            for mesh in &info.meshes {
+                println!("Mesh: {}", mesh.name);
+                println!("Mesh ID: {}", mesh.id);
+                println!("Members: {}", mesh.members.len());
+            }
+            println!("Devices: {}", info.members.len());
         }
         MeshCommand::Members { ids } => {
-            let (mut info, _) = info(&root).await?;
-            if info.mesh_id.is_none() {
+            let (info, _) = info(&root).await?;
+            if info.meshes.is_empty() {
                 bail!("device is not enrolled in a mesh");
             }
-            info.members
-                .sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-            println!(
-                "{}",
-                if ids {
-                    "NICKNAME\tDEVICE ID"
-                } else {
-                    "NICKNAME"
-                }
-            );
-            for member in info.members {
-                let suffix = if member.id == info.id {
-                    " (this device)"
-                } else {
-                    ""
-                };
-                if ids {
-                    println!("{}\t{}{}", member.name, member.id, suffix);
-                } else {
-                    println!("{}{suffix}", member.name);
+            let selected = &info.meshes;
+            for entry in selected {
+                println!("Mesh: {} ({})", entry.name, entry.id);
+                println!(
+                    "{}",
+                    if ids {
+                        "NICKNAME\tDEVICE ID"
+                    } else {
+                        "NICKNAME"
+                    }
+                );
+                let mut members = entry.members.clone();
+                members.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+                for member in members {
+                    let suffix = if member.id == info.id {
+                        " (this device)"
+                    } else {
+                        ""
+                    };
+                    if ids {
+                        println!("{}\t{}{}", member.name, member.id, suffix);
+                    } else {
+                        println!("{}{suffix}", member.name);
+                    }
                 }
             }
         }
