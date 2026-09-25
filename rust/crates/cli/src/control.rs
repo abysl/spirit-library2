@@ -66,7 +66,7 @@ impl Drop for ControlGuard {
 
 async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream, limit: usize) -> Result<T> {
     let size = stream.read_u32().await? as usize;
-    ensure!(size <= limit, "local control request is too large");
+    ensure!(size <= limit, "local control frame is too large");
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -222,22 +222,35 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn single_mesh_info_response_fits_maximum_membership_bounds() {
+    async fn two_mesh_info_response_fits_maximum_membership_bounds() {
         let dir = tempfile::tempdir().unwrap();
         Node::init(dir.path(), "root").unwrap();
         let node = Node::bind(dir.path(), NodeConfig::local()).await.unwrap();
-        execute(
+        let Reply::Created(first) = execute(
             &node,
             Operation::Create {
                 name: "first".into(),
             },
         )
         .await
-        .unwrap();
+        .unwrap() else {
+            panic!("expected created")
+        };
+        let Reply::Created(second) = execute(
+            &node,
+            Operation::Create {
+                name: "second".into(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("expected created")
+        };
+        assert_ne!(first, second);
         let Reply::Info(mut info) = execute(&node, Operation::Info).await.unwrap() else {
             panic!("expected info")
         };
-        assert_eq!(info.meshes.len(), 1);
+        assert_eq!(info.meshes.len(), 2);
         let mut previous = serde_json::to_value(&info).unwrap();
         previous.as_object_mut().unwrap().remove("meshes");
         let restored: NodeInfo = serde_json::from_value(previous).unwrap();

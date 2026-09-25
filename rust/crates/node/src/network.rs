@@ -12,6 +12,8 @@ use iroh::{
     Endpoint, EndpointAddr,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -70,6 +72,56 @@ pub(crate) fn bounded_diagnostic(error: &str) -> String {
     }
     safe
 }
+#[cfg(test)]
+static TEST_PINGS: OnceLock<Mutex<BTreeMap<NodeId, usize>>> = OnceLock::new();
+#[cfg(test)]
+type TestDialLog = BTreeMap<NodeId, Vec<(MeshId, EndpointAddr)>>;
+#[cfg(test)]
+static TEST_DIALS: OnceLock<Mutex<TestDialLog>> = OnceLock::new();
+#[cfg(test)]
+static TEST_HEARTBEATS: OnceLock<Mutex<BTreeMap<NodeId, (usize, usize)>>> = OnceLock::new();
+
+#[cfg(test)]
+struct TestHeartbeat(NodeId);
+
+#[cfg(test)]
+impl TestHeartbeat {
+    fn start(id: NodeId) -> Self {
+        let mut counts = TEST_HEARTBEATS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        let count = counts.entry(id).or_default();
+        count.0 += 1;
+        count.1 = count.1.max(count.0);
+        Self(id)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHeartbeat {
+    fn drop(&mut self) {
+        TEST_HEARTBEATS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&self.0)
+            .unwrap()
+            .0 -= 1;
+    }
+}
+
+#[cfg(test)]
+fn test_ping_count(id: NodeId) -> usize {
+    *TEST_PINGS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&id)
+        .unwrap_or(&0)
+}
+
 pub(crate) struct Shared {
     pub storage: Storage,
     pub state: Mutex<State>,
@@ -145,6 +197,8 @@ impl Shared {
     }
 
     async fn ping_with_sync_budget(self: &Arc<Self>, id: NodeId, budget: Duration) -> Result<u128> {
+        #[cfg(test)]
+        let _heartbeat = TestHeartbeat::start(id);
         let result = async {
             let address = self.address(id);
             let shared: Vec<_> = self
@@ -161,8 +215,16 @@ impl Shared {
             let mut pending = BTreeMap::new();
             for mesh_id in shared {
                 let peer = self.clone();
-                let address = address.clone();
-                let task = syncs.spawn(async move { peer.sync(address, mesh_id).await });
+                let mesh_address = self.address_for_mesh(id, mesh_id);
+                #[cfg(test)]
+                TEST_DIALS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .entry(self.endpoint.id())
+                    .or_default()
+                    .push((mesh_id, mesh_address.clone()));
+                let task = syncs.spawn(async move { peer.sync(mesh_address, mesh_id).await });
                 pending.insert(task.id(), mesh_id);
             }
             let mut errors = Vec::new();
@@ -172,12 +234,12 @@ impl Shared {
                         Ok((task_id, result)) => {
                             let mesh_id = pending.remove(&task_id).unwrap();
                             if let Err(error) = result {
-                                errors.push(format!("{mesh_id}: {error:#}"));
+                                errors.push(bounded_diagnostic(&format!("{mesh_id}: {error:#}")));
                             }
                         }
                         Err(error) => {
                             let mesh_id = pending.remove(&error.id()).unwrap();
-                            errors.push(format!("{mesh_id}: {error}"));
+                            errors.push(bounded_diagnostic(&format!("{mesh_id}: {error}")));
                         }
                     }
                 }
@@ -186,9 +248,9 @@ impl Shared {
             if sync_result.is_err() {
                 syncs.abort_all();
                 errors.extend(
-                    pending
-                        .values()
-                        .map(|id| format!("{id}: membership exchange timed out")),
+                    pending.values().map(|id| {
+                        bounded_diagnostic(&format!("{id}: membership exchange timed out"))
+                    }),
                 );
             }
             let start = Instant::now();
@@ -224,6 +286,16 @@ impl Shared {
             .unwrap_or_else(|| id.into())
     }
 
+    fn address_for_mesh(&self, id: NodeId, mesh_id: MeshId) -> EndpointAddr {
+        self.state
+            .lock()
+            .unwrap()
+            .addresses
+            .get(&id)
+            .and_then(|entry| entry.preferred(mesh_id).cloned())
+            .unwrap_or_else(|| id.into())
+    }
+
     pub fn merge_current(&self, snapshot: &Snapshot, source: NodeId) -> Result<()> {
         let verified = VerifiedSnapshot::new(snapshot)?;
         self.merge_verified_snapshot(&verified, source, true)
@@ -244,10 +316,6 @@ impl Shared {
             let changed = if current_only {
                 state.merge_current(verified, source)?
             } else {
-                ensure!(
-                    state.meshes.is_empty() || state.meshes.contains_key(&snapshot.mesh.id),
-                    "device already belongs to a mesh"
-                );
                 state.join(verified, source)?
             };
             ensure!(
@@ -531,6 +599,15 @@ impl Protocol {
                 let request: String = serde_json::from_slice(&bytes)?;
                 ensure!(request == "ping", "invalid ping");
                 self.shared.heartbeat_received(remote);
+                #[cfg(test)]
+                {
+                    *TEST_PINGS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .entry(self.shared.endpoint.id())
+                        .or_default() += 1;
+                }
                 serde_json::to_vec("pong")?
             }
         };
@@ -708,12 +785,9 @@ mod tests {
         a.gossip.abort();
         b.gossip.abort();
         let mesh_id = a.new_mesh("shared").unwrap();
-        a.add(
-            a.info().only_mesh().unwrap(),
-            &b.pair(Duration::from_secs(60)).await.unwrap(),
-        )
-        .await
-        .unwrap();
+        a.add(mesh_id, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
         b.pair(Duration::from_secs(60)).await.unwrap();
         let invalid = Enrollment {
             secret: [0; 32],
@@ -738,7 +812,7 @@ mod tests {
     async fn pairing_reply_from_another_mesh_cannot_enroll_the_introducer() {
         let (_dir, a) = device("a").await;
         a.gossip.abort();
-        a.new_mesh("target").unwrap();
+        let target = a.new_mesh("target").unwrap();
         let fake_key = SecretKey::generate();
         let mut attacker = Mesh::create(
             "attacker",
@@ -772,7 +846,7 @@ mod tests {
         .encode()
         .unwrap();
         assert!(a
-            .add(a.info().only_mesh().unwrap(), &ticket)
+            .add(target, &ticket)
             .await
             .unwrap_err()
             .to_string()
@@ -1087,6 +1161,399 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permanently_failing_mesh_does_not_block_sync_or_one_ping_per_interval() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let first = a.new_mesh("first").unwrap();
+        a.add(first, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second = a.new_mesh("second").unwrap();
+        a.add(second, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let conflict = SecretKey::generate();
+        let new_member = SecretKey::generate();
+        a.shared
+            .update(|state| {
+                state.meshes.get_mut(&second).unwrap().admit(
+                    crate::Member {
+                        id: conflict.public(),
+                        name: "one".into(),
+                    },
+                    &a.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        b.shared
+            .update(|state| {
+                state.meshes.get_mut(&second).unwrap().admit(
+                    crate::Member {
+                        id: conflict.public(),
+                        name: "two".into(),
+                    },
+                    &b.shared.storage.key,
+                )?;
+                state.meshes.get_mut(&first).unwrap().admit(
+                    crate::Member {
+                        id: new_member.public(),
+                        name: "new".into(),
+                    },
+                    &b.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        let start = Instant::now();
+        let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while test_ping_count(b.info().id) < 1
+                || TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].0 != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_round = start.elapsed();
+        tokio::time::timeout(Duration::from_secs(13), async {
+            while test_ping_count(b.info().id) < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(test_ping_count(b.info().id), 3);
+        assert!(a
+            .info()
+            .meshes
+            .iter()
+            .find(|mesh| mesh.id == first)
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.id == new_member.public()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].0 != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(a
+            .peers()
+            .iter()
+            .find(|peer| peer.id == b.info().id)
+            .unwrap()
+            .last_error
+            .is_some());
+        assert!(
+            a.peers()
+                .iter()
+                .find(|peer| peer.id == b.info().id)
+                .unwrap()
+                .connected
+        );
+        assert_eq!(
+            TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].1,
+            1
+        );
+        println!(
+            "first heartbeat round with one permanently failing mesh: {first_round:?}; three intervals: {:?}",
+            start.elapsed()
+        );
+        heartbeat.abort();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_meshes_isolate_membership_and_preserve_the_other_on_leave() {
+        let (a_dir, a) = device("a").await;
+        let (b_dir, b) = device("b").await;
+        let (c_dir, c) = device("c").await;
+        for node in [&a, &b, &c] {
+            node.gossip.abort();
+        }
+        let m1 = a.new_mesh("M1").unwrap();
+        a.add(m1, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let m2 = b.new_mesh("M2").unwrap();
+        b.add(m2, &c.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let a_id = a.info().id;
+        let b_id = b.info().id;
+        let c_id = c.info().id;
+        assert_eq!(a.info().meshes[0].members.len(), 2);
+        assert_eq!(c.info().meshes[0].members.len(), 2);
+        assert_eq!(b.info().meshes.len(), 2);
+        assert_eq!(b.peers().len(), 2);
+        assert!(!b.shared.snapshot(m1).unwrap().addresses.contains_key(&c_id));
+        assert!(!std::fs::read_to_string(a_dir.path().join("state.json"))
+            .unwrap()
+            .contains(&c_id.to_string()));
+        assert!(!std::fs::read_to_string(a_dir.path().join("state.json"))
+            .unwrap()
+            .contains(&m2.to_string()));
+        assert!(!std::fs::read_to_string(c_dir.path().join("state.json"))
+            .unwrap()
+            .contains(&a_id.to_string()));
+        assert!(!std::fs::read_to_string(c_dir.path().join("state.json"))
+            .unwrap()
+            .contains(&m1.to_string()));
+        let refused_ping: Result<String> = a
+            .shared
+            .request(c.shared.endpoint.addr(), PING_ALPN, &"ping")
+            .await;
+        assert!(refused_ping.is_err());
+        let request = a.shared.snapshot(m1).unwrap();
+        let unknown = Snapshot {
+            mesh: Mesh {
+                id: MeshId::generate().unwrap(),
+                ..request.mesh.clone()
+            },
+            addresses: request.addresses.clone(),
+        };
+        assert_eq!(
+            b.shared
+                .answer_sync(&request, c_id)
+                .unwrap_err()
+                .to_string(),
+            b.shared
+                .answer_sync(&unknown, c_id)
+                .unwrap_err()
+                .to_string()
+        );
+        let wire: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &request)
+            .await;
+        assert!(wire.is_err());
+        let second: Result<Snapshot> = c
+            .shared
+            .request(b.shared.endpoint.addr(), SYNC_ALPN, &unknown)
+            .await;
+        assert_eq!(
+            wire.unwrap_err().to_string(),
+            second.unwrap_err().to_string()
+        );
+        b.ping(c_id).await.unwrap();
+        assert!(
+            b.peers()
+                .iter()
+                .find(|peer| peer.id == c_id)
+                .unwrap()
+                .connected
+        );
+        let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
+        b.leave(m1).await.unwrap();
+        assert!(b.shared.pending.lock().unwrap().is_none());
+        assert!(a.add(m1, &ticket).await.is_err());
+        assert_eq!(b.info().meshes.len(), 1);
+        assert_eq!(b.info().meshes[0].id, m2);
+        assert!(b.shared.state.lock().unwrap().departed.contains_key(&m1));
+        assert!(
+            b.peers()
+                .iter()
+                .find(|peer| peer.id == c_id)
+                .unwrap()
+                .connected
+        );
+        assert!(b.shared.state.lock().unwrap().addresses.contains_key(&c_id));
+        let departure = b.shared.state.lock().unwrap().departure(m1).unwrap();
+        let rejected: Result<Snapshot> = b
+            .shared
+            .request(a.shared.endpoint.addr(), SYNC_ALPN, &departure)
+            .await;
+        assert!(rejected.is_err());
+        a.add(m1, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let b_info = b.info();
+        assert_eq!(b_info.meshes.len(), 2);
+        assert_eq!(
+            b_info
+                .meshes
+                .iter()
+                .find(|mesh| mesh.id == m1)
+                .unwrap()
+                .members
+                .iter()
+                .find(|member| member.id == b_id)
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(!b.shared.state.lock().unwrap().departed.contains_key(&m1));
+        assert!(b.shared.state.lock().unwrap().addresses.contains_key(&c_id));
+        a.add(m1, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(b.info().meshes.len(), 2);
+        assert_eq!(
+            b.info()
+                .meshes
+                .iter()
+                .find(|mesh| mesh.id == m1)
+                .unwrap()
+                .members
+                .iter()
+                .find(|member| member.id == b_id)
+                .unwrap()
+                .generation,
+            1
+        );
+        for node in [&a, &b, &c] {
+            node.shutdown().await.unwrap();
+        }
+        drop((a_dir, b_dir, c_dir));
+    }
+
+    #[tokio::test]
+    async fn enrollment_into_a_sixty_fifth_mesh_is_rejected_without_consuming_ticket() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        for _ in 0..64 {
+            a.new_mesh("full").unwrap();
+        }
+        let mesh_id = b.new_mesh("extra").unwrap();
+        let ticket = a.pair(Duration::from_secs(60)).await.unwrap();
+        assert!(b
+            .add(mesh_id, &ticket)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("could not join this mesh"));
+        assert_eq!(a.info().meshes.len(), 64);
+        assert!(a.shared.pending.lock().unwrap().is_some());
+        b.shutdown().await.unwrap();
+        a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_peer_gets_one_heartbeat_after_two_mesh_syncs() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let first = a.new_mesh("one").unwrap();
+        a.add(first, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second = a.new_mesh("two").unwrap();
+        a.add(second, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(a.peers().len(), 1);
+        let start = Instant::now();
+        let heartbeat = tokio::spawn(gossip(a.shared.clone()));
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !a.peers().first().is_some_and(|peer| peer.connected) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(test_ping_count(b.info().id), 1);
+        assert_eq!(
+            TEST_HEARTBEATS.get().unwrap().lock().unwrap()[&b.info().id].1,
+            1
+        );
+        assert_eq!(a.peers().len(), 1);
+        assert!(a.peers()[0].connected);
+        println!("two-mesh heartbeat round: {:?}", start.elapsed());
+        heartbeat.abort();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn creating_first_mesh_and_incoming_enrollment_serialize_on_pending() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let mesh = a.new_mesh("remote").unwrap();
+        let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
+        let b = Arc::new(b);
+        let pending = b.shared.pending.lock().unwrap();
+        let creator = b.clone();
+        let create = tokio::task::spawn_blocking(move || creator.create_first_mesh("local"));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(b.info().meshes.is_empty());
+        let a = Arc::new(a);
+        let introducer = a.clone();
+        let enroll = tokio::spawn(async move { introducer.add(mesh, &ticket).await });
+        drop(pending);
+        let created = create.await.unwrap().is_ok();
+        let joined = enroll.await.unwrap().is_ok();
+        assert_ne!(created, joined);
+        assert_eq!(b.info().meshes.len(), 1);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn per_mesh_sync_dials_only_its_own_hint_or_a_direct_address() {
+        let (_a_dir, a) = device("a").await;
+        let (_b_dir, b) = device("b").await;
+        a.gossip.abort();
+        b.gossip.abort();
+        let first = a.new_mesh("first").unwrap();
+        a.add(first, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let second = a.new_mesh("second").unwrap();
+        a.add(second, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        let id = b.info().id;
+        let planted = EndpointAddr::new(id).with_ip_addr("127.0.0.1:9".parse().unwrap());
+        a.shared.state.lock().unwrap().addresses.insert(
+            id,
+            crate::storage::AddressEntry::Current {
+                direct: None,
+                hints: BTreeMap::from([
+                    (first, planted.clone()),
+                    (second, b.shared.endpoint.addr()),
+                ]),
+            },
+        );
+        let local = a.info().id;
+        TEST_DIALS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(&local);
+        a.shared
+            .ping_with_sync_budget(id, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let dials = TEST_DIALS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&local)
+            .unwrap();
+        assert!(dials.contains(&(first, planted)));
+        assert!(dials.contains(&(second, b.shared.endpoint.addr())));
+        assert_eq!(
+            a.shared.address_for_mesh(id, first),
+            b.shared.endpoint.addr()
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_rejects_outsider_pings_wrong_mesh_sync_and_bad_secrets() {
         let (_a_dir, a) = device("a").await;
         let (_b_dir, b) = device("b").await;
@@ -1099,7 +1566,7 @@ mod tests {
         assert!(reply.is_err());
         assert!(b
             .shared
-            .sync(a.shared.endpoint.addr(), b.info().mesh_id.unwrap())
+            .sync(a.shared.endpoint.addr(), b.info().only_mesh().unwrap())
             .await
             .is_err());
         assert_eq!(a.info().members.len(), 1);
@@ -1148,7 +1615,7 @@ mod tests {
         assert!(b.peers()[0].last_received_ago_ms.is_none());
 
         a.shared
-            .sync(b.shared.endpoint.addr(), a.info().mesh_id.unwrap())
+            .sync(b.shared.endpoint.addr(), a.info().only_mesh().unwrap())
             .await
             .unwrap();
         assert!(a.peers()[0].last_received_ago_ms.is_none());
@@ -1198,6 +1665,28 @@ mod tests {
             .to_string()
             .contains("could not join this mesh"));
         assert!(b.info().mesh_id.is_none());
+        let mut snapshot = a.shared.snapshot(a.info().only_mesh().unwrap()).unwrap();
+        snapshot
+            .mesh
+            .admit(
+                b.shared.state.lock().unwrap().member.clone(),
+                &a.shared.storage.key,
+            )
+            .unwrap();
+        let local_error = b
+            .shared
+            .enroll(
+                Enrollment {
+                    secret: PairingTicket::decode(&ticket).unwrap().secret,
+                    snapshot,
+                },
+                a.info().id,
+            )
+            .err()
+            .unwrap();
+        assert!(local_error
+            .to_string()
+            .contains("pairing ticket has expired"));
         b.shutdown().await.unwrap();
         a.shutdown().await.unwrap();
     }
@@ -1223,6 +1712,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let m1 = a.info().only_mesh().unwrap();
         let b_id = b.info().id;
         assert!(c.info().members.iter().any(|member| member.id == b_id));
         c.shutdown().await.unwrap();
@@ -1235,6 +1725,8 @@ mod tests {
                 .notified_members,
             1
         );
+        let m2 = b.new_mesh("other").unwrap();
+        assert!(b.shared.state.lock().unwrap().departed.contains_key(&m1));
         let c = Node::bind(c_dir.path(), NodeConfig::local()).await.unwrap();
         c.gossip.abort();
         assert!(c.info().members.iter().any(|member| member.id == b_id));
@@ -1244,13 +1736,13 @@ mod tests {
             .request(
                 b.shared.endpoint.addr(),
                 SYNC_ALPN,
-                &c.shared.snapshot(c.info().mesh_id.unwrap()).unwrap(),
+                &c.shared.snapshot(c.info().only_mesh().unwrap()).unwrap(),
             )
             .await;
         assert!(sync.unwrap().mesh.departed(b_id));
 
         let ticket = b.pair(Duration::from_secs(60)).await.unwrap();
-        let mut stale = c.shared.snapshot(c.info().mesh_id.unwrap()).unwrap();
+        let mut stale = c.shared.snapshot(c.info().only_mesh().unwrap()).unwrap();
         stale
             .mesh
             .admit(
@@ -1270,10 +1762,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(refusal
-            .joined
-            .unwrap_err()
-            .contains("could not join this mesh"));
+        assert_eq!(refusal.joined.unwrap_err(), "could not join this mesh");
         assert!(refusal.departure.unwrap().mesh.departed(b_id));
         assert!(b.shared.pending.lock().unwrap().is_some());
         c.add(c.info().only_mesh().unwrap(), &ticket).await.unwrap();
@@ -1283,21 +1772,21 @@ mod tests {
             .lock()
             .unwrap()
             .meshes
-            .values()
-            .next()
-            .unwrap()
-            .clone();
+            .get(&m1)
+            .cloned()
+            .unwrap();
         assert!(joined
             .admissions
             .iter()
             .any(|admission| admission.member.id == b_id
                 && admission.generation == 1
                 && admission.issuer == c.info().id));
-        assert_eq!(b.info().mesh_id, a.info().mesh_id);
+        assert_eq!(b.info().meshes.len(), 2);
+        assert!(b.info().meshes.iter().any(|mesh| mesh.id == m2));
         assert!(b.shared.state.lock().unwrap().departed.is_empty());
         assert_eq!(c.ping(b_id).await.unwrap().id, b_id);
         a.shared
-            .sync(c.shared.endpoint.addr(), a.info().mesh_id.unwrap())
+            .sync(c.shared.endpoint.addr(), a.info().only_mesh().unwrap())
             .await
             .unwrap();
         assert!(a.info().members.iter().any(|member| member.id == b_id));
@@ -1314,15 +1803,11 @@ mod tests {
         for node in [&a, &b, &c] {
             node.gossip.abort();
         }
-        a.new_mesh("private mesh name").unwrap();
-        a.add(
-            a.info().only_mesh().unwrap(),
-            &b.pair(Duration::from_secs(60)).await.unwrap(),
-        )
-        .await
-        .unwrap();
-        let mesh_id = a.info().mesh_id.unwrap();
-        b.leave(b.info().only_mesh().unwrap()).await.unwrap();
+        let mesh_id = a.new_mesh("private mesh name").unwrap();
+        a.add(mesh_id, &b.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        b.leave(mesh_id).await.unwrap();
         let forged = Mesh::create_with_id(
             mesh_id,
             "outsider mesh",
@@ -1336,11 +1821,11 @@ mod tests {
         );
         c.shared
             .update(|state| {
-                state.meshes.insert(forged.id, forged);
+                state.meshes.insert(mesh_id, forged);
                 Ok(((), true))
             })
             .unwrap();
-        let snapshot = c.shared.snapshot(c.info().mesh_id.unwrap()).unwrap();
+        let snapshot = c.shared.snapshot(mesh_id).unwrap();
         assert!(snapshot.verify().is_ok());
         assert_eq!(
             b.shared
@@ -1357,7 +1842,7 @@ mod tests {
         assert!(!error.contains("private mesh name"));
         assert!(!error.contains("founder-private-unique"));
         assert!(!error.contains("departed-private-unique"));
-        assert!(b.shared.state.lock().unwrap().meshes.is_empty());
+        assert!(!b.shared.state.lock().unwrap().meshes.contains_key(&mesh_id));
         for node in [&a, &b, &c] {
             node.shutdown().await.unwrap();
         }
@@ -1384,7 +1869,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let snapshot = b.shared.snapshot(b.info().mesh_id.unwrap()).unwrap();
+        let snapshot = b.shared.snapshot(b.info().only_mesh().unwrap()).unwrap();
         let reply: Result<String> = b
             .shared
             .request(a.shared.endpoint.addr(), DEPART_ALPN, &snapshot)
@@ -1485,7 +1970,7 @@ mod tests {
         a.gossip.abort();
         assert!(a.info().members.iter().any(|member| member.id == b_id));
         a.shared
-            .sync(b.shared.endpoint.addr(), a.info().mesh_id.unwrap())
+            .sync(b.shared.endpoint.addr(), a.info().only_mesh().unwrap())
             .await
             .unwrap();
         assert!(!a.info().members.iter().any(|member| member.id == b_id));
@@ -1529,7 +2014,7 @@ mod tests {
         .await
         .unwrap();
         a.shared
-            .sync(b.shared.endpoint.addr(), a.info().mesh_id.unwrap())
+            .sync(b.shared.endpoint.addr(), a.info().only_mesh().unwrap())
             .await
             .unwrap();
         let mesh_id = a.info().mesh_id.unwrap();
@@ -1552,8 +2037,9 @@ mod tests {
                     let mut mesh =
                         Mesh::create("later", state.member.clone(), &b.shared.storage.key)?;
                     mesh.admit(peer.clone(), &b.shared.storage.key)?;
-                    state.meshes.insert(mesh.id, mesh.clone());
-                    state.leave(mesh.id, &b.shared.storage.key)?;
+                    let id = mesh.id;
+                    state.meshes.insert(id, mesh);
+                    state.leave(id, &b.shared.storage.key)?;
                     Ok(((), true))
                 })
                 .unwrap();
@@ -1564,7 +2050,7 @@ mod tests {
         assert!(a.info().members.iter().any(|member| member.id == b_id));
         assert!(a
             .shared
-            .sync(b.shared.endpoint.addr(), a.info().mesh_id.unwrap())
+            .sync(b.shared.endpoint.addr(), a.info().only_mesh().unwrap())
             .await
             .is_err());
         assert!(a.info().members.iter().any(|member| member.id == b_id));

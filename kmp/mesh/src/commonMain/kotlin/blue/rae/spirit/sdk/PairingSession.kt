@@ -80,9 +80,19 @@ class PairingSession(
     }
 
     suspend fun refreshTicket() {
+        if (state.value.meshName != null) {
+            mutableState.update { it.copy(error = null, notice = ENROLLED_TICKET_NOTICE) }
+            return
+        }
         if (!beginAction()) return
         try {
-            withActiveNode { activeNode -> offerTicket(activeNode, notice = null) }
+            withActiveNode { activeNode ->
+                if (activeNode.status().meshName == null) {
+                    offerTicket(activeNode, notice = null)
+                } else {
+                    mutableState.update { it.copy(error = null, notice = ENROLLED_TICKET_NOTICE) }
+                }
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -285,7 +295,9 @@ class PairingSession(
                     notice = if (joinedMesh) "Joined ${snapshot.meshName}" else it.notice,
                 )
             }
-            !offeredInitialTicket
+            val offer = !offeredInitialTicket && snapshot.meshName == null
+            if (offer) offeredInitialTicket = true
+            offer
         }
     }
 
@@ -377,6 +389,7 @@ class PairingSession(
         const val OPEN_ERROR = "Could not open node"
         const val POLL_ERROR = "Could not read node status"
         const val TICKET_ERROR = "Could not create pairing ticket"
+        const val ENROLLED_TICKET_NOTICE = "Pairing QR is available only before joining a mesh"
         const val INVALID_TICKET_ERROR = "Enter a valid pairing ticket"
         const val OWN_TICKET_ERROR = "This pairing ticket belongs to this device"
         const val ADD_ERROR = "Could not add device"

@@ -166,7 +166,7 @@ class PairingSessionTest {
 
     @Test
     fun `run cancellation clears a ticket completed before shutdown`() = runTest {
-        val node = FakeNode(meshName = "personal")
+        val node = FakeNode(meshName = null)
         val session = PairingSession({ node }, "personal") { 0L }
         val running = start(session)
         val pairGate = CompletableDeferred<Unit>()
@@ -390,6 +390,24 @@ class PairingSessionTest {
         running.cancelAndJoin()
     }
 
+    @Test
+    fun `enrolled device does not retry a refused pairing ticket and may still add a device`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        node.pairFailureWhileEnrolled = true
+        val session = PairingSession({ node }, "personal") { 0L }
+        val running = start(session)
+        repeat(5) { advanceTimeBy(1_000); runCurrent() }
+        assertEquals(0, node.pairCalls)
+        assertNull(session.state.value.error)
+        session.refreshTicket()
+        assertEquals(0, node.pairCalls)
+        assertEquals("Pairing QR is available only before joining a mesh", session.state.value.notice)
+        session.pair("spirit1member")
+        assertEquals(listOf("spirit1member"), node.adds)
+        assertNull(session.state.value.error)
+        running.cancelAndJoin()
+    }
+
     private fun TestScope.start(session: PairingSession) = backgroundScope.launch { session.run() }.also { runCurrent() }
 
     private class FakeNode(
@@ -411,6 +429,8 @@ class PairingSessionTest {
         var leaveFailure: Throwable? = null
         var notifiedOnLeave: Int? = null
         var leaves = 0
+        var pairCalls = 0
+        var pairFailureWhileEnrolled = false
         var shutdowns = 0
         val createdMeshes = mutableListOf<String>()
         val adds = mutableListOf<String>()
@@ -428,6 +448,8 @@ class PairingSessionTest {
         }
 
         override suspend fun pair(): PairingInvitation {
+            pairCalls++
+            if (pairFailureWhileEnrolled && snapshot.meshName != null) error("pairing requires an unenrolled device")
             pairGate?.await()
             return ticket
         }

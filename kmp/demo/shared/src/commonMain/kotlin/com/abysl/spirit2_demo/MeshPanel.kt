@@ -77,7 +77,7 @@ fun MeshPanel(node: MeshNode) {
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(enabled = ready, onClick = { attempt { invitation = node.pair() } }) { Text("Show pairing QR") }
+            OutlinedButton(enabled = ready && snapshot?.meshName == null, onClick = { attempt { invitation = node.pair() } }) { Text("Show pairing QR") }
             if (snapshot?.meshName != null) {
                 ScanPairingButton(ready, ::enroll) { actionError = it }
             }

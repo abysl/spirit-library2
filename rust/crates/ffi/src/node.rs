@@ -124,12 +124,7 @@ impl SpiritNode {
         let node = guard
             .as_ref()
             .ok_or_else(|| FfiError::Node("node is closed".into()))?;
-        if !node.info().meshes.is_empty() {
-            return Err(FfiError::Node(
-                "createMesh is single-mesh until S3; this device already belongs to a mesh".into(),
-            ));
-        }
-        node.new_mesh(&name).map_err(node_error)?;
+        node.create_first_mesh(&name).map_err(node_error)?;
         Ok(())
     }
 
@@ -150,7 +145,7 @@ impl SpiritNode {
     pub fn pair(&self) -> Result<PairingCode, FfiError> {
         let node = self.active()?;
         let ticket = runtime()?
-            .block_on(node.pair(Duration::from_secs(300)))
+            .block_on(node.pair_when_unenrolled(Duration::from_secs(300)))
             .map_err(node_error)?;
         let qr =
             QrCode::new(ticket.as_bytes()).map_err(|error| FfiError::Node(error.to_string()))?;
@@ -221,6 +216,7 @@ mod tests {
         a.create_mesh("one".into()).unwrap();
         let stale = b.pair().unwrap();
         b.create_mesh("two".into()).unwrap();
+        assert!(format!("{}", b.pair().err().unwrap()).contains("single-mesh until S3"));
         assert!(a.add(stale.ticket).is_err());
         assert!(format!("{}", b.create_mesh("three".into()).unwrap_err())
             .contains("single-mesh until S3"));
@@ -245,6 +241,23 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert!(node.status().unwrap().mesh_id.is_some());
         node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mesh_specific_bindings_need_selection_for_multiple_meshes() {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), "desktop").unwrap();
+        Node::create_mesh(dir.path(), "one").unwrap();
+        Node::create_mesh(dir.path(), "two").unwrap();
+        let ffi =
+            SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap();
+        let status = ffi.status().unwrap();
+        assert!(status.mesh_id.is_none());
+        assert!(status.mesh_name.is_none());
+        assert!(format!("{}", ffi.add("not-a-ticket".into()).unwrap_err()).contains("choose one"));
+        assert!(format!("{}", ffi.leave_mesh().err().unwrap()).contains("choose one"));
+        assert!(format!("{}", ffi.pair().err().unwrap()).contains("single-mesh until S3"));
+        ffi.shutdown().unwrap();
     }
 
     #[test]
