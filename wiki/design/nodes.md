@@ -8,7 +8,7 @@ A new mesh receives a cryptographically random 32-byte `MeshId`, independent of 
 
 Existing meshes retain their original founder-key IDs and version-1 admission signatures, with no `founder` field. Their signed tuple remains `("spirit/mesh/admission/1", mesh_id, mesh_name, member, issuer)`. They remain readable and can admit more members; they are not silently migrated because changing an ID would invalidate signed membership on other devices. New-format meshes require upgraded clients. Older clients reject their IDs and admissions; the unchanged pairing and sync ALPNs do not negotiate a downgrade. Rebuild native libraries together with their UniFFI bindings when upgrading.
 
-A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admission subjects and conflicting names are rejected. Existing local admissions are retained when merging, making independent enrollments converge by device ID. Merges must agree on mesh ID, mesh name, and founder; matching display names alone never join independent meshes.
+A received membership snapshot is accepted only if every signature verifies and every issuer can be traced to the self-signed founding admission. This graph is verified without relying on the ordering of records. Duplicate admissions for the same `(device, generation)`, duplicate departures, and conflicting nicknames for the same `(device, generation)` are rejected. Existing local records are retained when merging, making independent enrollments and departures converge by `(device, generation)`. Merges must agree on mesh ID, mesh name, and founder; matching display names alone never join independent meshes.
 
 A member proves ownership of its admitted key through the iroh connection. Nicknames, network addresses, and the presence of a node ID in an unsigned list cannot authorize a pong.
 
@@ -23,6 +23,16 @@ A ticket expires after five minutes by default. Its lifetime can be set between 
 The ticket is a bearer credential: possessing it authorizes its holder to enroll the issuing device into the holder's mesh. Keep the QR image and text private until enrollment completes. It contains an enrollment secret, never a device's long-term private key.
 
 If the final acknowledgment is lost, the receiver may already have committed its membership. Its subsequent membership exchange repairs the introducer's view. Inspect `mesh members` before generating a fresh ticket and retrying.
+
+## Leaving and rejoining
+
+A member leaves by signing a departure record for its own current admission. The signed bytes are the Postcard encoding of `("spirit/mesh/departure/1", mesh_id, founder, mesh_name, member_id, generation)`, where `mesh_id` is the canonical text ID and `founder` is optional for legacy meshes. Only the departing key can sign its departure; another member cannot remove a device. Departures merge like admissions: every copy of the mesh converges on the union of both record sets, so a stale snapshot cannot return a departed device to the member list.
+
+A device is a current member when its highest-generation admission has no matching departure. Current members are the only devices listed, pinged, sent heartbeats, answered with pongs, or allowed to admit devices. Departed admissions remain in the signed history because later admissions may trace their trust through them. Consequently the founder, or any introducer, may leave without invalidating the devices it admitted. Departure is a cooperative membership change, not key revocation: a departed key that is later compromised can still sign records that other members accept, and removing a device against its will requires a future policy.
+
+Leaving offline with `Node::leave_mesh` atomically clears the active mesh and its routing addresses. It retains up to 64 departed copies when other members remain; the oldest is evicted when a new departure exceeds that limit. Other members are not told and keep listing the device until departure delivery exists. Re-enrollment into that mesh is refused while the introducer has not learned the departure.
+
+Signed readmissions use the next generation after a departure, but an introducer must first learn the departure to issue one. Clients from before departures ignore them, so they keep listing a departed device until they upgrade. They reject readmission signatures, so a mixed-version mesh stops exchanging membership with older clients after a device rejoins.
 
 ## Networking
 
@@ -42,7 +52,7 @@ Addresses are routing hints. A newly discovered member's address can be learned 
 
 Normal operation uses iroh's N0 relay and address lookup preset. Ticket generation waits for relay readiness so the ticket includes a usable relay address. `node serve --local` instead binds loopback with no relay or external discovery, for same-machine tests. This mode does not connect separate machines.
 
-Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh supports at most 256 members, with at most 16 transport addresses per member. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
+Connection and exchange stages each have a ten-second deadline, or three seconds in local mode. Messages are limited to 256 KiB; ping requests to 16 bytes. A mesh holds at most 256 admission records, including readmissions, with at most 16 transport addresses per member. Leave and rejoin cycles consume the admission cap permanently. Two individually valid snapshots whose union exceeds it fail to merge in either direction with `invalid mesh size`; same-generation readmissions with different signed nicknames permanently fail to merge with `conflicting device nickname`. Neither conflict is resolved automatically. Names are limited to 128 UTF-8 bytes and cannot contain control characters.
 
 Membership propagation is eventual. Peers must have exchanged membership and usable addresses before the introducer goes offline. Once they have, the introducer need not remain online for authentication, pinging, or further enrollment.
 
@@ -53,7 +63,7 @@ The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` o
 | File | Contents |
 |---|---|
 | `secret.key` | Raw 32-byte secret key |
-| `state.json` | Local identity, nickname, signed mesh admissions, and learned addresses |
+| `state.json` | Local identity, nickname, signed mesh admissions and departures, learned addresses, and up to 64 departed mesh copies with their recording order |
 | `node.lock` | Process ownership lock |
 | `control.json` | Running node's loopback control address and random credential |
 
@@ -61,15 +71,16 @@ Writes use temporary files and atomic replacement. New secret, state, control, a
 
 The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit and a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
 
-`node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization and mesh creation work offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
+`node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization and mesh creation work offline; `Node::leave_mesh` works offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
 
 ## Rust API
 
-Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types include `Node`, `NodeConfig`, `NodeId`, `MeshId`, `NodeInfo`, `Member`, and `Pong`. `NodeInfo.mesh_id` is an optional `MeshId`, not a `NodeId`; `mesh status` prints it separately from the mesh name.
+Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumers do not enable the networking dependency. The FFI crate enables it to provide KMP node bindings. Public types include `Node`, `NodeConfig`, `NodeId`, `MeshId`, `NodeInfo`, `Member`, `LeftMesh`, and `Pong`. `NodeInfo.mesh_id` is an optional `MeshId`, not a `NodeId`; `mesh status` prints it separately from the mesh name.
 
 - `Node::init(directory, nickname)` creates or reopens an identity.
 - `Node::create_mesh(directory, mesh_name)` creates a mesh while stopped.
 - `Node::bind(directory, config).await` starts networking and background exchange.
+- `Node::leave_mesh(directory)` leaves while stopped and notifies nobody immediately.
 - `node.new_mesh(mesh_name)` creates a mesh while running.
 - `node.pair(lifetime).await` opens an enrollment window and returns a ticket.
 - `node.add(ticket).await` admits the ticket's device.
@@ -82,7 +93,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumer
 
 ## Deferred operations
 
-This version supports one append-only mesh per device. Nicknames are fixed at initialization. Device removal, renaming, leaving, merging meshes, and restricting admission require new signed update and policy rules. Removing an introducer is not yet an operation. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
+This version supports one mesh at a time per device. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
 
 The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency.
 

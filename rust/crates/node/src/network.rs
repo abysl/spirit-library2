@@ -320,8 +320,8 @@ pub(crate) async fn gossip(shared: Arc<Shared>) {
             _ = interval.tick() => {
                 let peers: Vec<_> = {
                     let state = shared.state.lock().unwrap();
-                    state.mesh.as_ref().map(|mesh| mesh.admissions.iter()
-                        .map(|admission| admission.member.id)
+                    state.mesh.as_ref().map(|mesh| mesh.members()
+                        .map(|member| member.id)
                         .filter(|id| *id != state.member.id).collect()).unwrap_or_default()
                 };
                 for id in peers {

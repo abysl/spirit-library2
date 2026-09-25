@@ -1,18 +1,45 @@
 use crate::membership::{validate_name, Member, Mesh, Snapshot};
+use crate::mesh_id::MeshId;
 use crate::NodeInfo;
 use anyhow::{ensure, Context, Result};
 use iroh::{EndpointAddr, EndpointId, SecretKey};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+const MAX_DEPARTED_MESHES: usize = 64;
+
+fn read_departed<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<MeshId, Mesh>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Departed {
+        Map(BTreeMap<MeshId, Mesh>),
+        Previous(Mesh),
+    }
+    Ok(match Option::<Departed>::deserialize(deserializer)? {
+        Some(Departed::Map(meshes)) => meshes,
+        Some(Departed::Previous(mesh)) => BTreeMap::from([(mesh.id, mesh)]),
+        None => BTreeMap::new(),
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct State {
     pub member: Member,
     pub mesh: Option<Mesh>,
     pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+    #[serde(
+        default,
+        deserialize_with = "read_departed",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub departed: BTreeMap<MeshId, Mesh>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub departure_order: Vec<MeshId>,
 }
 
 pub(crate) struct Storage {
@@ -92,6 +119,8 @@ impl Storage {
                 },
                 mesh: None,
                 addresses: BTreeMap::new(),
+                departed: BTreeMap::new(),
+                departure_order: Vec::new(),
             })?;
         }
         let state = Self::read(root)?;
@@ -125,7 +154,7 @@ impl Storage {
     }
 
     pub fn read(root: &Path) -> Result<State> {
-        let state: State = serde_json::from_slice(
+        let mut state: State = serde_json::from_slice(
             &std::fs::read(root.join("state.json"))
                 .context("node is not initialized; run spirit node init")?,
         )?;
@@ -135,6 +164,37 @@ impl Storage {
             ensure!(
                 mesh.member(state.member.id) == Some(&state.member),
                 "device is missing from its mesh"
+            );
+        }
+        ensure!(
+            state.departed.len() <= MAX_DEPARTED_MESHES,
+            "too many departed meshes"
+        );
+        let mut seen = BTreeSet::new();
+        for id in &state.departure_order {
+            ensure!(
+                state.departed.contains_key(id) && seen.insert(*id),
+                "invalid departure order"
+            );
+        }
+        for id in state.departed.keys() {
+            if !seen.contains(id) {
+                state.departure_order.push(*id);
+            }
+        }
+        for (id, departed) in &state.departed {
+            ensure!(
+                *id == departed.id,
+                "departed mesh ID does not match its key"
+            );
+            departed.verify()?;
+            ensure!(
+                departed.departed(state.member.id),
+                "departed mesh does not record this device leaving"
+            );
+            ensure!(
+                state.mesh.as_ref().map(|mesh| mesh.id) != Some(*id),
+                "device cannot be a member of the mesh it left"
             );
         }
         Ok(state)
@@ -158,7 +218,7 @@ impl State {
             members: self
                 .mesh
                 .as_ref()
-                .map(|mesh| mesh.admissions.iter().map(|a| a.member.clone()).collect())
+                .map(|mesh| mesh.members().cloned().collect())
                 .unwrap_or_default(),
         }
     }
@@ -179,15 +239,226 @@ impl State {
             snapshot.mesh.member(self.member.id) == Some(&self.member),
             "membership does not match this device"
         );
-        match &mut self.mesh {
-            Some(mesh) => mesh.merge(&snapshot.mesh)?,
-            None => self.mesh = Some(snapshot.mesh.clone()),
+        let mut mesh = match &self.mesh {
+            Some(mesh) => {
+                let mut mesh = mesh.clone();
+                mesh.merge(&snapshot.mesh)?;
+                mesh
+            }
+            None => snapshot.mesh.clone(),
+        };
+        if let Some(departed) = self.departed.get(&mesh.id) {
+            mesh.merge(departed)?;
+            ensure!(
+                mesh.member(self.member.id).is_some(),
+                "this device left that mesh"
+            );
+            self.departed.remove(&mesh.id);
+            self.departure_order.retain(|id| *id != mesh.id);
         }
+        self.mesh = Some(mesh);
         for (id, addr) in &snapshot.addresses {
             if *id == source || !self.addresses.contains_key(id) {
                 self.addresses.insert(*id, addr.clone());
             }
         }
+        self.retain_member_addresses();
         Ok(())
+    }
+
+    pub fn leave(&mut self, key: &SecretKey) -> Result<Snapshot> {
+        let mut mesh = self.mesh.clone().context("device is not a mesh member")?;
+        mesh.depart(key)?;
+        self.mesh = None;
+        self.addresses.clear();
+        if mesh.members().next().is_some() {
+            self.departure_order.retain(|id| *id != mesh.id);
+            if self.departed.len() == MAX_DEPARTED_MESHES && !self.departed.contains_key(&mesh.id) {
+                let oldest = *self
+                    .departure_order
+                    .first()
+                    .context("missing oldest departure")?;
+                self.departed.remove(&oldest);
+                self.departure_order.retain(|id| *id != oldest);
+            }
+            self.departed.insert(mesh.id, mesh.clone());
+            self.departure_order.push(mesh.id);
+        }
+        Ok(Snapshot::without_addresses(mesh))
+    }
+
+    fn retain_member_addresses(&mut self) {
+        let members: BTreeSet<_> = self
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.members().map(|member| member.id).collect())
+            .unwrap_or_default();
+        self.addresses.retain(|id, _| members.contains(id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Node;
+
+    fn setup() -> (tempfile::TempDir, Storage, State) {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), "device").unwrap();
+        let (storage, state) = Storage::open(dir.path()).unwrap();
+        (dir, storage, state)
+    }
+
+    fn joined_mesh(state: &mut State, key: &SecretKey, peer: &SecretKey) -> MeshId {
+        let mut mesh = Mesh::create("mesh", state.member.clone(), key).unwrap();
+        mesh.admit(
+            Member {
+                id: peer.public(),
+                name: "peer".into(),
+            },
+            key,
+        )
+        .unwrap();
+        let id = mesh.id;
+        state.mesh = Some(mesh);
+        id
+    }
+
+    #[test]
+    fn old_departed_shape_and_main_state_still_open() {
+        let (dir, storage, mut state) = setup();
+        storage.save(&state).unwrap();
+        assert!(Storage::read(dir.path()).unwrap().departed.is_empty());
+        let peer = SecretKey::generate();
+        let id = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        let mut old = serde_json::to_value(&state).unwrap();
+        old["departed"] = serde_json::to_value(&state.departed[&id]).unwrap();
+        old.as_object_mut().unwrap().remove("departure_order");
+        write_private(
+            &dir.path().join("state.json"),
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let reopened = Storage::read(dir.path()).unwrap();
+        assert!(reopened.departed.contains_key(&id));
+        assert_eq!(reopened.departure_order, [id]);
+        storage.save(&reopened).unwrap();
+        assert_eq!(Storage::read(dir.path()).unwrap().departure_order, [id]);
+    }
+
+    #[test]
+    fn reading_rejects_invalid_departed_copies() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let id = joined_mesh(&mut state, &storage.key, &peer);
+        let active = state.mesh.clone().unwrap();
+        state.leave(&storage.key).unwrap();
+        let valid = state.clone();
+        let mut invalid = valid.clone();
+        invalid.departed.insert(id, active.clone());
+        storage.save(&invalid).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not record"));
+        let mut invalid = valid.clone();
+        invalid.mesh = Some(active);
+        storage.save(&invalid).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be a member"));
+        let mut invalid = valid.clone();
+        invalid.departed.get_mut(&id).unwrap().name = "tampered".into();
+        storage.save(&invalid).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid admission signature"));
+        let mut invalid = valid.clone();
+        let wrong = MeshId::generate().unwrap();
+        let copy = invalid.departed.remove(&id).unwrap();
+        invalid.departed.insert(wrong, copy);
+        invalid.departure_order[0] = wrong;
+        storage.save(&invalid).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its key"));
+    }
+
+    #[test]
+    fn reading_rejects_duplicate_and_dangling_departure_order_ids() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let id = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        let mut duplicate = state.clone();
+        duplicate.departure_order.push(id);
+        storage.save(&duplicate).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid departure order"));
+        state.departure_order.push(MeshId::generate().unwrap());
+        storage.save(&state).unwrap();
+        assert!(Storage::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid departure order"));
+    }
+
+    #[test]
+    fn migrated_departures_are_appended_after_recorded_order() {
+        let (dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let first = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        let second = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        state.departure_order.remove(0);
+        storage.save(&state).unwrap();
+        let reopened = Storage::read(dir.path()).unwrap();
+        assert_eq!(reopened.departure_order, [second, first]);
+        let mut reopened = reopened;
+        for _ in 0..MAX_DEPARTED_MESHES - 1 {
+            joined_mesh(&mut reopened, &storage.key, &peer);
+            reopened.leave(&storage.key).unwrap();
+        }
+        assert!(!reopened.departed.contains_key(&second));
+        assert!(reopened.departed.contains_key(&first));
+    }
+
+    #[test]
+    fn departure_retention_evicts_oldest_and_discards_solo_meshes() {
+        let (_dir, storage, mut state) = setup();
+        let peer = SecretKey::generate();
+        let first = joined_mesh(&mut state, &storage.key, &peer);
+        state.leave(&storage.key).unwrap();
+        for _ in 1..=MAX_DEPARTED_MESHES {
+            joined_mesh(&mut state, &storage.key, &peer);
+            state.leave(&storage.key).unwrap();
+        }
+        assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
+        assert!(!state.departed.contains_key(&first));
+        let mut invalid = state.clone();
+        joined_mesh(&mut invalid, &storage.key, &peer);
+        invalid.leave(&storage.key).unwrap();
+        invalid.departed.insert(
+            first,
+            Mesh::create("bad", invalid.member.clone(), &storage.key).unwrap(),
+        );
+        storage.save(&invalid).unwrap();
+        assert!(Storage::read(&storage.root)
+            .unwrap_err()
+            .to_string()
+            .contains("too many departed meshes"));
+        let solo = Mesh::create("solo", state.member.clone(), &storage.key).unwrap();
+        let solo_id = solo.id;
+        state.mesh = Some(solo);
+        state.leave(&storage.key).unwrap();
+        assert_eq!(state.departed.len(), MAX_DEPARTED_MESHES);
+        assert!(!state.departed.contains_key(&solo_id));
     }
 }
