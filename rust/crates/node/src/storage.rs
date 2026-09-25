@@ -751,6 +751,130 @@ mod tests {
     }
 
     #[test]
+    fn hints_from_one_mesh_are_not_forwarded_to_another() {
+        let (_dir, storage, mut state) = setup();
+        let introducer = SecretKey::generate();
+        let shared = SecretKey::generate();
+        let first = joined_mesh(&mut state, &storage.key, &introducer);
+        let second = joined_mesh(&mut state, &storage.key, &shared);
+        state
+            .meshes
+            .get_mut(&first)
+            .unwrap()
+            .admit(
+                Member {
+                    id: shared.public(),
+                    name: "shared".into(),
+                },
+                &storage.key,
+            )
+            .unwrap();
+        let mut incoming = Snapshot::without_addresses(state.meshes[&first].clone());
+        let hint =
+            EndpointAddr::new(shared.public()).with_ip_addr("127.0.0.1:54321".parse().unwrap());
+        incoming.addresses.insert(shared.public(), hint.clone());
+        assert!(state
+            .join(
+                &VerifiedSnapshot::new(&incoming).unwrap(),
+                introducer.public()
+            )
+            .unwrap());
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(first),
+            Some(&hint)
+        );
+        let newer =
+            EndpointAddr::new(shared.public()).with_ip_addr("127.0.0.1:54322".parse().unwrap());
+        incoming.addresses.insert(shared.public(), newer.clone());
+        assert!(state
+            .merge_current(
+                &VerifiedSnapshot::new(&incoming).unwrap(),
+                introducer.public()
+            )
+            .unwrap());
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(first),
+            Some(&newer)
+        );
+        assert!(!state
+            .snapshot(second, EndpointAddr::new(state.member.id))
+            .unwrap()
+            .addresses
+            .contains_key(&shared.public()));
+        assert!(state
+            .snapshot(first, EndpointAddr::new(state.member.id))
+            .unwrap()
+            .addresses
+            .contains_key(&shared.public()));
+        let mut second_hint = Snapshot::without_addresses(state.meshes[&second].clone());
+        second_hint.addresses.insert(shared.public(), hint.clone());
+        state
+            .merge_current(
+                &VerifiedSnapshot::new(&second_hint).unwrap(),
+                state.member.id,
+            )
+            .unwrap();
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(first),
+            Some(&newer)
+        );
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(second),
+            Some(&hint)
+        );
+        let mut direct = Snapshot::without_addresses(state.meshes[&second].clone());
+        direct.addresses.insert(shared.public(), hint.clone());
+        state
+            .merge_current(&VerifiedSnapshot::new(&direct).unwrap(), shared.public())
+            .unwrap();
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(first),
+            Some(&hint)
+        );
+        incoming.addresses.insert(shared.public(), newer);
+        state
+            .merge_current(
+                &VerifiedSnapshot::new(&incoming).unwrap(),
+                introducer.public(),
+            )
+            .unwrap();
+        assert_eq!(
+            state.addresses[&shared.public()].preferred(first),
+            Some(&hint)
+        );
+        assert!(state
+            .snapshot(first, EndpointAddr::new(state.member.id))
+            .unwrap()
+            .addresses
+            .contains_key(&shared.public()));
+        assert!(state
+            .snapshot(second, EndpointAddr::new(state.member.id))
+            .unwrap()
+            .addresses
+            .contains_key(&shared.public()));
+        state.leave(first, &storage.key).unwrap();
+        if let AddressEntry::Current { hints, .. } = &state.addresses[&shared.public()] {
+            assert!(!hints.contains_key(&first));
+        } else {
+            panic!("address was not migrated");
+        }
+    }
+
+    #[test]
+    fn sync_after_concurrent_leave_cannot_rejoin_without_a_retained_copy() {
+        let (_dir, storage, mut state) = setup();
+        let solo = Mesh::create("solo", state.member.clone(), &storage.key).unwrap();
+        let snapshot = Snapshot::without_addresses(solo.clone());
+        state.meshes.insert(solo.id, solo);
+        state.leave(snapshot.mesh.id, &storage.key).unwrap();
+        assert!(state.departed.is_empty());
+        assert!(state
+            .merge_current(&VerifiedSnapshot::new(&snapshot).unwrap(), state.member.id)
+            .is_err());
+        assert!(state.meshes.is_empty());
+    }
+
+    #[test]
     fn historical_state_fixtures_migrate_and_block_old_readers() {
         #[derive(Deserialize)]
         struct MainState {

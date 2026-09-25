@@ -314,7 +314,7 @@ impl Node {
             joined.mesh.member(member.id) == Some(&member),
             "enrollment did not admit the expected device"
         );
-        self.shared.merge(&joined, member.id)?;
+        self.shared.merge_current(&joined, member.id)?;
         Ok(member)
     }
 
@@ -323,7 +323,8 @@ impl Node {
         ticket: &PairingTicket,
         member: &Member,
     ) -> Result<network::EnrollmentReply> {
-        let mut snapshot = self.shared.snapshot()?;
+        let mesh_id = self.info().mesh_id.context("device is not a mesh member")?;
+        let mut snapshot = self.shared.snapshot(mesh_id)?;
         snapshot
             .mesh
             .admit(member.clone(), &self.shared.storage.key)?;
@@ -359,7 +360,10 @@ impl Node {
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
-                Ok((state.leave(mesh_id, &self.shared.storage.key)?, peers))
+                Ok((
+                    (state.leave(mesh_id, &self.shared.storage.key)?, peers),
+                    true,
+                ))
             })?;
             *pending = None;
             (departure, peers)

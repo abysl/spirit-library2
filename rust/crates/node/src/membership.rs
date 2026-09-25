@@ -754,6 +754,108 @@ mod tests {
     }
 
     #[test]
+    fn membership_bounds_and_maximum_snapshot_fit_wire_limit() {
+        use iroh::{RelayUrl, TransportAddr};
+        use std::time::Instant;
+
+        let root = SecretKey::generate();
+        let mut mesh =
+            Mesh::create(&"n".repeat(128), member(&root, &"r".repeat(128)), &root).unwrap();
+        let mut keys = vec![root.clone()];
+        for _ in 1..MAX_MEMBERS {
+            let key = SecretKey::generate();
+            mesh.admit(member(&key, &"\"".repeat(128)), &root).unwrap();
+            keys.push(key);
+        }
+        assert!(mesh
+            .admit(member(&SecretKey::generate(), "extra"), &root)
+            .unwrap_err()
+            .to_string()
+            .contains("group membership history is full"));
+        let readmission = SecretKey::generate();
+        let mut past = Mesh::create("past", member(&root, "root"), &root).unwrap();
+        past.admit(member(&readmission, "returning"), &root)
+            .unwrap();
+        past.depart(&readmission).unwrap();
+        for _ in 0..MAX_ADMISSIONS - 2 {
+            past.admit(member(&SecretKey::generate(), "other"), &root)
+                .unwrap();
+        }
+        assert!(past
+            .admit(member(&readmission, "returning"), &root)
+            .unwrap_err()
+            .to_string()
+            .contains("group membership history is full"));
+        let mesh_current = mesh.clone();
+        for key in &keys {
+            mesh.depart(key).unwrap();
+            assert!(mesh.admissions.len() + mesh.departures.len() <= 2 * MAX_ADMISSIONS);
+        }
+        assert_eq!(
+            mesh.admissions.len() + mesh.departures.len(),
+            2 * MAX_ADMISSIONS
+        );
+        mesh.verify().unwrap();
+        let mut addresses = BTreeMap::new();
+        for key in &keys {
+            let mut addr: EndpointAddr = key.public().into();
+            for index in 0..MAX_ADDRESSES {
+                let prefix = format!("https://relay.example/{index:02}/");
+                let overhead =
+                    serde_json::to_vec(&TransportAddr::Relay(prefix.parse::<RelayUrl>().unwrap()))
+                        .unwrap()
+                        .len();
+                let url = format!(
+                    "{prefix}{}",
+                    "x".repeat(MAX_TRANSPORT_ADDRESS_BYTES - overhead)
+                );
+                let transport = TransportAddr::Relay(url.parse::<RelayUrl>().unwrap());
+                assert_eq!(
+                    serde_json::to_vec(&transport).unwrap().len(),
+                    MAX_TRANSPORT_ADDRESS_BYTES
+                );
+                addr.addrs.insert(transport);
+            }
+            addresses.insert(key.public(), addr);
+        }
+        let snapshot = Snapshot {
+            mesh: mesh_current.clone(),
+            addresses,
+        };
+        let departed_snapshot = Snapshot::without_addresses(mesh);
+        departed_snapshot.verify().unwrap();
+        let departed_length = serde_json::to_vec(&departed_snapshot).unwrap().len();
+        snapshot.verify().unwrap();
+        let length = serde_json::to_vec(&snapshot).unwrap().len();
+        assert!(
+            length.max(departed_length) < 1024 * 1024,
+            "maximum snapshot is {} bytes",
+            length.max(departed_length)
+        );
+        let start = Instant::now();
+        departed_snapshot.mesh.verify().unwrap();
+        let verify = start.elapsed();
+        let mut merging = departed_snapshot.mesh.clone();
+        let start = Instant::now();
+        merging.merge_trusted(&departed_snapshot.mesh).unwrap();
+        let merge = start.elapsed();
+        println!("256 current members: snapshot={length} bytes; 512 records, no current members: snapshot={departed_length} bytes verify={verify:?} trusted_merge={merge:?}");
+        let mut too_long = snapshot;
+        let first = too_long.addresses.values_mut().next().unwrap();
+        first.addrs.clear();
+        first.addrs.insert(TransportAddr::Relay(
+            format!("https://relay.example/{}", "z".repeat(160))
+                .parse()
+                .unwrap(),
+        ));
+        assert!(too_long
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("transport address is too long"));
+    }
+
+    #[test]
     fn addresses_are_trimmed_before_sending() {
         use iroh::RelayUrl;
         let id = SecretKey::generate().public();
