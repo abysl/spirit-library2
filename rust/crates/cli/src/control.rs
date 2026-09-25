@@ -15,7 +15,8 @@ use tokio::{
     task::JoinSet,
 };
 
-const MAX_FRAME: usize = 256 * 1024;
+const MAX_REQUEST: usize = 256 * 1024;
+const MAX_REPLY: usize = 16 * 1024 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
@@ -62,20 +63,17 @@ impl Drop for ControlGuard {
     }
 }
 
-async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
+async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream, limit: usize) -> Result<T> {
     let size = stream.read_u32().await? as usize;
-    ensure!(size <= MAX_FRAME, "local control request is too large");
+    ensure!(size <= limit, "local control request is too large");
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T, limit: usize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    ensure!(
-        bytes.len() <= MAX_FRAME,
-        "local control response is too large"
-    );
+    ensure!(bytes.len() <= limit, "local control response is too large");
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
     Ok(())
@@ -107,9 +105,10 @@ pub async fn request_if_running(root: &Path, operation: Operation) -> Result<Opt
                 token: control.token,
                 operation,
             },
+            MAX_REQUEST,
         )
         .await?;
-        read_frame(&mut stream).await
+        read_frame(&mut stream, MAX_REPLY).await
     })
     .await
     .context("local node operation timed out")??;
@@ -139,7 +138,7 @@ async fn execute(node: &Node, operation: Operation) -> Result<Reply> {
 }
 
 async fn handle(mut stream: TcpStream, token: [u8; 32], node: Arc<Node>) -> Result<()> {
-    let request: Request = read_frame(&mut stream).await?;
+    let request: Request = read_frame(&mut stream, MAX_REQUEST).await?;
     ensure!(
         bool::from(token.ct_eq(&request.token)),
         "invalid local control credential"
@@ -147,7 +146,7 @@ async fn handle(mut stream: TcpStream, token: [u8; 32], node: Arc<Node>) -> Resu
     let result = execute(&node, request.operation)
         .await
         .map_err(|error| format!("{error:#}"));
-    write_frame(&mut stream, &Response { result }).await
+    write_frame(&mut stream, &Response { result }, MAX_REPLY).await
 }
 
 async fn interrupted() -> Result<()> {
@@ -222,6 +221,72 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn single_mesh_info_response_fits_maximum_membership_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), "root").unwrap();
+        let node = Node::bind(dir.path(), NodeConfig::local()).await.unwrap();
+        execute(
+            &node,
+            Operation::Create {
+                name: "first".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let Reply::Info(mut info) = execute(&node, Operation::Info).await.unwrap() else {
+            panic!("expected info")
+        };
+        assert_eq!(info.meshes.len(), 1);
+        let mut previous = serde_json::to_value(&info).unwrap();
+        previous.as_object_mut().unwrap().remove("meshes");
+        let restored: NodeInfo = serde_json::from_value(previous).unwrap();
+        assert!(restored.meshes.is_empty());
+        let mut meshes = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for mesh_index in 0..64 {
+            let mut mesh = info.meshes[0].clone();
+            mesh.id = format!(
+                "mesh1_{}{}",
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[mesh_index]
+                    as char,
+                "A".repeat(42)
+            )
+            .parse()
+            .unwrap();
+            mesh.name = "\"".repeat(128);
+            mesh.members = (0..256)
+                .map(|_| {
+                    let id = iroh::SecretKey::generate().public();
+                    let member = spirit_sdk::MeshMember {
+                        id,
+                        name: "\"".repeat(128),
+                        generation: 0,
+                    };
+                    members.insert(
+                        id,
+                        spirit_sdk::Member {
+                            id,
+                            name: member.name.clone(),
+                        },
+                    );
+                    member
+                })
+                .collect();
+            meshes.push(mesh);
+        }
+        info.meshes = meshes;
+        info.members = members.into_values().collect();
+        let response = serde_json::to_vec(&Response {
+            result: Ok(Reply::Info(info)),
+        })
+        .unwrap();
+        assert!(response.len() > MAX_REQUEST);
+        assert!(response.len() < MAX_REPLY);
+        println!("worst-case control reply: {} bytes", response.len());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn local_control_rejects_an_invalid_credential() {
         let dir = tempfile::tempdir().unwrap();
         Node::init(dir.path(), "desktop").unwrap();
@@ -237,12 +302,15 @@ mod tests {
                 token: [0; 32],
                 operation: Operation::Pair { ttl_seconds: 60 },
             },
+            MAX_REQUEST,
         )
         .await
         .unwrap();
         let error = handle(server, [1; 32], node.clone()).await.unwrap_err();
         assert!(error.to_string().contains("credential"));
-        assert!(read_frame::<Response>(&mut client).await.is_err());
+        assert!(read_frame::<Response>(&mut client, MAX_REPLY)
+            .await
+            .is_err());
         node.shutdown().await.unwrap();
     }
 }

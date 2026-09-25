@@ -48,6 +48,26 @@ pub struct MeshMember {
 }
 
 impl NodeInfo {
+    pub fn only_mesh(&self) -> Result<MeshId> {
+        match self.meshes.as_slice() {
+            [mesh] => Ok(mesh.id),
+            [] => bail!("device is not enrolled in a mesh"),
+            _ => bail!("this device is in several meshes; choose one"),
+        }
+    }
+
+    pub fn select_mesh(&self, selected: Option<MeshId>) -> Result<MeshId> {
+        if let Some(id) = selected {
+            ensure!(
+                self.meshes.iter().any(|mesh| mesh.id == id),
+                "device is not a member of this mesh"
+            );
+            Ok(id)
+        } else {
+            self.only_mesh()
+        }
+    }
+
     pub fn resolve(&self, nickname_or_id: &str) -> Result<Member> {
         if let Ok(id) = nickname_or_id.parse::<NodeId>() {
             if let Some(member) = self.members.iter().find(|m| m.id == id) {
@@ -410,7 +430,9 @@ fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::
         response.departure.is_none(),
         "device refused readmission twice; update the introducing device if it runs an older Spirit"
     );
-    response.joined.map_err(anyhow::Error::msg)
+    response
+        .joined
+        .map_err(|error| anyhow::anyhow!(network::bounded_diagnostic(&error)))
 }
 
 impl Drop for Node {

@@ -78,7 +78,7 @@ On open, legacy single-mesh state migrates to a `meshes` map without changing me
 
 Writes use temporary files and atomic replacement. New secret, state, control, and exported QR files are owner-only on Unix. Malformed or missing existing identities fail rather than silently generating a replacement. A process lock prevents a second service or offline mutation from overwriting the running node's state.
 
-The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit and a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
+The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit, replies have a 16 MiB limit for bounded multi-mesh status, and operations have a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
 
 `node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization, mesh creation, and leaving work offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
 
@@ -115,7 +115,7 @@ The protocol is an initial version intended for small personal meshes. Its autom
 
 ## Connectivity and KMP integration
 
-Connectivity is in-memory state measured using a monotonic clock. Only a validated heartbeat message marks a member as received. A green peer has received an authenticated valid ping or pong from that member less than 60 seconds ago. A transport, protocol, or heartbeat error is retained as a diagnostic without changing green status; a subsequent valid ping or pong clears it. Never-seen peers start red. Restarting clears presence without removing memberships.
+Connectivity is in-memory state measured using a monotonic clock. Only a validated heartbeat message marks a member as received. A green peer has received an authenticated valid ping or pong from that member less than 60 seconds ago. A transport, protocol, or heartbeat error is retained as a diagnostic of at most 256 UTF-8 bytes without Unicode control or format characters, without changing green status; a subsequent valid ping or pong clears it. Never-seen peers start red. Restarting clears presence without removing memberships.
 
 Membership snapshots and enrollment messages do not count. Unauthenticated traffic, malformed messages, and sent requests do not make a device connected. Heartbeat timeouts are recorded as diagnostics, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
 

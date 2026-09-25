@@ -27,6 +27,24 @@ pub(crate) const PING_ALPN: &[u8] = b"spirit/ping/1";
 pub(crate) const DEPART_ALPN: &[u8] = b"spirit/depart/1";
 const DEPARTURE_RECORDED: &str = "recorded";
 const MAX_MESSAGE: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_BYTES: usize = 256;
+
+pub(crate) fn bounded_diagnostic(error: &str) -> String {
+    let mut safe = String::new();
+    for character in error.chars().filter(|character| {
+        !character.is_control()
+            && !matches!(
+                unicode_general_category::get_general_category(*character),
+                unicode_general_category::GeneralCategory::Format
+            )
+    }) {
+        if safe.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
+            break;
+        }
+        safe.push(character);
+    }
+    safe
+}
 pub(crate) struct Shared {
     pub storage: Storage,
     pub state: Mutex<State>,
@@ -87,7 +105,7 @@ impl Shared {
             .unwrap()
             .entry(id)
             .or_default()
-            .failed(format!("{error:#}"));
+            .failed(bounded_diagnostic(&format!("{error:#}")));
     }
 
     fn record_failure<T>(&self, id: NodeId, result: &Result<T>) {
@@ -262,7 +280,7 @@ impl Shared {
             send.write_all(&bytes).await?;
             send.finish()?;
             let response = recv.read_to_end(MAX_MESSAGE).await?;
-            Ok::<R, anyhow::Error>(serde_json::from_slice(&response)?)
+            serde_json::from_slice(&response).map_err(|_| anyhow::anyhow!("invalid response"))
         })
         .await
         .context("request timed out");
@@ -560,6 +578,48 @@ mod tests {
             .accept(alpn, FakeResponder { response, hang })
             .spawn();
         (endpoint, router)
+    }
+
+    #[tokio::test]
+    async fn huge_peer_response_never_enters_presence_diagnostics() {
+        let (_a_dir, a) = device("a").await;
+        a.gossip.abort();
+        let key = SecretKey::generate();
+        let mesh = a.new_mesh("mesh").unwrap().mesh_id.unwrap();
+        a.shared
+            .update(|state| {
+                state.meshes.get_mut(&mesh).unwrap().admit(
+                    crate::Member {
+                        id: key.public(),
+                        name: "peer".into(),
+                    },
+                    &a.shared.storage.key,
+                )?;
+                Ok(((), true))
+            })
+            .unwrap();
+        let id = key.public();
+        let (endpoint, router) = fake_endpoint(
+            key,
+            SYNC_ALPN,
+            serde_json::to_vec(&"x".repeat(900_000)).unwrap(),
+            false,
+        )
+        .await;
+        a.shared.sync(endpoint.addr(), mesh).await.unwrap_err();
+        let error = a.peers()[0].last_error.clone().unwrap();
+        assert!(error.contains("invalid response"));
+        assert!(error.len() <= MAX_DIAGNOSTIC_BYTES);
+        a.shared.failed(
+            id,
+            &anyhow::anyhow!(format!("{}\n\t{}", "界".repeat(200), "x".repeat(900_000))),
+        );
+        let error = a.peers()[0].last_error.clone().unwrap();
+        assert!(error.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(!error.chars().any(char::is_control));
+        assert_eq!(bounded_diagnostic("safe\u{202e}\u{200b}text"), "safetext");
+        router.shutdown().await.unwrap();
+        a.shutdown().await.unwrap();
     }
 
     #[tokio::test]

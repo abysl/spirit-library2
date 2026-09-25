@@ -81,10 +81,13 @@ Example output:
 Device: desktop
 Node: running
 Mesh: personal
+Mesh ID: mesh1_<mesh-id>
 Members: 2
+Devices: 2
 ```
 
 ```text
+Mesh: personal (mesh1_<mesh-id>)
 NICKNAME
 desktop (this device)
 laptop
