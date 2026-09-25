@@ -265,11 +265,30 @@ impl Node {
             ticket.address.id != self.info().id,
             "cannot enroll this device into itself"
         );
-        let mut snapshot = self.shared.snapshot()?;
         let member = Member {
             id: ticket.address.id,
             name: ticket.name.clone(),
         };
+        let mut response = self.enroll(&ticket, &member).await?;
+        if let Some(departure) = response.departure.take() {
+            self.shared.record_departure(&departure, member.id)?;
+            response = self.enroll(&ticket, &member).await?;
+        }
+        let joined = joined_after_retry(response)?;
+        ensure!(
+            joined.mesh.member(member.id) == Some(&member),
+            "enrollment did not admit the expected device"
+        );
+        self.shared.merge(&joined, member.id)?;
+        Ok(member)
+    }
+
+    async fn enroll(
+        &self,
+        ticket: &PairingTicket,
+        member: &Member,
+    ) -> Result<network::EnrollmentReply> {
+        let mut snapshot = self.shared.snapshot()?;
         snapshot
             .mesh
             .admit(member.clone(), &self.shared.storage.key)?;
@@ -278,17 +297,9 @@ impl Node {
             secret: ticket.secret,
             snapshot,
         };
-        let response: network::EnrollmentReply = self
-            .shared
-            .request(ticket.address, PAIR_ALPN, &request)
-            .await?;
-        let joined = response.joined.map_err(anyhow::Error::msg)?;
-        ensure!(
-            joined.mesh.member(member.id) == Some(&member),
-            "enrollment did not admit the expected device"
-        );
-        self.shared.merge(&joined, member.id)?;
-        Ok(member)
+        self.shared
+            .request(ticket.address.clone(), PAIR_ALPN, &request)
+            .await
     }
 
     pub async fn leave(&self) -> Result<LeftMesh> {
@@ -351,6 +362,14 @@ impl Node {
     }
 }
 
+fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::Snapshot> {
+    ensure!(
+        response.departure.is_none(),
+        "device refused readmission twice; update the introducing device if it runs an older Spirit"
+    );
+    response.joined.map_err(anyhow::Error::msg)
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         self.gossip.abort();
@@ -360,6 +379,28 @@ impl Drop for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_departure_refusal_is_an_error_not_another_retry() {
+        let key = SecretKey::generate();
+        let mesh = Mesh::create(
+            "home",
+            Member {
+                id: key.public(),
+                name: "device".into(),
+            },
+            &key,
+        )
+        .unwrap();
+        let reply = network::EnrollmentReply {
+            joined: Err("this device left the mesh".into()),
+            departure: Some(membership::Snapshot::without_addresses(mesh)),
+        };
+        assert!(joined_after_retry(reply)
+            .unwrap_err()
+            .to_string()
+            .contains("refused readmission twice"));
+    }
 
     #[test]
     fn duplicate_nicknames_require_an_id() {
