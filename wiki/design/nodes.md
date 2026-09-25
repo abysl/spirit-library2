@@ -74,7 +74,7 @@ Writes use temporary files and atomic replacement. New secret, state, control, a
 
 The CLI contacts the service through a loopback TCP listener authenticated by a random 32-byte credential. Control requests use length-prefixed JSON with a 256 KiB limit and a 30-second deadline. At most 32 control connections are handled concurrently. Public iroh connections cannot use this interface.
 
-`node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization and mesh creation work offline; `Node::leave_mesh` works offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
+`node serve` handles Ctrl-C and SIGTERM, cancels control tasks, removes the control file, and shuts down iroh. A process crash can leave a stale control file; restarting replaces it after acquiring the node lock. Initialization, mesh creation, and leaving work offline. Status and membership can be read while stopped. Enrollment, pairing, and ping require a running service.
 
 ## Rust API
 

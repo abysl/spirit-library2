@@ -82,23 +82,7 @@ class PairingSession(
     suspend fun refreshTicket() {
         if (!beginAction()) return
         try {
-            withActiveNode { activeNode ->
-                val generationStartedAt = nowMillis()
-                val invitation = activeNode.pair()
-                val expiresAt = generationStartedAt + invitation.lifetimeSeconds.coerceAtLeast(0) * 1_000L
-                tracking.withLock {
-                    ticketExpiresAtMillis = expiresAt
-                    offeredInitialTicket = true
-                    mutableState.update {
-                        it.copy(
-                            invitation = invitation,
-                            invitationSecondsRemaining = remainingSeconds(expiresAt),
-                            error = null,
-                            notice = null,
-                        )
-                    }
-                }
-            }
+            withActiveNode { activeNode -> offerTicket(activeNode, notice = null) }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -149,9 +133,76 @@ class PairingSession(
         }
     }
 
+    suspend fun leaveMesh() {
+        if (!beginAction()) return
+        try {
+            withActiveNode { activeNode ->
+                val notice = departureNotice(activeNode.leaveMesh())
+                tracking.withLock {
+                    peerSamples = emptyList()
+                    ticketExpiresAtMillis = null
+                    mutableState.update {
+                        it.copy(
+                            meshName = null,
+                            meshId = null,
+                            peers = emptyList(),
+                            invitation = null,
+                            invitationSecondsRemaining = 0,
+                            error = null,
+                            notice = notice,
+                        )
+                    }
+                }
+            }
+            try {
+                withActiveNode(cancellable = true) { activeNode ->
+                    offerTicket(activeNode, mutableState.value.notice)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                mutableState.update { it.copy(error = TICKET_ERROR) }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            mutableState.update { it.copy(error = LEAVE_ERROR, notice = null) }
+        } finally {
+            finishAction()
+        }
+    }
+
     fun reportError(message: String) {
         val safeMessage = message.trim().takeIf { it.isNotEmpty() && !it.contains(TICKET_PREFIX) } ?: "Operation failed"
         mutableState.update { it.copy(error = safeMessage, notice = null) }
+    }
+
+    private suspend fun offerTicket(activeNode: MeshNode, notice: String?) {
+        val generationStartedAt = nowMillis()
+        val invitation = activeNode.pair()
+        val expiresAt = generationStartedAt + invitation.lifetimeSeconds.coerceAtLeast(0) * 1_000L
+        tracking.withLock {
+            ticketExpiresAtMillis = expiresAt
+            offeredInitialTicket = true
+            mutableState.update {
+                it.copy(
+                    invitation = invitation,
+                    invitationSecondsRemaining = remainingSeconds(expiresAt),
+                    error = null,
+                    notice = notice,
+                )
+            }
+        }
+    }
+
+    private fun departureNotice(left: LeftMesh): String = when {
+        left.remainingMembers <= 0 -> "Left ${left.meshName}"
+        left.notifiedMembers >= left.remainingMembers -> "Left ${left.meshName} and notified its other devices"
+        else -> {
+            val devices = if (left.remainingMembers == 1) "device" else "devices"
+            val relay = if (left.notifiedMembers == 0) "" else " notified devices relay the departure;"
+            "Left ${left.meshName}. Notified ${left.notifiedMembers} of ${left.remainingMembers} $devices;$relay the rest can also learn it when they next reach this device"
+        }
     }
 
     private suspend fun openNode(): Boolean {
@@ -282,12 +333,12 @@ class PairingSession(
         actions.unlock()
     }
 
-    private suspend fun <T> withActiveNode(block: suspend (MeshNode) -> T): T {
+    private suspend fun <T> withActiveNode(cancellable: Boolean = false, block: suspend (MeshNode) -> T): T {
         currentCoroutineContext().ensureActive()
         return operations.withLock {
             currentCoroutineContext().ensureActive()
             val activeNode = checkNotNull(node) { "PairingSession node is not open" }
-            withContext(NonCancellable) { block(activeNode) }
+            if (cancellable) block(activeNode) else withContext(NonCancellable) { block(activeNode) }
         }
     }
     private fun devicesAt(now: Long, peers: Collection<PeerSample>): List<DeviceStatus> = peers.map { peer ->
@@ -329,5 +380,6 @@ class PairingSession(
         const val INVALID_TICKET_ERROR = "Enter a valid pairing ticket"
         const val OWN_TICKET_ERROR = "This pairing ticket belongs to this device"
         const val ADD_ERROR = "Could not add device"
+        const val LEAVE_ERROR = "Could not leave mesh"
     }
 }

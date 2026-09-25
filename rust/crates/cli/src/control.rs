@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use spirit_sdk::{Member, Node, NodeConfig, NodeInfo, Pong};
+use spirit_sdk::{LeftMesh, Member, Node, NodeConfig, NodeInfo, Pong};
 use std::{
     io::Write,
     net::SocketAddr,
@@ -25,6 +25,7 @@ pub enum Operation {
     Pair { ttl_seconds: u64 },
     Add { ticket: String },
     Ping { device: String },
+    Leave,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,6 +34,7 @@ pub enum Reply {
     Ticket(String),
     Added(Member),
     Pong(Pong),
+    Left(LeftMesh),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,6 +134,7 @@ async fn execute(node: &Node, operation: Operation) -> Result<Reply> {
             let member = node.info().resolve(&device)?;
             Ok(Reply::Pong(node.ping(member.id).await?))
         }
+        Operation::Leave => Ok(Reply::Left(node.leave().await?)),
     }
 }
 

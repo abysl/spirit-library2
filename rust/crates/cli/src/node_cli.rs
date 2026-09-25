@@ -5,7 +5,7 @@ use qrcode::{
     render::{svg, unicode::Dense1x2},
     QrCode,
 };
-use spirit_sdk::{Node, NodeInfo};
+use spirit_sdk::{LeftMesh, Node, NodeInfo};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -49,6 +49,8 @@ pub enum MeshCommand {
     },
     #[command(about = "enroll a device using its pairing ticket")]
     Add { ticket: String },
+    #[command(about = "leave this device's mesh; members must enroll it again to readmit it")]
+    Leave,
     #[command(about = "show this device's membership and service status")]
     Status,
     #[command(about = "list known mesh members")]
@@ -135,6 +137,28 @@ async fn info(root: &std::path::Path) -> Result<(NodeInfo, bool)> {
     }
 }
 
+fn departure_message(left: &LeftMesh) -> String {
+    let name = &left.mesh_name;
+    match (left.notified_members, left.remaining_members) {
+        (_, 0) => format!("Left {name}. No other members remained."),
+        (notified, remaining) if notified == remaining => {
+            let members = if remaining == 1 { "member" } else { "members" };
+            format!("Left {name} and notified its {remaining} remaining {members}.")
+        }
+        (notified, remaining) => {
+            let members = if remaining == 1 { "member" } else { "members" };
+            let relay = if notified == 0 {
+                ""
+            } else {
+                " notified members relay the departure;"
+            };
+            format!(
+                "Left {name}. Notified {notified} of {remaining} remaining {members};{relay} the others can also learn it when they next reach this device while it is serving."
+            )
+        }
+    }
+}
+
 pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
     match command {
         MeshCommand::Create { name } => {
@@ -162,6 +186,14 @@ pub async fn mesh(command: MeshCommand, root: PathBuf) -> Result<()> {
                 member.name,
                 info(&root).await?.0.mesh_name.unwrap()
             );
+        }
+        MeshCommand::Leave => {
+            let left = match control::request_if_running(&root, Operation::Leave).await? {
+                Some(Reply::Left(left)) => left,
+                None => Node::leave_mesh(&root)?,
+                _ => bail!("unexpected node response"),
+            };
+            println!("{}", departure_message(&left));
         }
         MeshCommand::Status => {
             let (info, running) = info(&root).await?;

@@ -104,6 +104,22 @@ spirit node ping '<device-id>'
 
 `node id` always prints the local public ID. Membership listings show known members, not live presence; use `node ping` to check reachability. Restarting preserves both identity and membership.
 
+## Leave a mesh
+
+```bash
+spirit mesh leave
+```
+
+Expected output while the service is running and every other member is reachable:
+
+```text
+Left personal and notified its 2 remaining members.
+```
+
+The device keeps its identity and nickname but is no longer a member: it stops heartbeats, other members stop listing and pinging it, and outstanding pairing tickets are invalidated. Leaving also works while the service is stopped. Unreached members learn of the departure from any notified member, or from this device when they next reach it while it is serving and still retains the departed mesh copy. The device retains at most 64 departed meshes, evicting the oldest departure after 64 later departures. After eviction, this device can no longer deliver that departure by pull or refuse a stale introducer's enrollment. Without another member relaying the departure, the stale introducer's generation-0 enrollment rejoins the device on its side only, while informed members still reject it. To recover, leave again, then be readmitted.
+
+To return, generate a fresh ticket on the device and redeem it from a remaining member with `mesh add`, as for a new device. It rejoins the same mesh with its original device ID. The device can instead create or join a different mesh. Leaving does not revoke its key, and there is no command to remove a different device.
+
 ## Try multiple devices on one computer
 
 Each simulated device needs its own directory. These example paths are relative to the current working directory; keep them outside a source checkout because they contain private keys.
@@ -140,6 +156,7 @@ For separate machines, omit `--local` so iroh can use its relay and discovery se
 - An ambiguous nickname requires a device ID.
 - Pairing, enrollment, and ping report that the node must be running when it is stopped.
 - A second service using the same node directory fails without disturbing the first.
+- Leaving fails when the device is not a mesh member. A device that left rejects pings, and members no longer ping it.
 
 If enrollment loses its final acknowledgment, check `mesh members`: the admitted device may already have joined and will exchange its membership with the introducer. Restarting invalidates unconsumed tickets, so generate a fresh ticket if needed.
 
@@ -147,7 +164,7 @@ If enrollment loses its final acknowledgment, check `mesh members`: the admitted
 
 `rust/crates/cli/tests/node.rs` runs separate CLI services, exercises hostname defaults, terminal/SVG QR generation, nickname resolution, duplicate names, crash recovery, and communication with the introducer offline. `rust/crates/node/tests/mesh.rs` covers persistent identities, enrollment, transitive admission, restart, and ticket behavior. Library tests also send unauthorized requests directly over iroh and verify signed admission rejection.
 
-Blob storage commands continue to use their existing store. Blob transfer, mesh removal, and admission restrictions are future stories.
+Blob storage commands continue to use their existing store. The CLI suite also leaves and rejoins a mesh while serving and leaves while stopped. Blob transfer, removing another device, and admission restrictions are future stories.
 
 See [the node design](../../wiki/design/nodes.md) for the trust model and protocol.
 
