@@ -333,7 +333,7 @@ impl Node {
                         state
                             .addresses
                             .get(&member.id)
-                            .cloned()
+                            .and_then(|entry| entry.dial().cloned())
                             .unwrap_or_else(|| member.id.into())
                     })
                     .collect();
