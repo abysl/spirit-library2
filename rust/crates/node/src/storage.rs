@@ -1,4 +1,4 @@
-use crate::membership::{validate_name, Member, Mesh, Snapshot};
+use crate::membership::{bounded_address, validate_name, Member, Mesh, Snapshot, VerifiedSnapshot};
 use crate::mesh_id::MeshId;
 use crate::NodeInfo;
 use anyhow::{ensure, Context, Result};
@@ -229,12 +229,12 @@ impl State {
             .clone()
             .context("device is not a mesh member; create a mesh or enroll this device first")?;
         let mut addresses = self.addresses.clone();
-        addresses.insert(addr.id, addr);
+        addresses.insert(addr.id, bounded_address(addr));
         Ok(Snapshot { mesh, addresses })
     }
 
     pub fn merge(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<()> {
-        snapshot.verify()?;
+        let verified = VerifiedSnapshot::new(snapshot)?;
         ensure!(
             snapshot.mesh.member(self.member.id) == Some(&self.member),
             "membership does not match this device"
@@ -242,7 +242,7 @@ impl State {
         let mut mesh = match &self.mesh {
             Some(mesh) => {
                 let mut mesh = mesh.clone();
-                mesh.merge(&snapshot.mesh)?;
+                verified.merge_into(&mut mesh)?;
                 mesh
             }
             None => snapshot.mesh.clone(),
