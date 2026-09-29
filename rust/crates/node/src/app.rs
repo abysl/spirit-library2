@@ -12,10 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::membership::decode_signature;
 
@@ -156,12 +160,16 @@ const APP_ENVELOPE_BYTES: usize = 256;
 pub(crate) const MAX_APP_WIRE: usize = MAX_APP_ENCODED + APP_ENVELOPE_BYTES;
 const DIAGNOSTICS_LIMIT: usize = 32;
 const APP_REPLY_CLOSE_WAIT: Duration = Duration::from_millis(100);
+const APP_REPLY_RESERVE: Duration = Duration::from_millis(250);
+const HANDLER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const APP_UNAVAILABLE: &str = "app unavailable";
 #[derive(Clone)]
 pub struct AppCallContext {
     mesh: MeshId,
     peer: NodeId,
     protocol: String,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl AppCallContext {
@@ -173,6 +181,12 @@ impl AppCallContext {
     }
     pub fn protocol(&self) -> &str {
         &self.protocol
+    }
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -232,6 +246,14 @@ pub(crate) struct AppState {
     handlers: Mutex<BTreeMap<String, Arc<dyn AppHandler>>>,
     total: Arc<Semaphore>,
     peers: Mutex<BTreeMap<NodeId, usize>>,
+    active: Mutex<ActiveHandlers>,
+}
+
+#[derive(Default)]
+struct ActiveHandlers {
+    stopping: bool,
+    cancellations: Vec<Weak<AtomicBool>>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl Default for AppState {
@@ -240,6 +262,7 @@ impl Default for AppState {
             handlers: Mutex::new(BTreeMap::new()),
             total: Arc::new(Semaphore::new(MAX_APP_IN_FLIGHT)),
             peers: Mutex::new(BTreeMap::new()),
+            active: Mutex::new(ActiveHandlers::default()),
         }
     }
 }
@@ -274,12 +297,33 @@ impl AppState {
         })
     }
 
+    pub(crate) async fn shutdown(&self) {
+        let tasks = {
+            let mut active = self.active.lock().unwrap();
+            active.stopping = true;
+            for token in active.cancellations.drain(..) {
+                if let Some(token) = token.upgrade() {
+                    token.store(true, Ordering::Release);
+                }
+            }
+            std::mem::take(&mut active.tasks)
+        };
+        let deadline = tokio::time::Instant::now() + HANDLER_SHUTDOWN_GRACE;
+        for task in tasks {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                break;
+            }
+        }
+    }
+
     async fn dispatch(
         self: &Arc<Self>,
         shared: &Shared,
         peer: NodeId,
         request: AppRequest,
         permit: AppPermit,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
     ) -> Result<String> {
         ensure!(
             shared.both_current_members(request.mesh_id, peer),
@@ -312,19 +356,38 @@ impl AppState {
             mesh: request.mesh_id,
             peer,
             protocol: request.protocol,
+            deadline,
+            cancelled: cancelled.clone(),
         };
         let (tx, rx) = oneshot::channel();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.handle(context, payload)
-            }))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("app handler panicked")));
-            let _ = tx.send(result);
-        });
+        {
+            let mut active = self.active.lock().unwrap();
+            ensure!(!active.stopping, "app shutting down");
+            active
+                .cancellations
+                .retain(|token| token.strong_count() > 0);
+            active.cancellations.push(Arc::downgrade(&cancelled));
+            active.tasks.retain(|task| !task.is_finished());
+            active.tasks.push(tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.handle(context, payload)
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("app handler panicked")));
+                let _ = tx.send(result);
+            }));
+        }
         let response = rx.await.context("app handler stopped")??;
         ensure!(response.len() <= MAX_APP_BYTES, "app response is too large");
         Ok(URL_SAFE_NO_PAD.encode(response))
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -375,6 +438,14 @@ impl AppProtocol {
 
     async fn respond(&self, connection: &Connection) -> Result<()> {
         let peer = connection.remote_id();
+        let deadline = Instant::now()
+            + self
+                .shared
+                .config
+                .request_timeout
+                .saturating_sub(APP_REPLY_RESERVE);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelOnDrop(cancelled.clone());
         let (mut send, mut recv) = self.transport(peer, connection.accept_bi().await)?;
         let permit = self.app.enter(peer);
         let mut mesh = None;
@@ -392,7 +463,7 @@ impl AppProtocol {
                 protocol = Some(request.protocol.clone());
             }
             tokio::select! {
-                result = self.app.dispatch(&self.shared, peer, request, permit) => result,
+                result = self.app.dispatch(&self.shared, peer, request, permit, cancelled, deadline) => result,
                 _ = connection.closed() => anyhow::bail!("app requester disconnected"),
             }
         }
@@ -441,6 +512,10 @@ impl ProtocolHandler for AppProtocol {
         )
         .await
     }
+
+    async fn shutdown(&self) {
+        self.app.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -448,7 +523,7 @@ mod channel_tests {
     use super::*;
     use crate::{Member, Node, NodeConfig};
     use iroh::SecretKey;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     async fn device(name: &str) -> (tempfile::TempDir, Node) {
         let dir = tempfile::tempdir().unwrap();
@@ -805,5 +880,204 @@ mod channel_tests {
             start.elapsed().as_nanos() as f64 / 100_000.0
         );
         node.shutdown().await.unwrap();
+    }
+
+    struct WaitForCancellation {
+        started: AtomicUsize,
+        cancelled: AtomicBool,
+        initial_budget_ms: AtomicU64,
+    }
+
+    impl AppHandler for WaitForCancellation {
+        fn handle(&self, context: AppCallContext, _: Vec<u8>) -> Result<Vec<u8>> {
+            self.initial_budget_ms
+                .store(context.remaining().as_millis() as u64, Ordering::SeqCst);
+            self.started.fetch_add(1, Ordering::SeqCst);
+            while !context.is_cancelled() && !context.remaining().is_zero() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            self.cancelled
+                .store(context.is_cancelled(), Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    async fn started(handler: &WaitForCancellation, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handler.started.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn responder_deadline_frees_slot_while_connection_remains_open() {
+        let (_ad, a) = device("a").await;
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), "b").unwrap();
+        let b = Node::bind(
+            dir.path(),
+            NodeConfig {
+                request_timeout: Duration::from_millis(650),
+                ..NodeConfig::local()
+            },
+        )
+        .await
+        .unwrap();
+        b.gossip.abort();
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        let handler = Arc::new(WaitForCancellation {
+            started: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            initial_budget_ms: AtomicU64::new(0),
+        });
+        b.register_app_handler("afm/echo", handler.clone()).unwrap();
+        let connection = a
+            .shared
+            .endpoint
+            .connect(b.shared.endpoint.addr(), APP_ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&serde_json::to_vec(&request(mesh)).unwrap())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        started(&handler, 1).await;
+        let answer: Result<String, String> = serde_json::from_slice(
+            &tokio::time::timeout(Duration::from_secs(2), recv.read_to_end(MAX_APP_WIRE))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(answer.is_ok());
+        assert!(!handler.cancelled.load(Ordering::SeqCst));
+        assert!((1..=400).contains(&handler.initial_budget_ms.load(Ordering::SeqCst)));
+        free_slots(&b).await;
+        connection.close(0u32.into(), b"finished");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_requester_cancels_handler() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        let handler = Arc::new(WaitForCancellation {
+            started: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            initial_budget_ms: AtomicU64::new(0),
+        });
+        b.register_app_handler("afm/echo", handler.clone()).unwrap();
+        let connection = a
+            .shared
+            .endpoint
+            .connect(b.shared.endpoint.addr(), APP_ALPN)
+            .await
+            .unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(&serde_json::to_vec(&request(mesh)).unwrap())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        started(&handler, 1).await;
+        connection.close(0u32.into(), b"disconnected");
+        free_slots(&b).await;
+        assert!(handler.cancelled.load(Ordering::SeqCst));
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unregister_keeps_in_flight_snapshot_and_shutdown_cancels() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        let slow = Arc::new(Slow {
+            started: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        });
+        b.register_app_handler("afm/echo", slow.clone()).unwrap();
+        let task = spawn_exchange(&a, &b, mesh).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slow.started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        b.unregister_app_handler("afm/echo").unwrap();
+        slow.release.store(true, Ordering::SeqCst);
+        assert!(task.await.unwrap().unwrap().is_ok());
+        assert_refused(&a, &b, &request(mesh)).await;
+        free_slots(&b).await;
+        let handler = Arc::new(WaitForCancellation {
+            started: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            initial_budget_ms: AtomicU64::new(0),
+        });
+        b.register_app_handler("afm/echo", handler.clone()).unwrap();
+        let task = spawn_exchange(&a, &b, mesh).await;
+        started(&handler, 1).await;
+        b.shutdown().await.unwrap();
+        free_slots(&b).await;
+        assert!(handler.cancelled.load(Ordering::SeqCst));
+        let _ = task.await.unwrap();
+        a.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_grace_period_requests_and_detaches_noncooperative_handler() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let b = Arc::new(b);
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        let slow = Arc::new(Slow {
+            started: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        });
+        struct ReleaseOnDrop(Arc<Slow>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.release.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release = ReleaseOnDrop(slow.clone());
+        b.register_app_handler("afm/echo", slow.clone()).unwrap();
+        let first = spawn_exchange(&a, &b, mesh).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slow.started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let start = Instant::now();
+        let shutdown = tokio::spawn({
+            let b = b.clone();
+            async move { b.shutdown().await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(b.app.active.lock().unwrap().stopping);
+        let second =
+            tokio::time::timeout(Duration::from_secs(4), spawn_exchange(&a, &b, mesh).await)
+                .await
+                .unwrap();
+        assert!(!matches!(second, Ok(Ok(_))));
+        shutdown.await.unwrap();
+        assert!(start.elapsed() >= HANDLER_SHUTDOWN_GRACE);
+        assert_eq!(b.app.total.available_permits(), MAX_APP_IN_FLIGHT - 1);
+        slow.release.store(true, Ordering::SeqCst);
+        let _ = first.await;
+        free_slots(&b).await;
+        a.shutdown().await.unwrap();
     }
 }
