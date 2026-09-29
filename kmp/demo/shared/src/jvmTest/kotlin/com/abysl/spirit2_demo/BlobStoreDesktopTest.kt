@@ -14,16 +14,15 @@ class BlobStoreDesktopTest {
     fun theDesktopStoreIsSpirit() {
         val dir = Files.createTempDirectory("spirit-demo-store").absolutePathString()
         val store = assertNotNull(openBlobStore(dir))
-        runBlocking {
+        val hash = runBlocking {
             store.use {
                 val hash = it.put("from the demo".encodeToByteArray())
                 assertEquals(64, hash.length)
                 assertTrue(it.has(hash))
                 assertContentEquals("from the demo".encodeToByteArray(), it.get(hash))
+                hash
             }
         }
-        assertTrue(java.io.File(dir, hash(dir)).isFile)
+        assertTrue(java.io.File(dir, hash).isFile)
     }
-
-    private fun hash(dir: String): String = java.io.File(dir).list()!!.single()
 }

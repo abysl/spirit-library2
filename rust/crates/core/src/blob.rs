@@ -16,6 +16,10 @@ impl BlobHash {
     pub fn as_bytes(&self) -> &[u8; BLOB_HASH_BYTE_LENGTH] {
         &self.0
     }
+
+    pub(crate) fn from_bytes(bytes: [u8; BLOB_HASH_BYTE_LENGTH]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Display for BlobHash {
@@ -54,7 +58,9 @@ impl FromStr for BlobHash {
 
         let mut bytes = [0; BLOB_HASH_BYTE_LENGTH];
         hex.as_bytes()
-            .chunks_exact(HEX_DIGITS_PER_BYTE)
+            .as_chunks::<HEX_DIGITS_PER_BYTE>()
+            .0
+            .iter()
             .zip(&mut bytes)
             .try_for_each(|(digits, byte)| {
                 let digits = std::str::from_utf8(digits).map_err(|_| invalid_hash())?;

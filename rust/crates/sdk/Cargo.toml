@@ -2,6 +2,7 @@
 name = "spirit-sdk"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [features]
 node = ["dep:spirit-node"]
