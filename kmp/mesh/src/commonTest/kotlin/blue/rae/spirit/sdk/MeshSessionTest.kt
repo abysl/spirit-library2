@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
 @OptIn(ExperimentalCoroutinesApi::class)
 class MeshSessionTest {
     @Test
-    fun `presence ages through poll failures at the sixty second boundary`() = runTest {
+    fun presenceAgesThroughPollFailuresAtTheSixtySecondBoundary() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = 0)
         val session = MeshSession({ node }) { now }
@@ -41,7 +41,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `presence ages while a native poll is stalled`() = runTest {
+    fun presenceAgesWhileANativePollIsStalled() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = 0)
         val session = MeshSession({ node }) { now }
@@ -60,7 +60,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `ticket expires conservatively and rejects malformed and own values`() = runTest {
+    fun ticketExpiresConservativelyAndRejectsMalformedAndOwnValues() = runTest {
         var now = 0L
         val node = FakeNode(ticketLifetimeSeconds = 5)
         val session = MeshSession({ node }) { now }
@@ -86,7 +86,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `scanningNeedsAChosenGroupAndNeverCreatesOne`() = runTest {
+    fun scanningNeedsAChosenGroupAndNeverCreatesOne() = runTest {
         val node = FakeNode()
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -103,7 +103,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `session exposes the mesh identity from status`() = runTest {
+    fun sessionExposesTheMeshIdentityFromStatus() = runTest {
         val node = FakeNode(meshName = "personal")
         node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "personal", emptyList())))
         val session = MeshSession({ node }) { 0L }
@@ -115,7 +115,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `failedAdmissionLeavesGroupAndTicketAvailable`() = runTest {
+    fun failedAdmissionLeavesGroupAndTicketAvailable() = runTest {
         val node = FakeNode(meshName = "personal")
         node.addFailure = IllegalStateException("spirit1secret")
         val session = MeshSession({ node }) { 0L }
@@ -127,7 +127,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `busy actions are queued while another is busy and cancellation still closes the node`() = runTest {
+    fun busyActionsAreQueuedWhileAnotherIsBusyAndCancellationStillClosesTheNode() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -151,7 +151,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `run cancellation clears a ticket completed before shutdown`() = runTest {
+    fun runCancellationClearsATicketCompletedBeforeShutdown() = runTest {
         val node = FakeNode(meshName = null)
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -173,7 +173,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `caller cancellation still reconciles a completed native enrollment`() = runTest {
+    fun callerCancellationStillReconcilesACompletedNativeEnrollment() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -188,12 +188,12 @@ class MeshSessionTest {
 
         assertFalse(session.state.value.busy)
         assertTrue(session.state.value.invitation != null)
-        assertEquals("Added spirit1member", session.state.value.notice)
+        assertEquals("Added peer", session.state.value.notice)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `cancelled opening is cleaned up after the factory returns`() = runTest {
+    fun cancelledOpeningIsCleanedUpAfterTheFactoryReturns() = runTest {
         val opened = CompletableDeferred<MeshNode>()
         val node = FakeNode()
         val session = MeshSession({ opened.await() }) { 0L }
@@ -208,7 +208,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `open failure becomes reusable state without leaking a node`() = runTest {
+    fun openFailureBecomesReusableStateWithoutLeakingANode() = runTest {
         val session = MeshSession({ throw IllegalStateException() }) { 0L }
 
         session.run()
@@ -217,7 +217,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `scanner errors survive successful polls until the next action`() = runTest {
+    fun scannerErrorsSurviveSuccessfulPollsUntilTheNextAction() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -231,7 +231,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `cancelled queued action does not reach the native node`() = runTest {
+    fun cancelledQueuedActionDoesNotReachTheNativeNode() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -251,7 +251,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `invalid or overflowing received ages are offline`() = runTest {
+    fun invalidOrOverflowingReceivedAgesAreOffline() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = -1)
         val session = MeshSession({ node }) { now }
@@ -269,7 +269,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `groupListAddAndLeaveOnlyTheSelectedGroup`() = runTest {
+    fun groupListAddAndLeaveOnlyTheSelectedGroup() = runTest {
         val node = FakeNode(meshName = "personal", peerAge = 0)
         node.snapshot = node.snapshot.copy(meshes = listOf(
             MeshStatus("mesh1_example", "personal", listOf(MeshMember("self", "self", 0), MeshMember("peer", "peer", 1))),
@@ -293,7 +293,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `additionalGroupKeepsTheEnrolledDevicesInvitation`() = runTest {
+    fun additionalGroupKeepsTheEnrolledDevicesInvitation() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -306,7 +306,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `groupMemberPresenceAgesDuringFailedPolls`() = runTest {
+    fun groupMemberPresenceAgesDuringFailedPolls() = runTest {
         var now = 0L
         val node = FakeNode(meshName = "personal", peerAge = 0)
         node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "personal", listOf(MeshMember("peer", "peer", 2)))))
@@ -322,7 +322,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `enrolledDevicesRefreshTicketsAndRemoteEnrollmentConsumesThem`() = runTest {
+    fun enrolledDevicesRefreshTicketsAndRemoteEnrollmentConsumesThem() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -339,7 +339,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `errorsCannotContainTickets`() = runTest {
+    fun errorsCannotContainTickets() = runTest {
         val node = FakeNode(meshName = "personal")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -352,19 +352,19 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `successful admission survives a failed status refresh`() = runTest {
+    fun successfulAdmissionSurvivesAFailedStatusRefresh() = runTest {
         val node = FakeNode(meshName = "home")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
         node.statusFailureAfterAdd = IllegalStateException("poll failed")
-        assertEquals(AddDeviceResult.Added("spirit1other"), session.addDevice("mesh1_example", "spirit1other"))
-        assertEquals("Added spirit1other", session.state.value.notice)
+        assertEquals(AddDeviceResult.Added("peer"), session.addDevice("mesh1_example", "spirit1other"))
+        assertEquals("Added peer", session.state.value.notice)
         assertNull(session.state.value.error)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `add failures expose typed recovery category`() = runTest {
+    fun addFailuresExposeTypedRecoveryCategory() = runTest {
         val node = FakeNode(meshName = "home")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -382,7 +382,7 @@ class MeshSessionTest {
     }
 
     @Test
-    fun `same group readmission consumes the ticket without changing membership`() = runTest {
+    fun sameGroupReadmissionConsumesTheTicketWithoutChangingMembership() = runTest {
         val node = FakeNode(meshName = "home")
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -392,12 +392,12 @@ class MeshSessionTest {
         runCurrent()
         assertEquals(listOf("home"), session.state.value.groups.map { it.name })
         assertEquals(2, node.pairCalls)
-        assertEquals(previous, session.state.value.invitation)
+        assertTrue(previous != session.state.value.invitation)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `group creation and departure return stable identities and counts`() = runTest {
+    fun groupCreationAndDepartureReturnStableIdentitiesAndCounts() = runTest {
         val node = FakeNode()
         val session = MeshSession({ node }) { 0L }
         val running = start(session)
@@ -430,6 +430,10 @@ class MeshSessionTest {
         var statusGate: CompletableDeferred<Unit>? = null
         var pairGate: CompletableDeferred<Unit>? = null
         var pairFailure: Throwable? = null
+        var createFailure: Throwable? = null
+        var pingFailure: Throwable? = null
+        var secondAddGate: CompletableDeferred<Unit>? = null
+        var remoteEnrollmentOnAdd = false
         var addGate: CompletableDeferred<Unit>? = null
         var addFailure: Throwable? = null
         var leaveFailure: Throwable? = null
@@ -440,7 +444,7 @@ class MeshSessionTest {
         val createdMeshes = mutableListOf<String>()
         val adds = mutableListOf<String>()
         val addedTo = mutableListOf<String>()
-        private val ticket = PairingInvitation("spirit1own", 1, byteArrayOf(1), ticketLifetimeSeconds)
+        private val ticketLifetime = ticketLifetimeSeconds
 
         override suspend fun status(): NodeStatus {
             statusGate?.await()
@@ -450,6 +454,7 @@ class MeshSessionTest {
         }
 
         override suspend fun createMesh(name: String): String {
+            createFailure?.let { throw it }
             createdMeshes += name
             val id = if (snapshot.meshes.isEmpty()) "mesh1_example" else "mesh1_" + createdMeshes.size
             snapshot = snapshot.copy(meshes = snapshot.meshes + MeshStatus(id, name, emptyList()), ticketPending = if (snapshot.meshes.isEmpty()) false else snapshot.ticketPending)
@@ -461,18 +466,23 @@ class MeshSessionTest {
             pairGate?.await()
             pairFailure?.let { throw it }
             snapshot = snapshot.copy(ticketPending = true)
-            return ticket
+            return PairingInvitation("spirit1own" + pairCalls, 1, byteArrayOf(1), ticketLifetime)
         }
 
         override suspend fun add(meshId: String, ticket: String): String {
             adds += ticket
             addedTo += meshId
-            addGate?.await()
-            addFailure?.let { throw it }
-            return ticket
+            if (adds.size == 2) secondAddGate?.await() else addGate?.await()
+            if (adds.size == 1) addFailure?.let { throw it }
+            if (remoteEnrollmentOnAdd) {
+                remoteEnrollmentOnAdd = false
+                snapshot = snapshot.copy(meshes = snapshot.meshes + MeshStatus("mesh1_remote", "remote", emptyList()), ticketPending = false)
+            }
+            return "peer"
         }
 
         override suspend fun ping(device: String): NodePong {
+            pingFailure?.let { throw it }
             return NodePong(device, 0)
         }
 
