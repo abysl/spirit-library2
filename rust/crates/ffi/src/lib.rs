@@ -72,7 +72,16 @@ fn node_error(error: anyhow::Error) -> FfiError {
 
 fn node_error_with_hash(error: anyhow::Error, expected_hash: Option<BlobHash>) -> FfiError {
     for cause in error.chain() {
-        if let Some(callback) = cause.downcast_ref::<FfiError>() {
+        let callback = cause.downcast_ref::<FfiError>().or_else(|| {
+            let store = cause.downcast_ref::<StoreError>()?;
+            match store {
+                StoreError::Io(io) | StoreError::Destination(io) => {
+                    io.get_ref()?.downcast_ref::<FfiError>()
+                }
+                _ => None,
+            }
+        });
+        if let Some(callback) = callback {
             return match callback {
                 FfiError::SourceRead(message) => FfiError::SourceRead(message.clone()),
                 FfiError::Destination(message) => FfiError::Destination(message.clone()),

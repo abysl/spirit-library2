@@ -11,12 +11,13 @@ class FakeMeshFiles(val deviceId: String = "fake-node") : MeshFiles {
     private val handlers = mutableMapOf<String, (AppCallInfo, ByteArray) -> ByteArray>()
     private val blobs = mutableMapOf<String, ByteArray>()
     private val shared = mutableMapOf<String, MutableSet<String>>()
+    private val admissions = mutableMapOf<String, MutableSet<Pair<String, Long>>>()
 
     suspend fun sharesFor(meshId: String): Set<String> = mutex.withLock { shared[meshId]?.toSet() ?: emptySet() }
 
-    override suspend fun importFile(path: String): String = store(fakeReadFile(path))
+    override suspend fun importFile(path: String): ImportedBlob = store(fakeReadFile(path))
 
-    override suspend fun importSource(open: () -> MeshSource): String {
+    override suspend fun importSource(open: () -> MeshSource): ImportedBlob {
         val source = open()
         val chunks = mutableListOf<ByteArray>()
         try {
@@ -29,11 +30,18 @@ class FakeMeshFiles(val deviceId: String = "fake-node") : MeshFiles {
         return store(chunks.fold(byteArrayOf()) { all, next -> all + next })
     }
 
-    private suspend fun store(bytes: ByteArray): String {
+    private suspend fun store(bytes: ByteArray): ImportedBlob {
         val hash = digest(bytes)
         mutex.withLock { blobs[hash] = bytes.copyOf() }
-        return hash
+        return ImportedBlob(hash, bytes.size.toLong())
     }
+
+    suspend fun admit(meshId: String, deviceId: String, generation: Long) {
+        mutex.withLock { admissions.getOrPut(meshId) { mutableSetOf() }.add(deviceId to generation) }
+    }
+
+    override suspend fun admitted(meshId: String, deviceId: String, generation: Long): Boolean =
+        mutex.withLock { admissions[meshId]?.contains(deviceId to generation) == true }
 
     private suspend fun blob(hash: String): ByteArray = mutex.withLock {
         blobs[hash]?.copyOf() ?: throw MeshNodeException(MeshFailure.Missing)

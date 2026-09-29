@@ -75,6 +75,14 @@ Before accepting a stream, the responder closes authenticated outsiders who shar
 
 The FFI fetch listener receives progress and exactly one completion callback on a dedicated forwarding thread, never a Tokio runtime worker. Listeners must not call `SpiritNode` synchronously; a blocked listener delays its own completion. Listener panics are isolated from the runtime. Cancellation signals the receive loop, closes its input, and joins the blocking writer before reporting `Cancelled`; Kotlin dispatches progress to a child coroutine, joins it before returning, and awaits native completion even when the coroutine is cancelled. UniFFI does not lower `Result` as a callback parameter, so completion carries mutually exclusive nullable size and typed error fields.
 
+An admission check `node.admitted(mesh, device, generation)` reads the verified admission
+history while this node is a current mesh member. It returns true for an author's
+previous generation even after that author leaves or rejoins; it returns
+`NotMember` after this node leaves. This allows AFM to validate signed catalog
+operations from departed authors without pretending departure revokes authorship.
+Importing a source or path returns `(hash, size)` from the same streaming hash
+pass, without a second blob-size query.
+
 The Kotlin `ByteSource.read` and `ByteSink.write`/`finish` callbacks execute on the calling
 SDK IO dispatcher while Rust imports and exports bytes. `finish` is called only after
 successful verification and writes; on failure, a caller creating a partial SAF document
@@ -235,7 +243,8 @@ not revoke in-flight transfers. There is no resume.
 `NodeClosed` after shutdown, even if the blob is locally present. App names, oversized app data, and
 share limits return `Invalid`; app requests from nonmembers return `NotMember`, and refusals or network
 failures return `Unavailable`. `FetchError::Node(NodeError)` reuses `NotMember`, `Unavailable`,
-`NodeClosed`, and `StoreNotConfigured`; `Interrupted`, `Corrupt`, `Timeout`, and `Io` are fetch-specific.
+`NodeClosed`, and `StoreNotConfigured`; `Cancelled`, `Interrupted`, `Corrupt`, `Timeout`, and
+`Io` are fetch-specific.
 Core `StoreError` distinguishes `NotFound`, `Corrupt`, `InvalidHash`, store `Io`, and destination
 `Destination`. Fetch maps store `Corrupt` to fetch `Corrupt`, missing blobs to node `Unavailable`, and
 store I/O or destination errors to fetch `Io`; no store maps to node `StoreNotConfigured`. The FFI
