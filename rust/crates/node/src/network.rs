@@ -127,6 +127,7 @@ pub(crate) struct Shared {
     pub state: Mutex<State>,
     pub pending: Mutex<Option<PairingTicket>>,
     pub presence: Mutex<BTreeMap<NodeId, Presence>>,
+    pub diagnostics: crate::app::DiagnosticLog,
     pub endpoint: Endpoint,
     pub config: NodeConfig,
 }
@@ -163,6 +164,13 @@ impl Shared {
             .heartbeat_received(Instant::now());
     }
 
+    pub(crate) fn both_current_members(&self, mesh_id: MeshId, peer: NodeId) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .both_current_members(mesh_id, peer)
+    }
+
     pub fn is_member(&self, id: NodeId) -> bool {
         self.state
             .lock()
@@ -172,7 +180,7 @@ impl Shared {
             .any(|mesh| mesh.member(id).is_some())
     }
 
-    fn failed(&self, id: NodeId, error: &anyhow::Error) {
+    pub(crate) fn failed(&self, id: NodeId, error: &anyhow::Error) {
         let state = self.state.lock().unwrap();
         if !state.meshes.values().any(|mesh| mesh.member(id).is_some()) {
             return;
@@ -286,7 +294,7 @@ impl Shared {
             .unwrap_or_else(|| id.into())
     }
 
-    fn address_for_mesh(&self, id: NodeId, mesh_id: MeshId) -> EndpointAddr {
+    pub(crate) fn address_for_mesh(&self, id: NodeId, mesh_id: MeshId) -> EndpointAddr {
         self.state
             .lock()
             .unwrap()
@@ -391,11 +399,21 @@ impl Shared {
         request: &T,
     ) -> Result<R> {
         let id = address.id;
-        let result = self.exchange(address, alpn, request).await;
+        let result = self.exchange(address, alpn, request, MAX_MESSAGE).await;
         if let Err(error) = &result {
             self.failed(id, error);
         }
         result
+    }
+
+    pub(crate) async fn app_exchange<T: Serialize, R: DeserializeOwned>(
+        &self,
+        address: EndpointAddr,
+        request: &T,
+        limit: usize,
+    ) -> Result<R> {
+        self.exchange(address, crate::app::APP_ALPN, request, limit)
+            .await
     }
 
     async fn exchange<T: Serialize, R: DeserializeOwned>(
@@ -403,9 +421,10 @@ impl Shared {
         address: EndpointAddr,
         alpn: &[u8],
         request: &T,
+        limit: usize,
     ) -> Result<R> {
         let bytes = serde_json::to_vec(request)?;
-        ensure!(bytes.len() <= MAX_MESSAGE, "request is too large");
+        ensure!(bytes.len() <= limit, "request is too large");
         let connection = tokio::time::timeout(
             self.config.request_timeout,
             self.endpoint.connect(address, alpn),
@@ -417,7 +436,10 @@ impl Shared {
             let (mut send, mut recv) = connection.open_bi().await?;
             send.write_all(&bytes).await?;
             send.finish()?;
-            let response = recv.read_to_end(MAX_MESSAGE).await?;
+            let response = recv
+                .read_to_end(limit)
+                .await
+                .context("response is too large")?;
             serde_json::from_slice(&response).map_err(|_| anyhow::anyhow!("invalid response"))
         })
         .await
@@ -622,21 +644,32 @@ impl Protocol {
     }
 }
 
+pub(crate) async fn finish_incoming(
+    connection: &Connection,
+    timeout: Duration,
+    response: impl std::future::Future<Output = Result<()>>,
+    record: impl FnOnce(&anyhow::Error),
+) -> Result<(), AcceptError> {
+    let result = tokio::time::timeout(timeout, response)
+        .await
+        .context("incoming request timed out")
+        .and_then(|result| result);
+    connection.close(0u32.into(), b"finished");
+    if let Err(error) = &result {
+        record(error);
+    }
+    result.map_err(|error| AcceptError::from_boxed(error.into()))
+}
+
 impl ProtocolHandler for Protocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let result = tokio::time::timeout(
+        finish_incoming(
+            &connection,
             self.shared.config.request_timeout,
             self.respond(&connection),
+            |error| self.shared.failed(connection.remote_id(), error),
         )
-        .await;
-        connection.close(0u32.into(), b"finished");
-        let result = result
-            .context("incoming request timed out")
-            .and_then(|result| result);
-        if let Err(error) = &result {
-            self.shared.failed(connection.remote_id(), error);
-        }
-        result.map_err(|error| AcceptError::from_boxed(error.into()))
+        .await
     }
 }
 
@@ -737,6 +770,33 @@ mod tests {
             .accept(alpn, FakeResponder { response, hang })
             .spawn();
         (endpoint, router)
+    }
+
+    #[tokio::test]
+    async fn app_reply_limit_is_checked_before_json() {
+        let (_dir, node) = device("requester").await;
+        let (endpoint, router) = fake_endpoint(
+            SecretKey::generate(),
+            crate::app::APP_ALPN,
+            vec![b'!'; crate::app::MAX_APP_WIRE + 1],
+            false,
+        )
+        .await;
+        let error = node
+            .shared
+            .app_exchange::<_, Result<String, String>>(
+                endpoint.addr(),
+                &"request",
+                crate::app::MAX_APP_WIRE,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("response is too large"),
+            "{error:#}"
+        );
+        router.shutdown().await.unwrap();
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

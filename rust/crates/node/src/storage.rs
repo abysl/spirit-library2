@@ -338,6 +338,12 @@ impl Storage {
 }
 
 impl State {
+    pub(crate) fn both_current_members(&self, mesh_id: MeshId, peer: iroh::EndpointId) -> bool {
+        self.meshes.get(&mesh_id).is_some_and(|mesh| {
+            mesh.member(self.member.id).is_some() && mesh.member(peer).is_some()
+        })
+    }
+
     pub fn info(&self) -> NodeInfo {
         let only = if self.meshes.len() == 1 {
             self.meshes.values().next()
