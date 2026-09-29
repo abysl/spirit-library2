@@ -1,6 +1,23 @@
-use crate::{membership::decode_signature, NodeId};
+use crate::{
+    network::{finish_incoming, Shared},
+    MeshId, NodeError, NodeId,
+};
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use iroh::{
+    endpoint::Connection,
+    protocol::{AcceptError, ProtocolHandler},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+
+use crate::membership::decode_signature;
 
 const APP_SIGNATURE_DOMAIN: &str = "spirit/app-signature/1";
 
@@ -10,9 +27,12 @@ pub(crate) fn validate_app_name(name: &str) -> Result<()> {
             && name
                 .bytes()
                 .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'/' | b'-')),
-        "application names must be 1–64 ASCII bytes from [a-z0-9._/-]"
+        NodeError::Invalid("application names must be 1–64 ASCII bytes from [a-z0-9._/-]".into())
     );
-    ensure!(!name.starts_with("spirit/"), "reserved application name");
+    ensure!(
+        !name.starts_with("spirit/"),
+        NodeError::Invalid("reserved application name".into())
+    );
     Ok(())
 }
 
@@ -125,5 +145,581 @@ mod tests {
             .verify()
             .is_err());
         node.shutdown().await.unwrap();
+    }
+}
+pub(crate) const APP_ALPN: &[u8] = b"spirit/app/1";
+pub(crate) const MAX_APP_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_APP_IN_FLIGHT: usize = 16;
+pub(crate) const MAX_APP_PER_PEER: usize = 4;
+pub(crate) const MAX_APP_ENCODED: usize = base64::encoded_len(MAX_APP_BYTES, false).unwrap();
+const APP_ENVELOPE_BYTES: usize = 256;
+pub(crate) const MAX_APP_WIRE: usize = MAX_APP_ENCODED + APP_ENVELOPE_BYTES;
+const DIAGNOSTICS_LIMIT: usize = 32;
+const APP_REPLY_CLOSE_WAIT: Duration = Duration::from_millis(100);
+const APP_UNAVAILABLE: &str = "app unavailable";
+#[derive(Clone)]
+pub struct AppCallContext {
+    mesh: MeshId,
+    peer: NodeId,
+    protocol: String,
+}
+
+impl AppCallContext {
+    pub fn mesh(&self) -> MeshId {
+        self.mesh
+    }
+    pub fn peer(&self) -> NodeId {
+        self.peer
+    }
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+}
+
+pub trait AppHandler: Send + Sync {
+    fn handle(&self, context: AppCallContext, payload: Vec<u8>) -> Result<Vec<u8>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct Diagnostic {
+    pub channel: &'static str,
+    pub mesh: Option<MeshId>,
+    pub peer: NodeId,
+    pub protocol: Option<String>,
+    pub cause: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct AppRequest {
+    pub mesh_id: MeshId,
+    pub protocol: String,
+    pub payload: String,
+}
+
+#[derive(Default)]
+pub(crate) struct DiagnosticLog {
+    entries: Mutex<VecDeque<Diagnostic>>,
+}
+
+impl DiagnosticLog {
+    pub(crate) fn entries(&self) -> Vec<Diagnostic> {
+        self.entries.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub(crate) fn record(
+        &self,
+        channel: &'static str,
+        mesh: Option<MeshId>,
+        peer: NodeId,
+        protocol: Option<&str>,
+        cause: &str,
+    ) {
+        let mut diagnostics = self.entries.lock().unwrap();
+        if diagnostics.len() == DIAGNOSTICS_LIMIT {
+            diagnostics.pop_front();
+        }
+        diagnostics.push_back(Diagnostic {
+            channel,
+            mesh,
+            peer,
+            protocol: protocol.map(crate::network::bounded_diagnostic),
+            cause: crate::network::bounded_diagnostic(cause),
+        });
+    }
+}
+
+pub(crate) struct AppState {
+    handlers: Mutex<BTreeMap<String, Arc<dyn AppHandler>>>,
+    total: Arc<Semaphore>,
+    peers: Mutex<BTreeMap<NodeId, usize>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            handlers: Mutex::new(BTreeMap::new()),
+            total: Arc::new(Semaphore::new(MAX_APP_IN_FLIGHT)),
+            peers: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl AppState {
+    pub(crate) fn register(&self, protocol: &str, handler: Arc<dyn AppHandler>) -> Result<()> {
+        validate_app_name(protocol)?;
+        self.handlers
+            .lock()
+            .unwrap()
+            .insert(protocol.into(), handler);
+        Ok(())
+    }
+
+    pub(crate) fn unregister(&self, protocol: &str) -> Result<()> {
+        validate_app_name(protocol)?;
+        self.handlers.lock().unwrap().remove(protocol);
+        Ok(())
+    }
+
+    fn enter(self: &Arc<Self>, peer: NodeId) -> Result<AppPermit> {
+        let mut peers = self.peers.lock().unwrap();
+        let count = peers.entry(peer).or_default();
+        if *count >= MAX_APP_PER_PEER {
+            anyhow::bail!("app per-peer concurrency limit reached");
+        }
+        *count += 1;
+        Ok(AppPermit {
+            state: self.clone(),
+            peer,
+            _total: None,
+        })
+    }
+
+    async fn dispatch(
+        self: &Arc<Self>,
+        shared: &Shared,
+        peer: NodeId,
+        request: AppRequest,
+        permit: AppPermit,
+    ) -> Result<String> {
+        ensure!(
+            shared.both_current_members(request.mesh_id, peer),
+            "mesh unavailable"
+        );
+        validate_app_name(&request.protocol)?;
+        ensure!(
+            request.payload.len() <= MAX_APP_ENCODED,
+            "app encoded payload is too large"
+        );
+        let payload = URL_SAFE_NO_PAD
+            .decode(&request.payload)
+            .context("invalid app payload")?;
+        ensure!(payload.len() <= MAX_APP_BYTES, "app payload is too large");
+        let handler = self
+            .handlers
+            .lock()
+            .unwrap()
+            .get(&request.protocol)
+            .cloned()
+            .context("unknown app protocol")?;
+        let total = self
+            .total
+            .clone()
+            .try_acquire_owned()
+            .context("app concurrency limit reached")?;
+        let mut permit = permit;
+        permit._total = Some(total);
+        let context = AppCallContext {
+            mesh: request.mesh_id,
+            peer,
+            protocol: request.protocol,
+        };
+        let (tx, rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.handle(context, payload)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("app handler panicked")));
+            let _ = tx.send(result);
+        });
+        let response = rx.await.context("app handler stopped")??;
+        ensure!(response.len() <= MAX_APP_BYTES, "app response is too large");
+        Ok(URL_SAFE_NO_PAD.encode(response))
+    }
+}
+
+struct AppPermit {
+    state: Arc<AppState>,
+    peer: NodeId,
+    _total: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for AppPermit {
+    fn drop(&mut self) {
+        let mut peers = self.state.peers.lock().unwrap();
+        let count = peers.get_mut(&self.peer).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            peers.remove(&self.peer);
+        }
+    }
+}
+
+pub(crate) struct AppProtocol {
+    shared: Arc<Shared>,
+    app: Arc<AppState>,
+}
+
+impl fmt::Debug for AppProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AppProtocol")
+    }
+}
+
+impl AppProtocol {
+    pub(crate) fn new(shared: Arc<Shared>, app: Arc<AppState>) -> Self {
+        Self { shared, app }
+    }
+
+    fn transport<T, E: Into<anyhow::Error>>(
+        &self,
+        peer: NodeId,
+        result: std::result::Result<T, E>,
+    ) -> Result<T> {
+        result.map_err(|error| {
+            let error = error.into();
+            self.shared.failed(peer, &error);
+            error
+        })
+    }
+
+    async fn respond(&self, connection: &Connection) -> Result<()> {
+        let peer = connection.remote_id();
+        let (mut send, mut recv) = self.transport(peer, connection.accept_bi().await)?;
+        let permit = self.app.enter(peer);
+        let mut mesh = None;
+        let mut protocol = None;
+        let result = async {
+            let permit = permit?;
+            let bytes = recv
+                .read_to_end(MAX_APP_WIRE)
+                .await
+                .context("app request wire limit exceeded")?;
+            let request: AppRequest =
+                serde_json::from_slice(&bytes).context("invalid app request")?;
+            mesh = Some(request.mesh_id);
+            if validate_app_name(&request.protocol).is_ok() {
+                protocol = Some(request.protocol.clone());
+            }
+            tokio::select! {
+                result = self.app.dispatch(&self.shared, peer, request, permit) => result,
+                _ = connection.closed() => anyhow::bail!("app requester disconnected"),
+            }
+        }
+        .await;
+        if let Err(error) = &result {
+            self.shared.diagnostics.record(
+                "spirit/app/1",
+                mesh,
+                peer,
+                protocol.as_deref(),
+                &format!("{error:#}"),
+            );
+        }
+        let accepted = result.is_ok();
+        let reply: Result<String, &str> = result.map_err(|_| APP_UNAVAILABLE);
+        self.transport(peer, send.write_all(&serde_json::to_vec(&reply)?).await)?;
+        self.transport(peer, send.finish())?;
+        if accepted {
+            connection.closed().await;
+        } else {
+            let _ = tokio::time::timeout(APP_REPLY_CLOSE_WAIT, connection.closed()).await;
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolHandler for AppProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        if !self.shared.is_member(connection.remote_id()) {
+            connection.close(0u32.into(), b"finished");
+            return Ok(());
+        }
+        finish_incoming(
+            &connection,
+            self.shared.config.request_timeout,
+            self.respond(&connection),
+            |error| {
+                self.shared.diagnostics.record(
+                    "spirit/app/1",
+                    None,
+                    connection.remote_id(),
+                    None,
+                    &format!("{error:#}"),
+                )
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use crate::{Node, NodeConfig};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn device(name: &str) -> (tempfile::TempDir, Node) {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), name).unwrap();
+        let node = Node::bind(dir.path(), NodeConfig::local()).await.unwrap();
+        node.gossip.abort();
+        (dir, node)
+    }
+
+    async fn join(founder: &Node, mesh: MeshId, peer: &Node) {
+        founder
+            .add(mesh, &peer.pair(Duration::from_secs(60)).await.unwrap())
+            .await
+            .unwrap();
+        peer.shared
+            .sync(founder.shared.endpoint.addr(), mesh)
+            .await
+            .unwrap();
+    }
+
+    fn request(mesh_id: MeshId) -> AppRequest {
+        AppRequest {
+            mesh_id,
+            protocol: "afm/echo".into(),
+            payload: URL_SAFE_NO_PAD.encode(b"hello"),
+        }
+    }
+
+    async fn raw(
+        sender: &Node,
+        receiver: &Node,
+        request: &AppRequest,
+    ) -> Result<Result<String, String>> {
+        sender
+            .shared
+            .request(receiver.shared.endpoint.addr(), APP_ALPN, request)
+            .await
+    }
+
+    async fn assert_refused(sender: &Node, receiver: &Node, request: &AppRequest) {
+        let answer = raw(sender, receiver, request).await;
+        assert!(
+            matches!(answer, Ok(Err(ref reason)) if reason == APP_UNAVAILABLE),
+            "{answer:?}"
+        );
+    }
+
+    async fn free_slots(node: &Node) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.app.total.available_permits() != MAX_APP_IN_FLIGHT
+                || !node.app.peers.lock().unwrap().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    struct Echo;
+    impl AppHandler for Echo {
+        fn handle(&self, _: AppCallContext, payload: Vec<u8>) -> Result<Vec<u8>> {
+            Ok(payload)
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_isolation_and_generic_failures() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("shared").unwrap();
+        join(&b, mesh, &a).await;
+        let other = b.new_mesh("not shared").unwrap();
+        b.register_app_handler("afm/echo", Arc::new(Echo)).unwrap();
+        assert_eq!(
+            a.app_request(mesh, b.info().id, "afm/echo", b"hello".to_vec())
+                .await
+                .unwrap(),
+            b"hello"
+        );
+        assert_refused(&a, &b, &request(other)).await;
+        assert!(a
+            .app_request(other, b.info().id, "afm/echo", vec![])
+            .await
+            .is_err());
+        for node in [&a, &b] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn large_reply_survives_a_slow_reader() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        b.register_app_handler("afm/echo", Arc::new(Echo)).unwrap();
+        let connection = a
+            .shared
+            .endpoint
+            .connect(b.shared.endpoint.addr(), APP_ALPN)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let payload = vec![42; MAX_APP_BYTES - 16];
+        let request = AppRequest {
+            payload: URL_SAFE_NO_PAD.encode(&payload),
+            ..request(mesh)
+        };
+        send.write_all(&serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut response = Vec::new();
+        let mut chunk = [0; 4096];
+        while let Some(count) = recv.read(&mut chunk).await.unwrap() {
+            response.extend_from_slice(&chunk[..count]);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let reply: Result<String, String> = serde_json::from_slice(&response).unwrap();
+        assert_eq!(URL_SAFE_NO_PAD.decode(reply.unwrap()).unwrap(), payload);
+        connection.close(0u32.into(), b"done");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    struct Oversize;
+    impl AppHandler for Oversize {
+        fn handle(&self, _: AppCallContext, _: Vec<u8>) -> Result<Vec<u8>> {
+            Ok(vec![0; MAX_APP_BYTES + 1])
+        }
+    }
+
+    #[tokio::test]
+    async fn sizes_and_protocol_validation_precede_dispatch_and_log() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("shared").unwrap();
+        join(&b, mesh, &a).await;
+        b.register_app_handler("afm/echo", Arc::new(Echo)).unwrap();
+        assert_refused(
+            &a,
+            &b,
+            &AppRequest {
+                payload: URL_SAFE_NO_PAD.encode(vec![0; MAX_APP_BYTES + 1]),
+                ..request(mesh)
+            },
+        )
+        .await;
+        assert_refused(
+            &a,
+            &b,
+            &AppRequest {
+                payload: URL_SAFE_NO_PAD.encode(vec![0; 300_000]),
+                ..request(mesh)
+            },
+        )
+        .await;
+        assert_refused(
+            &a,
+            &b,
+            &AppRequest {
+                protocol: "\u{202e}secret".into(),
+                ..request(mesh)
+            },
+        )
+        .await;
+        assert_eq!(b.diagnostics().last().unwrap().protocol, None);
+        b.register_app_handler("afm/echo", Arc::new(Oversize))
+            .unwrap();
+        assert_refused(&a, &b, &request(mesh)).await;
+        assert_eq!(
+            b.diagnostics().last().unwrap().cause,
+            "app response is too large"
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    struct Slow {
+        started: AtomicUsize,
+        release: AtomicBool,
+    }
+    impl AppHandler for Slow {
+        fn handle(&self, _: AppCallContext, _: Vec<u8>) -> Result<Vec<u8>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    async fn spawn_exchange(
+        sender: &Node,
+        receiver: &Node,
+        mesh: MeshId,
+    ) -> tokio::task::JoinHandle<Result<Result<String, String>>> {
+        let shared = sender.shared.clone();
+        let address = receiver.shared.endpoint.addr();
+        tokio::spawn(async move {
+            shared
+                .app_exchange(address, &request(mesh), MAX_APP_WIRE)
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn slots_stay_bounded_through_reads_and_blocking_handlers() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        let connection = a
+            .shared
+            .endpoint
+            .connect(b.shared.endpoint.addr(), APP_ALPN)
+            .await
+            .unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"{").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while b.app.peers.lock().unwrap().get(&a.info().id) != Some(&1) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(b.app.total.available_permits(), MAX_APP_IN_FLIGHT);
+        connection.close(0u32.into(), b"done");
+        free_slots(&b).await;
+        let slow = Arc::new(Slow {
+            started: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        });
+        b.register_app_handler("afm/echo", slow.clone()).unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_APP_PER_PEER {
+            tasks.push(spawn_exchange(&a, &b, mesh).await);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slow.started.load(Ordering::SeqCst) != MAX_APP_PER_PEER {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_refused(&a, &b, &request(mesh)).await;
+        slow.release.store(true, Ordering::SeqCst);
+        for task in tasks {
+            assert!(task.await.unwrap().unwrap().is_ok());
+        }
+        let state = Arc::new(AppState::default());
+        let permits: Vec<_> = (0..MAX_APP_IN_FLIGHT)
+            .map(|_| state.total.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(state.total.clone().try_acquire_owned().is_err());
+        drop(permits);
+        free_slots(&b).await;
+        b.register_app_handler("afm/echo", Arc::new(Panics))
+            .unwrap();
+        assert_refused(&a, &b, &request(mesh)).await;
+        free_slots(&b).await;
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    struct Panics;
+    impl AppHandler for Panics {
+        fn handle(&self, _: AppCallContext, _: Vec<u8>) -> Result<Vec<u8>> {
+            panic!("private panic details")
+        }
     }
 }

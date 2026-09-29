@@ -38,7 +38,7 @@ Older `/1` clients cannot exchange membership with `/2` nodes; upgrade all devic
 
 ## Networking
 
-`spirit-node` owns the iroh endpoint and router. It serves four versioned protocols:
+`spirit-node` owns the iroh endpoint and router. It serves five versioned protocols:
 
 | ALPN | Request | Response | Authorization |
 |---|---|---|---|
@@ -46,6 +46,7 @@ Older `/1` clients cannot exchange membership with `/2` nodes; upgrade all devic
 | `spirit/mesh/2` | Membership and address snapshot | Merged snapshot or retained departed copy | Peer has verified membership in the identity-matched current or departed mesh |
 | `spirit/ping/1` | JSON string `"ping"` | JSON string `"pong"` | Authenticated peer shares any current mesh |
 | `spirit/depart/1` | Departed mesh copy without addresses | JSON string `"recorded"` | The authenticated peer's own signed departure, for the named current mesh |
+| `spirit/app/1` | Named mesh, protocol and opaque bytes | Opaque bytes or generic failure | Both endpoints are current members of the selected mesh |
 
 Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Membership sync is routed by the request snapshot's mesh ID. Unknown meshes and requesters that are not current members of that mesh get the same generic failure, with no metadata; a departed device may reply to a member's signed snapshot with its retained departed copy. After signature verification, a requester key already known locally to have departed takes the fast refusal path before the full-state merge, including forged requests from that departed key. Ping is authorized across the union of current meshes. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. A stale introducer's pairing refusal includes the departed mesh copy, which the introducer records before retrying. A departed device's sync reply also includes its retained departed copy.
 
@@ -62,6 +63,14 @@ Membership propagation is eventual. Peers must have exchanged membership and usa
 ## Application signatures
 
 `node.sign_app(domain, bytes)` and offline `verify_app(device, domain, bytes, signature)` sign and verify Ed25519 over Postcard `("spirit/app-signature/1", domain, bytes)`. Domain names are 1–64 ASCII bytes from `[a-z0-9._/-]`, excluding the `spirit/` prefix. Signatures are exactly 86 unpadded URL-safe base64 characters. The distinct tuple prefix prevents an application signature from authenticating admissions, departures, or readmissions.
+
+## Mesh-scoped application channel
+
+`spirit/app/1` carries `{ "mesh_id": MeshId, "protocol": String, "payload": String }` as JSON, with unpadded URL-safe base64 opaque bytes. Replies are JSON `{"Ok":"<base64url>"}` or `{"Err":"app unavailable"}`. Application names follow the signature domain rules. Each payload is limited to 262,144 decoded bytes (349,526 encoded bytes); the request and reply wire limit is 349,782 bytes. The requester checks reply length before parsing and decoding.
+
+Before accepting a stream, the responder closes authenticated outsiders who share no current mesh. No outsider refusal enters local diagnostics. The requester checks membership locally before sending; the responder checks that both endpoints are current members of the named mesh once, before base64 decoding. Removing membership or unregistering a handler after dispatch does not revoke an already running call. Unknown meshes, malformed requests, unregistered names, handler failures, and concurrency refusals use the same generic failure. Four in-flight reads are allowed per peer; at most 16 handlers run concurrently globally. Handlers run on the blocking pool and retain slots until they return, even if the requester disconnects or a request times out.
+
+`node.register_app_handler(name, Arc<dyn AppHandler>)`, `node.unregister_app_handler(name)`, and `node.app_request(mesh, peer, name, bytes).await` expose the channel. The context has private fields with `mesh()`, `peer()`, and `protocol()` accessors. `node.diagnostics()` returns the last 32 oldest-first local `Diagnostic` entries, with a channel (currently `"spirit/app/1"`), optional mesh and protocol, peer and a sanitized cause of at most 256 UTF-8 bytes. Outsider refusals never evict member diagnostics. Transport errors alone enter presence diagnostics. No application data or diagnostics are persisted or merged. The union outsider gate scans current admissions under the state lock, costing about 1.0 ms per outsider connection at 64 meshes × 256 admissions on this host. This is a known limit; the generic failure is not timing-indistinguishable.
 
 ## Persistence and local control
 

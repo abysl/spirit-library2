@@ -5,7 +5,7 @@ mod network;
 mod presence;
 mod storage;
 
-pub use app::verify_app;
+pub use app::{verify_app, AppCallContext, AppHandler, Diagnostic};
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
 pub use mesh_id::MeshId;
@@ -32,6 +32,9 @@ pub use presence::{PeerStatus, CONNECTED_WINDOW, HEARTBEAT_INTERVAL};
 pub use storage::write_private;
 
 use anyhow::{bail, ensure, Context, Result};
+use app::{
+    AppProtocol, AppRequest, AppState, APP_ALPN, MAX_APP_BYTES, MAX_APP_ENCODED, MAX_APP_WIRE,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr, SecretKey};
 use membership::Mesh;
@@ -204,6 +207,7 @@ pub struct Node {
     router: Router,
     gossip: JoinHandle<()>,
     closed: AtomicBool,
+    app: Arc<AppState>,
 }
 
 impl Node {
@@ -260,14 +264,17 @@ impl Node {
             state: Mutex::new(state),
             pending: Mutex::new(None),
             presence: Mutex::new(Default::default()),
+            diagnostics: Default::default(),
             endpoint: endpoint.clone(),
             config,
         });
+        let app = Arc::new(AppState::default());
         let router = Router::builder(endpoint)
             .accept(PAIR_ALPN, Protocol::pair(shared.clone()))
             .accept(SYNC_ALPN, Protocol::sync(shared.clone()))
             .accept(PING_ALPN, Protocol::ping(shared.clone()))
             .accept(DEPART_ALPN, Protocol::depart(shared.clone()))
+            .accept(APP_ALPN, AppProtocol::new(shared.clone(), app.clone()))
             .spawn();
         let gossip = tokio::spawn(network::gossip(shared.clone()));
         Ok(Self {
@@ -275,6 +282,7 @@ impl Node {
             router,
             gossip,
             closed: AtomicBool::new(false),
+            app,
         })
     }
 
@@ -497,6 +505,65 @@ impl Node {
     fn ensure_open(&self) -> Result<()> {
         ensure!(!self.closed.load(Ordering::Acquire), NodeError::NodeClosed);
         Ok(())
+    }
+
+    pub fn register_app_handler(&self, protocol: &str, handler: Arc<dyn AppHandler>) -> Result<()> {
+        self.ensure_open()?;
+        self.app.register(protocol, handler)
+    }
+
+    pub fn unregister_app_handler(&self, protocol: &str) -> Result<()> {
+        self.ensure_open()?;
+        self.app.unregister(protocol)
+    }
+
+    pub async fn app_request(
+        &self,
+        mesh: MeshId,
+        peer: NodeId,
+        protocol: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.ensure_open()?;
+        app::validate_app_name(protocol)?;
+        ensure!(
+            payload.len() <= MAX_APP_BYTES,
+            NodeError::Invalid("app payload is too large".into())
+        );
+        ensure!(
+            self.shared.both_current_members(mesh, peer),
+            NodeError::NotMember
+        );
+        let request = AppRequest {
+            mesh_id: mesh,
+            protocol: protocol.into(),
+            payload: URL_SAFE_NO_PAD.encode(payload),
+        };
+        let reply: std::result::Result<String, String> = self
+            .shared
+            .app_exchange(
+                self.shared.address_for_mesh(peer, mesh),
+                &request,
+                MAX_APP_WIRE,
+            )
+            .await?;
+        let encoded = reply.map_err(|_| NodeError::Unavailable("app unavailable".into()))?;
+        ensure!(
+            encoded.len() <= MAX_APP_ENCODED,
+            NodeError::Invalid("app response is too large".into())
+        );
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| NodeError::Invalid("invalid app response".into()))?;
+        ensure!(
+            bytes.len() <= MAX_APP_BYTES,
+            NodeError::Invalid("app response is too large".into())
+        );
+        Ok(bytes)
+    }
+
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.shared.diagnostics.entries()
     }
 
     pub fn sign_app(&self, domain: &str, bytes: &[u8]) -> Result<String> {
