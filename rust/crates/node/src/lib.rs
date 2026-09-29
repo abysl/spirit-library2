@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::Storage;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -406,7 +407,39 @@ impl Node {
         progress: impl Fn(u64, u64),
     ) -> std::result::Result<u64, FetchError> {
         self.ensure_open()?;
-        transfer::fetch(&self.shared, mesh, provider, hash, expected_size, progress).await
+        let (_sender, mut cancel) = watch::channel(false);
+        transfer::fetch(
+            &self.shared,
+            mesh,
+            provider,
+            hash,
+            expected_size,
+            progress,
+            &mut cancel,
+        )
+        .await
+    }
+
+    pub async fn fetch_cancellable(
+        &self,
+        mesh: MeshId,
+        provider: NodeId,
+        hash: BlobHash,
+        expected_size: Option<u64>,
+        progress: impl Fn(u64, u64),
+        mut cancel: watch::Receiver<bool>,
+    ) -> std::result::Result<u64, FetchError> {
+        self.ensure_open()?;
+        transfer::fetch(
+            &self.shared,
+            mesh,
+            provider,
+            hash,
+            expected_size,
+            progress,
+            &mut cancel,
+        )
+        .await
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {

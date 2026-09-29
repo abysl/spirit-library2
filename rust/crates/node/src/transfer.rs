@@ -10,9 +10,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
+use tokio::sync::{mpsc, watch};
 
 pub(crate) const MAX_FETCHES: usize = 4;
 const RECEIVE_BUFFER: usize = 64 * 1024;
@@ -23,6 +23,8 @@ const PROGRESS_BYTES: u64 = 1024 * 1024;
 pub enum FetchError {
     #[error(transparent)]
     Node(#[from] NodeError),
+    #[error("fetch cancelled")]
+    Cancelled,
     #[error("blob transfer interrupted")]
     Interrupted,
     #[error("blob is corrupt")]
@@ -74,6 +76,7 @@ pub(crate) async fn fetch(
     hash: BlobHash,
     expected_size: Option<u64>,
     progress: impl Fn(u64, u64),
+    cancel: &mut watch::Receiver<bool>,
 ) -> std::result::Result<u64, FetchError> {
     if !shared.both_current_members(mesh, provider) {
         return Err(NodeError::NotMember.into());
@@ -84,23 +87,25 @@ pub(crate) async fn fetch(
         if expected_size.is_some_and(|expected| expected != size) {
             return Err(FetchError::Corrupt);
         }
+        progress(size, size);
         return Ok(size);
     }
-    let _permit = shared
-        .fetches
-        .clone()
-        .acquire_owned()
-        .await
+    let _permit = tokio::select! { biased; _ = cancelled(cancel) => return Err(FetchError::Cancelled), permit = shared.fetches.clone().acquire_owned() => permit }
         .map_err(|_| FetchError::Node(NodeError::Unavailable("fetch queue closed".into())))?;
     let address = shared.address_for_mesh(provider, mesh);
-    let connection = tokio::time::timeout(
-        shared.config.request_timeout,
-        shared.endpoint.connect(address, BLOB_ALPN),
-    )
-    .await
+    let connection = tokio::select! { biased; _ = cancelled(cancel) => return Err(FetchError::Cancelled), result = tokio::time::timeout(shared.config.request_timeout, shared.endpoint.connect(address, BLOB_ALPN)) => result }
     .map_err(|_| unavailable())?
     .map_err(|_| unavailable())?;
-    let result = receive(&connection, store, mesh, hash, expected_size, progress).await;
+    let result = receive(
+        &connection,
+        store,
+        mesh,
+        hash,
+        expected_size,
+        progress,
+        cancel,
+    )
+    .await;
     connection.close(0u32.into(), b"done");
     result
 }
@@ -112,7 +117,53 @@ async fn receive(
     hash: BlobHash,
     expected_size: Option<u64>,
     progress: impl Fn(u64, u64),
+    cancel: &mut watch::Receiver<bool>,
 ) -> std::result::Result<u64, FetchError> {
+    let (mut recv, total) = tokio::select! {
+        biased;
+        _ = cancelled(cancel) => return Err(FetchError::Cancelled),
+        result = open_stream(connection, mesh, hash, expected_size) => result?,
+    };
+    let (tx, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+    let writer = tokio::task::spawn_blocking(move || {
+        store.write_verified(
+            hash,
+            ChannelReader {
+                receiver,
+                current: io::Cursor::new(Vec::new()),
+            },
+        )
+    });
+    let streamed = tokio::select! {
+        biased;
+        _ = cancelled(cancel) => Err(FetchError::Cancelled),
+        result = stream_chunks(&mut recv, total, &tx, &progress) => result,
+    };
+    drop(tx);
+    let written = writer
+        .await
+        .map_err(|e| FetchError::Io(io::Error::other(e)))?
+        .map_err(map_store_error);
+    let reported = match streamed {
+        Ok(reported) => reported,
+        Err(error) if matches!(error, FetchError::Io(_)) => {
+            return Err(written.err().unwrap_or(error));
+        }
+        Err(error) => return Err(error),
+    };
+    let size = written?;
+    if reported != size {
+        progress(size, total);
+    }
+    Ok(size)
+}
+
+async fn open_stream(
+    connection: &Connection,
+    mesh: MeshId,
+    hash: BlobHash,
+    expected_size: Option<u64>,
+) -> std::result::Result<(noq::RecvStream, u64), FetchError> {
     let (mut send, mut recv) = tokio::time::timeout(CHUNK_IDLE, connection.open_bi())
         .await
         .map_err(|_| FetchError::Timeout)?
@@ -144,67 +195,55 @@ async fn receive(
     if expected_size.is_some_and(|expected| expected != total) {
         return Err(FetchError::Corrupt);
     }
-    let (tx, receiver) = mpsc::channel(CHANNEL_CAPACITY);
-    let writer = tokio::task::spawn_blocking(move || {
-        store.write_verified(
-            hash,
-            ChannelReader {
-                receiver,
-                current: io::Cursor::new(Vec::new()),
-            },
-        )
-    });
+    Ok((recv, total))
+}
+
+async fn stream_chunks(
+    recv: &mut noq::RecvStream,
+    total: u64,
+    tx: &mpsc::Sender<Piece>,
+    progress: &impl Fn(u64, u64),
+) -> std::result::Result<u64, FetchError> {
     let mut received = 0u64;
     let mut reported = 0u64;
     let mut last = Instant::now();
     let mut buffer = vec![0; RECEIVE_BUFFER];
-    let streamed: std::result::Result<(), FetchError> = async {
-        loop {
-            let chunk = tokio::time::timeout(CHUNK_IDLE, recv.read(&mut buffer))
-                .await
-                .map_err(|_| FetchError::Timeout)?
-                .map_err(|_| FetchError::Interrupted)?;
-            let Some(n) = chunk else {
-                break;
-            };
-            received = received.checked_add(n as u64).ok_or(FetchError::Corrupt)?;
-            if received > total {
-                return Err(FetchError::Corrupt);
-            }
-            tx.send(Piece::Bytes(buffer[..n].to_vec()))
-                .await
-                .map_err(|_| FetchError::Io(io::Error::other("store writer stopped")))?;
-            if received - reported >= PROGRESS_BYTES || last.elapsed() >= PROGRESS_INTERVAL {
-                progress(received, total);
-                reported = received;
-                last = Instant::now();
-            }
+    loop {
+        let chunk = tokio::time::timeout(CHUNK_IDLE, recv.read(&mut buffer))
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(|_| FetchError::Interrupted)?;
+        let Some(n) = chunk else {
+            break;
+        };
+        received = received.checked_add(n as u64).ok_or(FetchError::Corrupt)?;
+        if received > total {
+            return Err(FetchError::Corrupt);
         }
-        if received != total {
-            return Err(FetchError::Interrupted);
-        }
-        tx.send(Piece::Complete)
+        tx.send(Piece::Bytes(buffer[..n].to_vec()))
             .await
             .map_err(|_| FetchError::Io(io::Error::other("store writer stopped")))?;
-        Ok(())
-    }
-    .await;
-    drop(tx);
-    let written = writer
-        .await
-        .map_err(|e| FetchError::Io(io::Error::other(e)))?
-        .map_err(map_store_error);
-    if let Err(error) = streamed {
-        if matches!(error, FetchError::Io(_)) {
-            return Err(written.err().unwrap_or(error));
+        if received - reported >= PROGRESS_BYTES || last.elapsed() >= PROGRESS_INTERVAL {
+            progress(received, total);
+            reported = received;
+            last = Instant::now();
         }
-        return Err(error);
     }
-    let size = written?;
-    if reported != size {
-        progress(size, total);
+    if received != total {
+        return Err(FetchError::Interrupted);
     }
-    Ok(size)
+    tx.send(Piece::Complete)
+        .await
+        .map_err(|_| FetchError::Io(io::Error::other("store writer stopped")))?;
+    Ok(reported)
+}
+
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    while !*cancel.borrow() {
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 fn unavailable() -> FetchError {
@@ -277,14 +316,17 @@ mod tests {
             bytes
         );
         a.shutdown().await.unwrap();
+        let local = AtomicUsize::new(0);
         assert_eq!(
-            b.fetch(mesh, a.info().id, hash, None, |_, _| panic!(
-                "local hit reported progress"
-            ))
+            b.fetch(mesh, a.info().id, hash, None, |received, total| {
+                assert_eq!((received, total), (size, size));
+                local.fetch_add(1, Ordering::Relaxed);
+            })
             .await
             .unwrap(),
             size
         );
+        assert_eq!(local.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -473,6 +515,7 @@ mod tests {
             .connect(endpoint.addr(), BLOB_ALPN)
             .await
             .unwrap();
+        let (_sender, mut cancel) = watch::channel(false);
         let result = receive(
             &connection,
             node.shared.store.as_ref().unwrap().clone(),
@@ -480,6 +523,7 @@ mod tests {
             hash,
             expected_size,
             |_, _| {},
+            &mut cancel,
         )
         .await;
         connection.close(0u32.into(), b"done");

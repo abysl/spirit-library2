@@ -40,4 +40,5 @@ class FakeMeshFiles : MeshFiles {
     override suspend fun setShares(meshId: String, hashes: List<String>) { shares[meshId] = hashes.toMutableSet() }
     override suspend fun share(meshId: String, hash: String) { shares.getOrPut(meshId) { mutableSetOf() }.add(hash) }
     override suspend fun unshare(meshId: String, hash: String) { shares[meshId]?.remove(hash) }
+    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long = blobSize(hash)
 }

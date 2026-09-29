@@ -4,6 +4,14 @@ import java.nio.file.Paths
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import uniffi.spirit_ffi.FetchListener
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CoroutineDispatcher
@@ -31,8 +39,21 @@ internal fun mapError(error: FfiException): MeshNodeException = MeshNodeExceptio
     is FfiException.Destination -> MeshFailure.Destination
     is FfiException.Io -> MeshFailure.Io
     is FfiException.SourceRead -> MeshFailure.SourceRead
+    is FfiException.Cancelled -> MeshFailure.Cancelled
     is FfiException.Node -> MeshFailure.Node
-}, if (error is FfiException.TicketRejected) "ticket rejected" else error.message ?: "native error",
+}, when (error) {
+    is FfiException.TicketRejected -> "ticket rejected"
+    is FfiException.Invalid -> error.v1
+    is FfiException.NotMember -> error.v1
+    is FfiException.Unavailable -> error.v1
+    is FfiException.Io -> error.v1
+    is FfiException.SourceRead -> error.v1
+    is FfiException.Destination -> error.v1
+    is FfiException.Missing -> error.v1
+    is FfiException.Node -> error.v1
+    is FfiException.Corrupt -> "expected=${error.expected}, actual=${error.actual}"
+    else -> ""
+}, cause = error,
     expectedHash = (error as? FfiException.Corrupt)?.expected,
     actualHash = (error as? FfiException.Corrupt)?.actual,
 )
@@ -114,24 +135,28 @@ class SpiritNode private constructor(
         }
     }
 
-    private suspend fun <T> io(block: () -> T): T = withContext(dispatcher) {
-        synchronized(activeCalls) {
-            if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
-            callCount++
+    private fun beginCall() = synchronized(activeCalls) {
+        if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+        callCount++
+    }
+
+    private fun endCall() {
+        val finish = synchronized(activeCalls) {
+            callCount--
+            activeCalls.notifyAll()
+            if (closed.get() && callCount == 0 && !teardownClaimed) {
+                teardownClaimed = true
+                true
+            } else false
         }
+        if (finish) finishClose()
+    }
+
+    private suspend fun <T> io(block: () -> T): T = withContext(dispatcher) {
+        beginCall()
         try {
             try { block() } catch (error: FfiException) { throw mapError(error) }
-        } finally {
-            val finish = synchronized(activeCalls) {
-                callCount--
-                activeCalls.notifyAll()
-                if (closed.get() && callCount == 0 && !teardownClaimed) {
-                    teardownClaimed = true
-                    true
-                } else false
-            }
-            if (finish) finishClose()
-        }
+        } finally { endCall() }
     }
 
     private fun finishClose() {
@@ -208,6 +233,47 @@ class SpiritNode private constructor(
     override suspend fun setShares(meshId: String, hashes: List<String>) = io { ffi.setShares(meshId, hashes) }
     override suspend fun share(meshId: String, hash: String) = io { ffi.share(meshId, hash) }
     override suspend fun unshare(meshId: String, hash: String) = io { ffi.unshare(meshId, hash) }
+
+    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long = coroutineScope {
+        if (expectedSize != null && expectedSize < 0) throw MeshNodeException(MeshFailure.Invalid)
+        beginCall()
+        val completion = CompletableDeferred<Long>()
+        val progress = Channel<Pair<Long, Long>>(Channel.CONFLATED)
+        val handle = AtomicReference<uniffi.spirit_ffi.FetchHandle?>()
+        val worker = launch(dispatcher) {
+            for ((received, total) in progress) onProgress(received, total)
+        }
+        try {
+            try {
+                withContext(NonCancellable + dispatcher) {
+                    if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+                    try {
+                        handle.set(ffi.startFetch(meshId, provider, hash, expectedSize?.toULong(), object : FetchListener {
+                            override fun onProgress(received: ULong, total: ULong) {
+                                progress.trySend(received.toLong() to total.toLong())
+                            }
+                            override fun onComplete(size: ULong?, error: FfiException?) {
+                                if (error != null) completion.completeExceptionally(mapError(error))
+                                else if (size != null) completion.complete(size.toLong())
+                                else completion.completeExceptionally(MeshNodeException(MeshFailure.Node))
+                            }
+                        }))
+                    } catch (error: FfiException) { throw mapError(error) }
+                }
+                coroutineContext.ensureActive()
+                completion.await()
+            } catch (error: CancellationException) {
+                handle.get()?.cancel()
+                withContext(NonCancellable) { try { completion.await() } catch (_: Exception) { } }
+                throw error
+            }
+        } finally {
+            progress.close()
+            withContext(NonCancellable) { worker.join() }
+            handle.get()?.close()
+            endCall()
+        }
+    }
 
     override suspend fun status(): NodeStatus = io {
         val status = ffi.status()
