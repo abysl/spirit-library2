@@ -371,3 +371,79 @@ class SpiritNodeFetchTest {
         override fun close() = Unit
     }
 }
+
+class SpiritNodeAppTest {
+    @Test
+    fun appHandlerSignaturesAndDiagnostics() = runBlocking {
+        val aDir = Files.createTempDirectory("spirit-app-a")
+        val bDir = Files.createTempDirectory("spirit-app-b")
+        SpiritNode.open(aDir.toString(), "a", local = true).use { first ->
+            val firstId = first.status().id
+            val signature = first.signApp("afm/catalog/op/1", "op".encodeToByteArray())
+            SpiritNode.open(bDir.toString(), "b", local = true).use { second ->
+                val mesh = first.createMesh("group")
+                first.add(mesh, second.pair().ticket)
+                second.registerAppHandler("afm/catalog/1") { call, bytes ->
+                    assertEquals(mesh, call.meshId)
+                    assertEquals(firstId, call.peer)
+                    assertEquals("afm/catalog/1", call.protocol)
+                    val before = call.remainingMs
+                    assertTrue(before > 0)
+                    Thread.sleep(5)
+                    assertTrue(call.remainingMs < before)
+                    assertFalse(call.isCancelled)
+                    bytes + "-reply".encodeToByteArray()
+                }
+                assertEquals("hello-reply", first.appRequest(mesh, second.status().id, "afm/catalog/1", "hello".encodeToByteArray()).decodeToString())
+                assertTrue(second.diagnostics().isEmpty())
+                second.unregisterAppHandler("afm/catalog/1")
+                second.registerAppHandler("afm/refusal") { _, _ ->
+                    throw MeshNodeException(MeshFailure.Invalid, "bad catalog")
+                }
+                assertEquals(MeshFailure.Unavailable, assertFailsWith<MeshNodeException> {
+                    first.appRequest(mesh, second.status().id, "afm/refusal", byteArrayOf())
+                }.failure)
+                assertTrue(second.diagnostics().any { it.cause.contains("invalid input") })
+                second.unregisterAppHandler("afm/refusal")
+                second.registerAppHandler("afm/unexpected") { _, _ -> throw IOException("callback failed") }
+                assertEquals(MeshFailure.Unavailable, assertFailsWith<MeshNodeException> {
+                    first.appRequest(mesh, second.status().id, "afm/unexpected", byteArrayOf())
+                }.failure)
+                assertTrue(second.diagnostics().any { it.cause.contains("node: callback failed") })
+                second.unregisterAppHandler("afm/unexpected")
+            }
+            assertTrue(verifyApp(firstId, "afm/catalog/op/1", "op".encodeToByteArray(), signature))
+            assertFalse(verifyApp(firstId, "afm/catalog/op/1", "other".encodeToByteArray(), signature))
+            assertEquals(MeshFailure.Invalid, assertFailsWith<MeshNodeException> {
+                verifyApp(firstId, "spirit/reserved", byteArrayOf(), signature)
+            }.failure)
+        }
+    }
+}
+
+class SpiritNodeAppCancellationTest {
+    @Test
+    fun cancelledRequesterStopsBeforeRequestTimeout() = runBlocking {
+        val aDir = Files.createTempDirectory("spirit-app-cancel-a")
+        val bDir = Files.createTempDirectory("spirit-app-cancel-b")
+        SpiritNode.open(aDir.toString(), "a", local = true).use { first ->
+            SpiritNode.open(bDir.toString(), "b", local = true).use { second ->
+                val mesh = first.createMesh("group")
+                first.add(mesh, second.pair().ticket)
+                val entered = CountDownLatch(1)
+                val cancelled = CountDownLatch(1)
+                second.registerAppHandler("afm/slow") { call, _ ->
+                    entered.countDown()
+                    while (!call.isCancelled) Thread.sleep(5)
+                    cancelled.countDown()
+                    byteArrayOf()
+                }
+                val request = async { first.appRequest(mesh, second.status().id, "afm/slow", byteArrayOf()) }
+                assertTrue(withContext(Dispatchers.IO) { entered.await(5, TimeUnit.SECONDS) })
+                request.cancel()
+                kotlinx.coroutines.withTimeout(1_000) { request.join() }
+                assertTrue(withContext(Dispatchers.IO) { cancelled.await(5, TimeUnit.SECONDS) })
+            }
+        }
+    }
+}

@@ -12,6 +12,10 @@ import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
 import uniffi.spirit_ffi.FetchListener
+import uniffi.spirit_ffi.AppHandler
+import uniffi.spirit_ffi.AppCall
+import uniffi.spirit_ffi.AppResponseListener
+import uniffi.spirit_ffi.verifyApp as nativeVerifyApp
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CoroutineDispatcher
@@ -58,6 +62,30 @@ internal fun mapError(error: FfiException): MeshNodeException = MeshNodeExceptio
     actualHash = (error as? FfiException.Corrupt)?.actual,
 )
 
+
+fun verifyApp(deviceId: String, domain: String, bytes: ByteArray, signature: String): Boolean =
+    try { nativeVerifyApp(deviceId, domain, bytes, signature) }
+    catch (error: FfiException) { throw mapError(error) }
+
+private fun ffiError(error: MeshNodeException): FfiException = when (error.failure) {
+    MeshFailure.Invalid -> FfiException.Invalid(error.message ?: "invalid")
+    MeshFailure.NodeClosed -> FfiException.NodeClosed()
+    MeshFailure.NodeBusy -> FfiException.NodeBusy()
+    MeshFailure.MeshLimit -> FfiException.MeshLimit()
+    MeshFailure.NotMember -> FfiException.NotMember(error.message ?: "not member")
+    MeshFailure.TicketRejected -> FfiException.TicketRejected("ticket rejected")
+    MeshFailure.Unavailable -> FfiException.Unavailable(error.message ?: "unavailable")
+    MeshFailure.StoreNotConfigured -> FfiException.StoreNotConfigured()
+    MeshFailure.Interrupted -> FfiException.Interrupted()
+    MeshFailure.Corrupt -> FfiException.Corrupt(error.expectedHash ?: "", error.actualHash ?: "")
+    MeshFailure.Timeout -> FfiException.Timeout()
+    MeshFailure.Missing -> FfiException.Missing(error.message ?: "missing")
+    MeshFailure.Destination -> FfiException.Destination(error.message ?: "destination")
+    MeshFailure.SourceRead -> FfiException.SourceRead(error.message ?: "source read")
+    MeshFailure.Io -> FfiException.Io(error.message ?: "io")
+    MeshFailure.Cancelled -> FfiException.Cancelled()
+    MeshFailure.Node -> FfiException.Node(error.message ?: "node")
+}
 
 private const val NODE_LEASE_TIMEOUT_MILLIS = 15_000L
 
@@ -273,6 +301,61 @@ class SpiritNode private constructor(
             handle.get()?.close()
             endCall()
         }
+    }
+
+    override suspend fun registerAppHandler(protocol: String, handler: (AppCallInfo, ByteArray) -> ByteArray) = io {
+        ffi.registerAppHandler(protocol, object : AppHandler {
+            override fun handle(call: AppCall, payload: ByteArray): ByteArray = try {
+                handler(object : AppCallInfo {
+                    override val meshId get() = call.meshId()
+                    override val peer get() = call.peer()
+                    override val protocol get() = call.protocol()
+                    override val remainingMs get() = call.remainingMs().toLong()
+                    override val isCancelled get() = call.isCancelled()
+                }, payload)
+            } catch (error: Exception) {
+                if (error is MeshNodeException) throw ffiError(error)
+                throw FfiException.Node(error.message ?: "app handler failed")
+            } finally { call.close() }
+        })
+    }
+
+    override suspend fun unregisterAppHandler(protocol: String) = io { ffi.unregisterAppHandler(protocol) }
+    override suspend fun appRequest(meshId: String, peer: String, protocol: String, bytes: ByteArray): ByteArray {
+        beginCall()
+        val completion = CompletableDeferred<ByteArray>()
+        val handle = AtomicReference<uniffi.spirit_ffi.FetchHandle?>()
+        try {
+            try {
+                withContext(NonCancellable + dispatcher) {
+                    if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+                    try {
+                        handle.set(ffi.startAppRequest(meshId, peer, protocol, bytes, object : AppResponseListener {
+                            override fun onComplete(bytes: ByteArray?, error: FfiException?) {
+                                if (error != null) completion.completeExceptionally(mapError(error))
+                                else if (bytes != null) completion.complete(bytes)
+                                else completion.completeExceptionally(MeshNodeException(MeshFailure.Node))
+                            }
+                        }))
+                    } catch (error: FfiException) { throw mapError(error) }
+                }
+                coroutineContext.ensureActive()
+                return completion.await()
+            } catch (error: CancellationException) {
+                handle.get()?.cancel()
+                withContext(NonCancellable) { try { completion.await() } catch (_: Exception) { } }
+                throw error
+            }
+        } finally {
+            handle.get()?.close()
+            endCall()
+        }
+    }
+    override suspend fun signApp(domain: String, bytes: ByteArray): String = io { ffi.signApp(domain, bytes) }
+    override fun verifyApp(deviceId: String, domain: String, bytes: ByteArray, signature: String): Boolean =
+        blue.rae.spirit.sdk.verifyApp(deviceId, domain, bytes, signature)
+    override suspend fun diagnostics(): List<Diagnostic> = io {
+        ffi.diagnostics().map { Diagnostic(it.channel, it.mesh, it.peer, it.protocol, it.cause) }
     }
 
     override suspend fun status(): NodeStatus = io {

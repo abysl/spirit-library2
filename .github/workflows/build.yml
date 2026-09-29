@@ -72,7 +72,7 @@ jobs:
         run: ./gradlew prepareNative -ParchiveTarget='${{ matrix.target }}' --console=plain --max-workers=2
       - name: Test mesh, JVM SDK, and app
         working-directory: kmp
-        run: ./gradlew :mesh:jvmTest :sdk:jvmTest :demo:shared:jvmTest --console=plain --max-workers=2
+        run: ./gradlew :mesh:jvmTest :mesh-testing:jvmTest :sdk:jvmTest :demo:shared:jvmTest --console=plain --max-workers=2
       - name: Package desktop app
         working-directory: kmp
         run: ./gradlew :demo:desktopApp:packageDistributionForCurrentOS --console=plain --max-workers=2

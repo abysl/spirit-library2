@@ -25,7 +25,7 @@ use crate::membership::decode_signature;
 
 const APP_SIGNATURE_DOMAIN: &str = "spirit/app-signature/1";
 
-pub(crate) fn validate_app_name(name: &str) -> Result<()> {
+pub fn validate_app_name(name: &str) -> Result<()> {
     ensure!(
         (1..=64).contains(&name.len())
             && name
