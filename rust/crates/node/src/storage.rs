@@ -138,8 +138,12 @@ pub(crate) fn lock(root: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(root.join("node.lock"))?;
-    file.try_lock()
-        .context("node is already running or being modified")?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => crate::NodeError::NodeBusy.into(),
+        std::fs::TryLockError::Error(error) => {
+            anyhow::Error::new(error).context("could not lock node directory")
+        }
+    })?;
     Ok(file)
 }
 

@@ -105,7 +105,7 @@ class PairingSessionTest {
     @Test
     fun `session exposes the mesh identity from status`() = runTest {
         val node = FakeNode(meshName = "personal")
-        node.snapshot = node.snapshot.copy(meshId = "mesh1_example")
+        node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "personal", emptyList())))
         val session = PairingSession({ node }, "personal") { 0L }
         val running = start(session)
 
@@ -249,7 +249,7 @@ class PairingSessionTest {
         val node = FakeNode(meshName = null)
         val session = PairingSession({ node }, "personal") { 0L }
         val running = start(session)
-        node.snapshot = node.snapshot.copy(meshName = "joined")
+        node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "joined", emptyList())))
 
         session.pair("spirit1member")
 
@@ -418,8 +418,9 @@ class PairingSessionTest {
         var snapshot = NodeStatus(
             id = "self",
             name = "self",
-            meshName = meshName,
+            meshes = meshName?.let { listOf(MeshStatus("mesh1_example", it, emptyList())) } ?: emptyList(),
             peers = peerAge?.let { listOf(NodePeer("peer", "peer", false, it, "ignored")) } ?: emptyList(),
+            ticketPending = false,
         )
         var statusFailure: Throwable? = null
         var statusGate: CompletableDeferred<Unit>? = null
@@ -442,19 +443,20 @@ class PairingSessionTest {
             return snapshot
         }
 
-        override suspend fun createMesh(name: String) {
+        override suspend fun createMesh(name: String): String {
             createdMeshes += name
-            snapshot = snapshot.copy(meshName = name)
+            snapshot = snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", name, emptyList())))
+            return "mesh1_example"
         }
 
         override suspend fun pair(): PairingInvitation {
             pairCalls++
-            if (pairFailureWhileEnrolled && snapshot.meshName != null) error("pairing requires an unenrolled device")
+            if (pairFailureWhileEnrolled && snapshot.meshes.isNotEmpty()) error("pairing requires an unenrolled device")
             pairGate?.await()
             return ticket
         }
 
-        override suspend fun add(ticket: String): String {
+        override suspend fun add(meshId: String, ticket: String): String {
             adds += ticket
             addGate?.await()
             addFailure?.let { throw it }
@@ -463,11 +465,11 @@ class PairingSessionTest {
 
         override suspend fun ping(device: String): NodePong = NodePong(device, 0)
 
-        override suspend fun leaveMesh(): LeftMesh {
+        override suspend fun leaveMesh(meshId: String): LeftMesh {
             leaveFailure?.let { throw it }
-            val meshName = checkNotNull(snapshot.meshName)
+            val meshName = snapshot.meshes.single().name
             val remaining = snapshot.peers.size
-            snapshot = snapshot.copy(meshName = null, meshId = null, peers = emptyList())
+            snapshot = snapshot.copy(meshes = emptyList(), peers = emptyList())
             leaves++
             return LeftMesh("mesh1_example", meshName, remaining, notifiedOnLeave ?: remaining)
         }

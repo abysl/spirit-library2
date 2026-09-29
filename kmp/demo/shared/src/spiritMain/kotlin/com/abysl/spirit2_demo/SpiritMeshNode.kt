@@ -20,19 +20,20 @@ private class SpiritMeshNode(private val dir: String, private val nickname: Stri
 
     override suspend fun status(): MeshSnapshot {
         val status = native().status()
-        return MeshSnapshot(status.name, status.meshName, status.peers.map {
+        return MeshSnapshot(status.name, status.meshes.firstOrNull()?.name, status.peers.map {
             MeshPeer(it.id, it.name, it.connected, it.lastReceivedAgoMs, it.lastError)
         })
     }
 
-    override suspend fun createMesh(name: String) = native().createMesh(name)
+    override suspend fun createMesh(name: String) { native().createMesh(name) }
 
     override suspend fun pair(): MeshInvitation {
         val invitation = native().pair()
         return MeshInvitation(invitation.ticket, invitation.width, invitation.modules, invitation.lifetimeSeconds)
     }
 
-    override suspend fun add(ticket: String): String = native().add(ticket)
+    override suspend fun add(ticket: String): String = native().let { it.add(it.status().meshes.singleOrNull()?.id
+        ?: error("Choose a group: this adapter requires exactly one mesh"), ticket) }
 
     override suspend fun ping(id: String): String {
         val pong = native().ping(id)

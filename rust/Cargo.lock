@@ -3016,6 +3016,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "unicode-general-category",
 ]
@@ -3559,7 +3560,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edf78ecfb9bb8d7c4f8da11e8eb2ab6304e8ec0adb3ab32d8fc77c21a5bb0b86"
 dependencies = [
  "anyhow",
+ "camino",
  "cargo_metadata",
+ "clap",
  "uniffi_bindgen",
  "uniffi_core",
  "uniffi_macros",

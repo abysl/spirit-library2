@@ -411,7 +411,8 @@ impl Shared {
             self.endpoint.connect(address, alpn),
         )
         .await
-        .context("connection timed out")??;
+        .map_err(|_| crate::NodeError::Unavailable("connection timed out".into()))?
+        .map_err(|error| crate::NodeError::Unavailable(bounded_diagnostic(&error.to_string())))?;
         let result = tokio::time::timeout(self.config.request_timeout, async {
             let (mut send, mut recv) = connection.open_bi().await?;
             send.write_all(&bytes).await?;
@@ -420,9 +421,11 @@ impl Shared {
             serde_json::from_slice(&response).map_err(|_| anyhow::anyhow!("invalid response"))
         })
         .await
-        .context("request timed out");
+        .map_err(|_| crate::NodeError::Unavailable("request timed out".into()));
         connection.close(0u32.into(), b"done");
-        result?
+        result?.map_err(|error| {
+            crate::NodeError::Unavailable(bounded_diagnostic(&error.to_string())).into()
+        })
     }
 
     pub async fn sync(&self, address: EndpointAddr, mesh_id: MeshId) -> Result<()> {
@@ -1666,7 +1669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creating_first_mesh_and_incoming_enrollment_serialize_on_pending() {
+    async fn creating_mesh_and_incoming_enrollment_serialize_on_pending() {
         let (_a_dir, a) = device("a").await;
         let (_b_dir, b) = device("b").await;
         a.gossip.abort();
@@ -1676,7 +1679,7 @@ mod tests {
         let b = Arc::new(b);
         let pending = b.shared.pending.lock().unwrap();
         let creator = b.clone();
-        let create = tokio::task::spawn_blocking(move || creator.create_first_mesh("local"));
+        let create = tokio::task::spawn_blocking(move || creator.new_mesh("local"));
         std::thread::sleep(Duration::from_millis(40));
         assert!(b.info().meshes.is_empty());
         let a = Arc::new(a);
@@ -1685,10 +1688,25 @@ mod tests {
         drop(pending);
         let created = create.await.unwrap().is_ok();
         let joined = enroll.await.unwrap().is_ok();
-        assert_ne!(created, joined);
+        assert!(created);
+        assert!(!joined);
         assert_eq!(b.info().meshes.len(), 1);
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
+
+        let (_c_dir, c) = device("c").await;
+        let (_d_dir, d) = device("d").await;
+        c.gossip.abort();
+        d.gossip.abort();
+        let remote = c.new_mesh("remote").unwrap();
+        let ticket = d.pair(Duration::from_secs(60)).await.unwrap();
+        c.add(remote, &ticket).await.unwrap();
+        let local = d.new_mesh("local").unwrap();
+        assert_eq!(d.info().meshes.len(), 2);
+        assert!(d.info().meshes.iter().any(|mesh| mesh.id == remote));
+        assert!(d.info().meshes.iter().any(|mesh| mesh.id == local));
+        c.shutdown().await.unwrap();
+        d.shutdown().await.unwrap();
     }
 
     #[tokio::test]

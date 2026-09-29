@@ -7,6 +7,25 @@ mod storage;
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
 pub use mesh_id::MeshId;
+
+#[derive(Debug, thiserror::Error)]
+pub enum NodeError {
+    #[error("device has reached the 64-group limit")]
+    MeshLimit,
+    #[error("device is not a member of this mesh")]
+    NotMember,
+    #[error("{0}")]
+    TicketRejected(String),
+    #[error("node is closed")]
+    NodeClosed,
+    #[error("node directory is in use")]
+    NodeBusy,
+    #[error("invalid input: {0}")]
+    Invalid(String),
+    #[error("network unavailable: {0}")]
+    Unavailable(String),
+}
+
 pub use presence::{PeerStatus, CONNECTED_WINDOW, HEARTBEAT_INTERVAL};
 pub use storage::write_private;
 
@@ -17,6 +36,7 @@ use membership::Mesh;
 use network::{Protocol, Shared, DEPART_ALPN, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use storage::Storage;
@@ -60,7 +80,7 @@ impl NodeInfo {
         if let Some(id) = selected {
             ensure!(
                 self.meshes.iter().any(|mesh| mesh.id == id),
-                "device is not a member of this mesh"
+                NodeError::NotMember
             );
             Ok(id)
         } else {
@@ -181,6 +201,7 @@ pub struct Node {
     shared: Arc<Shared>,
     router: Router,
     gossip: JoinHandle<()>,
+    closed: AtomicBool,
 }
 
 impl Node {
@@ -196,9 +217,10 @@ impl Node {
         let (storage, mut state) = Storage::open(root.as_ref())?;
         ensure!(
             state.meshes.len() < storage::MAX_CURRENT_MESHES,
-            "device has reached the 64-group limit"
+            NodeError::MeshLimit
         );
-        let mesh = Mesh::create(name, state.member.clone(), &storage.key)?;
+        let mesh = Mesh::create(name, state.member.clone(), &storage.key)
+            .map_err(|error| NodeError::Invalid(error.to_string()))?;
         let id = mesh.id;
         state.meshes.insert(id, mesh);
         storage.save(&state)?;
@@ -250,7 +272,12 @@ impl Node {
             shared,
             router,
             gossip,
+            closed: AtomicBool::new(false),
         })
+    }
+
+    pub fn has_pending_ticket(&self) -> bool {
+        self.shared.pending.lock().unwrap().is_some()
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {
@@ -280,48 +307,30 @@ impl Node {
     }
 
     pub fn new_mesh(&self, name: &str) -> Result<MeshId> {
-        let id = self.shared.update(|state| {
+        let mut pending = self.shared.pending.lock().unwrap();
+        let (id, was_unenrolled) = self.shared.update(|state| {
+            let was_unenrolled = state.meshes.is_empty();
             ensure!(
                 state.meshes.len() < storage::MAX_CURRENT_MESHES,
-                "device has reached the 64-group limit"
+                NodeError::MeshLimit
             );
-            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
+            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)
+                .map_err(|error| NodeError::Invalid(error.to_string()))?;
             let id = mesh.id;
             state.meshes.insert(id, mesh);
-            Ok((id, true))
+            Ok(((id, was_unenrolled), true))
         })?;
-        *self.shared.pending.lock().unwrap() = None;
-        Ok(id)
-    }
-
-    pub fn create_first_mesh(&self, name: &str) -> Result<MeshId> {
-        let mut pending = self.shared.pending.lock().unwrap();
-        let id = self.shared.update(|state| {
-            ensure!(
-                state.meshes.is_empty(),
-                "createMesh is single-mesh until S3; this device already belongs to a mesh"
-            );
-            let mesh = Mesh::create(name, state.member.clone(), &self.shared.storage.key)?;
-            let id = mesh.id;
-            state.meshes.insert(id, mesh);
-            Ok((id, true))
-        })?;
-        *pending = None;
+        if was_unenrolled {
+            *pending = None;
+        }
         Ok(id)
     }
 
     pub async fn pair(&self, lifetime: Duration) -> Result<String> {
-        self.pair_inner(lifetime, false).await
-    }
-
-    pub async fn pair_when_unenrolled(&self, lifetime: Duration) -> Result<String> {
-        self.pair_inner(lifetime, true).await
-    }
-
-    async fn pair_inner(&self, lifetime: Duration, unenrolled_only: bool) -> Result<String> {
+        self.ensure_open()?;
         ensure!(
             (1..=3600).contains(&lifetime.as_secs()),
-            "ticket lifetime must be 1–3600 seconds"
+            NodeError::Invalid("ticket lifetime must be 1–3600 seconds".into())
         );
         if !self.shared.config.local {
             tokio::time::timeout(
@@ -329,7 +338,11 @@ impl Node {
                 self.shared.endpoint.online(),
             )
             .await
-            .context("relay is unavailable; use node serve --local for same-machine testing")?;
+            .map_err(|_| {
+                NodeError::Unavailable(
+                    "relay is unavailable; use node serve --local for same-machine testing".into(),
+                )
+            })?;
         }
         let address = self.shared.endpoint.addr();
         #[cfg(test)]
@@ -344,18 +357,12 @@ impl Node {
             expires_at: now()? + lifetime.as_secs(),
         };
         let encoded = ticket.encode()?;
-        let mut pending = self.shared.pending.lock().unwrap();
-        if unenrolled_only {
-            ensure!(
-                self.shared.state.lock().unwrap().meshes.is_empty(),
-                "pair is single-mesh until S3; this device already belongs to a mesh"
-            );
-        }
-        *pending = Some(ticket);
+        *self.shared.pending.lock().unwrap() = Some(ticket);
         Ok(encoded)
     }
 
     pub async fn add(&self, mesh_id: MeshId, ticket: &str) -> Result<Member> {
+        self.ensure_open()?;
         ensure!(
             self.shared
                 .state
@@ -363,12 +370,13 @@ impl Node {
                 .unwrap()
                 .meshes
                 .contains_key(&mesh_id),
-            "device is not a member of this mesh"
+            NodeError::NotMember
         );
-        let ticket = PairingTicket::decode(ticket)?;
+        let ticket = PairingTicket::decode(ticket)
+            .map_err(|error| NodeError::TicketRejected(error.to_string()))?;
         ensure!(
             ticket.address.id != self.info().id,
-            "cannot enroll this device into itself"
+            NodeError::TicketRejected("cannot enroll this device into itself".into())
         );
         let member = Member {
             id: ticket.address.id,
@@ -427,13 +435,14 @@ impl Node {
     }
 
     pub async fn leave(&self, mesh_id: MeshId) -> Result<LeftMesh> {
+        self.ensure_open()?;
         let (departure, peers) = {
             let mut pending = self.shared.pending.lock().unwrap();
             let (departure, peers) = self.shared.update(|state| {
                 let peers: Vec<_> = state
                     .meshes
                     .get(&mesh_id)
-                    .context("device is not a member of this mesh")?
+                    .ok_or(NodeError::NotMember)?
                     .members()
                     .filter(|member| member.id != state.member.id)
                     .map(|member| {
@@ -467,12 +476,13 @@ impl Node {
     }
 
     pub async fn ping(&self, id: NodeId) -> Result<Pong> {
+        self.ensure_open()?;
         let info = self.info();
         let member = info
             .members
             .iter()
             .find(|m| m.id == id)
-            .context("device is not a member of this mesh")?;
+            .ok_or(NodeError::NotMember)?;
         ensure!(id != info.id, "choose another mesh member to ping");
         let elapsed_ms = self.shared.ping(id).await?;
         Ok(Pong {
@@ -482,7 +492,13 @@ impl Node {
         })
     }
 
+    fn ensure_open(&self) -> Result<()> {
+        ensure!(!self.closed.load(Ordering::Acquire), NodeError::NodeClosed);
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
         self.gossip.abort();
         self.router.shutdown().await?;
         Ok(())
@@ -490,13 +506,10 @@ impl Node {
 }
 
 fn joined_after_retry(response: network::EnrollmentReply) -> Result<membership::Snapshot> {
-    ensure!(
-        response.departure.is_none(),
-        "device refused readmission twice; update the introducing device if it runs an older Spirit"
-    );
+    ensure!(response.departure.is_none(), NodeError::TicketRejected("device refused readmission twice; update the introducing device if it runs an older Spirit".into()));
     response
         .joined
-        .map_err(|error| anyhow::anyhow!(network::bounded_diagnostic(&error)))
+        .map_err(|error| NodeError::TicketRejected(network::bounded_diagnostic(&error)).into())
 }
 
 impl Drop for Node {
@@ -508,6 +521,28 @@ impl Drop for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operations_reject_a_closed_node() {
+        let dir = tempfile::tempdir().unwrap();
+        Node::init(dir.path(), "device").unwrap();
+        let node = Node::bind(dir.path(), NodeConfig::local()).await.unwrap();
+        node.shutdown().await.unwrap();
+        assert!(matches!(
+            node.pair(Duration::from_secs(300))
+                .await
+                .unwrap_err()
+                .downcast_ref::<NodeError>(),
+            Some(NodeError::NodeClosed)
+        ));
+        assert!(matches!(
+            node.ping(node.info().id)
+                .await
+                .unwrap_err()
+                .downcast_ref::<NodeError>(),
+            Some(NodeError::NodeClosed)
+        ));
+    }
 
     #[test]
     fn a_second_departure_refusal_is_an_error_not_another_retry() {

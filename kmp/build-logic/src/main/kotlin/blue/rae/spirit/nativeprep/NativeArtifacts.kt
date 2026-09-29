@@ -1,6 +1,8 @@
 package blue.rae.spirit.nativeprep
 
 internal object NativeArtifacts {
+    const val bindgenFeature = "spirit-ffi/bindgen"
+
     private val archiveTargets = setOf("linux-x64", "macos-arm64", "windows-x64")
 
     fun sharedLibraryName(systemName: String): String = when (operatingSystem(systemName)) {

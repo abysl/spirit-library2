@@ -24,12 +24,12 @@ class PairingSessionPublicationTest {
         val clockCallsUntilPublication = AtomicInteger(0)
         val shutdowns = AtomicInteger(0)
         val node = object : MeshNode {
-            override suspend fun status() = NodeStatus("self", "self", null, emptyList())
-            override suspend fun createMesh(name: String) = Unit
+            override suspend fun status() = NodeStatus("self", "self", emptyList(), emptyList(), false)
+            override suspend fun createMesh(name: String) = "mesh1_example"
             override suspend fun pair() = PairingInvitation("spirit1own", 1, byteArrayOf(1), 300)
-            override suspend fun add(ticket: String) = "peer"
+            override suspend fun add(meshId: String, ticket: String) = "peer"
             override suspend fun ping(device: String) = NodePong(device, 0)
-            override suspend fun leaveMesh() = LeftMesh("mesh1_example", "personal", 0, 0)
+            override suspend fun leaveMesh(meshId: String) = LeftMesh("mesh1_example", "personal", 0, 0)
             override suspend fun shutdown() {
                 shutdowns.incrementAndGet()
             }

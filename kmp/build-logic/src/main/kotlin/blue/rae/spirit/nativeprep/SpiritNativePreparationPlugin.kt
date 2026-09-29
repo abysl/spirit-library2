@@ -28,7 +28,7 @@ class SpiritNativePreparationPlugin : Plugin<Project> {
             workingDir = rustDirectory
             commandLine(
                 "cargo", "build", "--locked", "--release",
-                "-p", "spirit-ffi", "-p", "spirit-cli", "--features", "uniffi/cli",
+                "-p", "spirit-ffi", "-p", "spirit-cli", "--features", NativeArtifacts.bindgenFeature,
             )
             inputs.files(project.fileTree(rustDirectory) {
                 exclude("target/**")

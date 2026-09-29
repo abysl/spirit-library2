@@ -87,7 +87,7 @@ class PairingSession(
         if (!beginAction()) return
         try {
             withActiveNode { activeNode ->
-                if (activeNode.status().meshName == null) {
+                if (activeNode.status().meshes.firstOrNull()?.name == null) {
                     offerTicket(activeNode, notice = null)
                 } else {
                     mutableState.update { it.copy(error = null, notice = ENROLLED_TICKET_NOTICE) }
@@ -117,11 +117,14 @@ class PairingSession(
                 }
             }
             withActiveNode { activeNode ->
-                if (activeNode.status().meshName == null) {
-                    activeNode.createMesh(meshName)
-                    tracking.withLock { recordMeshMembership(meshName) }
+                val currentMesh = activeNode.status().meshes.firstOrNull()
+                if (currentMesh != null) mutableState.update { it.copy(meshId = currentMesh.id) }
+                if (currentMesh == null) {
+                    val id = activeNode.createMesh(meshName)
+                    tracking.withLock { recordMeshMembership(meshName)
+                        mutableState.update { it.copy(meshId = id) } }
                 }
-                val addedName = activeNode.add(ticket)
+                val addedName = activeNode.add(checkNotNull(state.value.meshId), ticket)
                 tracking.withLock {
                     ticketExpiresAtMillis = null
                     mutableState.update {
@@ -147,7 +150,7 @@ class PairingSession(
         if (!beginAction()) return
         try {
             withActiveNode { activeNode ->
-                val notice = departureNotice(activeNode.leaveMesh())
+                val notice = departureNotice(activeNode.leaveMesh(checkNotNull(state.value.meshId)))
                 tracking.withLock {
                     peerSamples = emptyList()
                     ticketExpiresAtMillis = null
@@ -283,19 +286,19 @@ class PairingSession(
             .map { PeerSample(it.id, it.name, it.lastReceivedAgoMs, observedAtMillis) }
         return tracking.withLock {
             peerSamples = samples
-            val joinedMesh = recordMeshMembership(snapshot.meshName)
+            val joinedMesh = recordMeshMembership(snapshot.meshes.firstOrNull()?.name)
             mutableState.update {
                 it.copy(
                     loading = false,
                     nodeId = snapshot.id,
                     name = snapshot.name,
-                    meshId = snapshot.meshId,
+                    meshId = snapshot.meshes.firstOrNull()?.id,
                     peers = devicesAt(observedAtMillis, samples),
                     error = if (it.error == POLL_ERROR) null else it.error,
-                    notice = if (joinedMesh) "Joined ${snapshot.meshName}" else it.notice,
+                    notice = if (joinedMesh) "Joined ${snapshot.meshes.firstOrNull()?.name}" else it.notice,
                 )
             }
-            val offer = !offeredInitialTicket && snapshot.meshName == null
+            val offer = !offeredInitialTicket && snapshot.meshes.isEmpty()
             if (offer) offeredInitialTicket = true
             offer
         }

@@ -19,6 +19,11 @@ class NativeArtifactsTest {
     }
 
     @Test
+    fun enablesTheLocalFfiFeatureRequiredByTheBindgenBinary() {
+        assertEquals("spirit-ffi/bindgen", NativeArtifacts.bindgenFeature)
+    }
+
+    @Test
     fun rejectsUnsupportedOperatingSystems() {
         assertFailsWith<IllegalStateException> {
             NativeArtifacts.sharedLibraryName("FreeBSD")
