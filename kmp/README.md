@@ -48,6 +48,12 @@ UniFFI errors map into `MeshNodeException.failure`: `Invalid`, `NodeClosed`, `No
 
 If the receiver is already in 64 groups, the introducer gets `TicketRejected("could not join this mesh")`; the receiver must leave a group before joining another.
 
+### Demo and node directory lifecycle
+
+Android keeps one `MeshSession` in its `AndroidViewModel` across configuration changes. The Kotlin SDK leases each node directory process-wide: `SpiritNode.open` waits for the previous owner to finish shutdown before opening the native lock, even when Android calls the finishing ViewModel’s `onCleared` after a new activity starts. A hung teardown fails the waiting open with typed `NodeBusy` after 15 seconds; an external holder of the native directory lock also reports `NodeBusy`. Desktop cancels and joins its node job before exiting its window. AFM can use `SpiritNode.open` directly without copying a demo handover.
+
+The demo uses `MeshSession` for a group list, group creation, group-scoped ticket paste or QR scan, member presence, leave confirmation, and this device's QR on Android and desktop. Web and iOS have no native node. Desktop uses `~/.spirit2/ktdemo-node` with `SPIRIT_NODE_DIR` and `SPIRIT_NODE_NAME` overrides; `SPIRIT_LOCAL=1` enables loopback. Android calls `AndroidNodeContext.initialize(applicationContext)` before opening a node and stores its identity in non-backed-up app storage. The SDK needs internet and network-state permissions; camera permission belongs to the scanner app. There is no foreground service, so Android can suspend background networking.
+
 ## IntelliJ IDEA
 
 Start IntelliJ from the project devenv so Gradle-run desktop applications inherit the Nix OpenGL runtime libraries:

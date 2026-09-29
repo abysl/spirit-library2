@@ -14,107 +14,82 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.delay
+import blue.rae.spirit.sdk.AddDeviceResult
+import blue.rae.spirit.sdk.MeshSession
+import blue.rae.spirit.sdk.MemberStatus
+import blue.rae.spirit.sdk.PairingInvitation
 import kotlinx.coroutines.launch
 import kotlin.math.floor
 
 @Composable
-fun MeshPanel(node: MeshNode) {
+fun MeshPanel(session: MeshSession) {
+    val snapshot by session.state.collectAsState()
     val scope = rememberCoroutineScope()
-    var snapshot by remember { mutableStateOf<MeshSnapshot?>(null) }
-    var pollError by remember { mutableStateOf<String?>(null) }
-    var actionError by remember { mutableStateOf<String?>(null) }
-    var message by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
-    var meshName by remember { mutableStateOf("personal") }
-    var ticket by remember { mutableStateOf("") }
-    var invitation by remember { mutableStateOf<MeshInvitation?>(null) }
-
-    LaunchedEffect(node) {
-        while (true) {
-            try {
-                val next = node.status()
-                if (snapshot?.meshName == null && next.meshName != null && invitation != null) {
-                    invitation = null
-                    message = "Joined ${next.meshName}"
-                }
-                snapshot = next
-                pollError = null
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { pollError = error.message ?: "Could not read node status" }
-            delay(1000)
-        }
-    }
-
-    fun attempt(block: suspend () -> Unit) {
-        if (busy) return
-        busy = true
-        actionError = null
-        message = null
-        scope.launch {
-            try { block(); snapshot = node.status() }
-            catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { actionError = error.message ?: "Operation failed" }
-            finally { busy = false }
-        }
-    }
-
-    fun enroll(value: String) = attempt {
-        message = "Added ${node.add(value.trim())}"
-        ticket = ""
-    }
+    var groupName by remember { mutableStateOf("") }
+    val tickets = remember { mutableStateMapOf<String, String>() }
+    var selectedGroup by remember { mutableStateOf<String?>(null) }
+    var showQr by remember { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(snapshot?.name ?: "Starting device…", style = MaterialTheme.typography.headlineSmall)
-        Text(snapshot?.meshName?.let { "Mesh: $it" } ?: "This device has not joined a mesh")
-        val ready = snapshot != null && pollError == null && !busy
-        if (snapshot?.meshName == null) {
-            Text("Create a mesh to invite devices, or show your QR code for an existing member to scan.")
-            OutlinedTextField(meshName, { meshName = it }, label = { Text("Mesh name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-            Button(enabled = ready && meshName.isNotBlank(), onClick = { attempt { node.createMesh(meshName.trim()); message = "Mesh created" } }) {
-                Text("Create mesh")
-            }
-        }
+        Text(snapshot.name.ifBlank { "Starting device…" }, style = MaterialTheme.typography.headlineSmall)
+        val ready = !snapshot.loading && !snapshot.busy
+        Text("Groups", style = MaterialTheme.typography.titleLarge)
+        OutlinedTextField(groupName, { groupName = it }, label = { Text("New group name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        Button(enabled = ready && groupName.isNotBlank(), onClick = {
+            scope.launch { if (session.createGroup(groupName) != null) groupName = "" }
+        }) { Text("Create group") }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(enabled = ready && snapshot?.meshName == null, onClick = { attempt { invitation = node.pair() } }) { Text("Show pairing QR") }
-            if (snapshot?.meshName != null) {
-                ScanPairingButton(ready, ::enroll) { actionError = it }
-            }
+            OutlinedButton(enabled = ready && snapshot.invitation != null, onClick = { showQr = true }) { Text("Show my QR") }
+            OutlinedButton(enabled = ready, onClick = { scope.launch { session.refreshTicket() } }) { Text("Refresh QR") }
         }
-        if (snapshot?.meshName != null) {
-            OutlinedTextField(ticket, { ticket = it }, label = { Text("Or paste a pairing ticket") }, maxLines = 3, modifier = Modifier.fillMaxWidth())
-            Button(enabled = ready && ticket.isNotBlank(), onClick = { enroll(ticket) }) { Text("Add device") }
-            HorizontalDivider()
-            Text("Devices", style = MaterialTheme.typography.titleLarge)
-            Text("Heartbeats every 5 seconds. Devices turn red without a valid ping or pong for 60 seconds.", style = MaterialTheme.typography.bodySmall)
-            if (snapshot?.peers.isNullOrEmpty()) { Text("No other devices yet. Scan a device's pairing QR to add it.") }
-            snapshot?.peers?.sortedWith(compareBy<MeshPeer> { it.name }.thenBy { it.id })?.forEach { peer ->
-                key(peer.id) {
-                    PeerRow(peer, ready, pollError != null, snapshot!!.peers.count { it.name == peer.name } > 1) {
-                        attempt { message = node.ping(peer.id) }
+        if (snapshot.groups.isEmpty()) Text("Create a group, or show your QR to a member of another group.")
+        snapshot.groups.forEach { group ->
+            key(group.id) {
+                HorizontalDivider()
+                Text(group.name, style = MaterialTheme.typography.titleLarge)
+                Text(group.id.take(16), style = MaterialTheme.typography.bodySmall)
+                if (group.members.isEmpty()) Text("No members yet")
+                group.members.sortedWith(compareBy<MemberStatus> { it.name.lowercase() }.thenBy { it.id }).forEach { member ->
+                    PeerRow(member, ready && member.id != snapshot.nodeId,
+                        group.members.count { it.name == member.name } > 1) {
+                        scope.launch { session.ping(member.id) }
                     }
                 }
+                OutlinedTextField(tickets[group.id].orEmpty(), { tickets[group.id] = it }, label = { Text("Paste a device ticket") }, maxLines = 3, modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = ready && !tickets[group.id].isNullOrBlank(), onClick = {
+                        scope.launch { if (session.addDevice(group.id, tickets[group.id].orEmpty()) is AddDeviceResult.Added) tickets[group.id] = "" }
+                    }) { Text("Add device") }
+                    ScanPairingButton(ready, { value -> scope.launch { session.addDevice(group.id, value) } }, session::reportError)
+                }
+                OutlinedButton(enabled = ready, onClick = { selectedGroup = group.id }) { Text("Leave group") }
             }
         }
-        if (busy) { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
-        message?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
-        (actionError ?: pollError)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        if (snapshot.busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        snapshot.notice?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
+        snapshot.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
-    invitation?.let { code -> PairingDialog(code) { invitation = null } }
+    selectedGroup?.let { id ->
+        AlertDialog(onDismissRequest = { selectedGroup = null }, title = { Text("Leave group?") },
+            text = { Text("This device will leave the selected group. Other members may learn about the departure when they reconnect.") },
+            confirmButton = { TextButton(onClick = { selectedGroup = null; scope.launch { session.leaveGroup(id) } }) { Text("Leave") } },
+            dismissButton = { TextButton(onClick = { selectedGroup = null }) { Text("Cancel") } })
+    }
+    if (showQr) snapshot.invitation?.let { invitation ->
+        PairingDialog(invitation, snapshot.invitationSecondsRemaining) { showQr = false }
+    }
 }
 
 @Composable
-private fun PeerRow(peer: MeshPeer, enabled: Boolean, statusUnavailable: Boolean, duplicateName: Boolean, ping: () -> Unit) {
-    val connected = peer.connected && !statusUnavailable
+private fun PeerRow(member: MemberStatus, enabled: Boolean, duplicateName: Boolean, ping: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(12.dp).background(if (connected) Color(0xFF218A45) else Color(0xFFC63737), CircleShape)
-                .semantics { contentDescription = if (connected) "Connected" else "Disconnected" })
+            Box(Modifier.size(12.dp).background(if (member.online) Color(0xFF218A45) else Color(0xFFC63737), CircleShape)
+                .semantics { contentDescription = if (member.online) "Online" else "Offline" })
             Column(Modifier.weight(1f)) {
-                Text(peer.name, style = MaterialTheme.typography.titleMedium)
-                if (duplicateName) Text(peer.id.take(12), style = MaterialTheme.typography.bodySmall)
-                Text(if (statusUnavailable) "Disconnected · status unavailable" else peer.connectionLabel(), style = MaterialTheme.typography.bodySmall)
+                Text(member.name, style = MaterialTheme.typography.titleMedium)
+                if (duplicateName) Text(member.id.take(12), style = MaterialTheme.typography.bodySmall)
+                Text(if (member.online) "Online" else "Offline", style = MaterialTheme.typography.bodySmall)
             }
             OutlinedButton(onClick = ping, enabled = enabled) { Text("Ping") }
         }
@@ -122,15 +97,13 @@ private fun PeerRow(peer: MeshPeer, enabled: Boolean, statusUnavailable: Boolean
 }
 
 @Composable
-private fun PairingDialog(code: MeshInvitation, dismiss: () -> Unit) {
-    var remaining by remember(code) { mutableIntStateOf(code.lifetimeSeconds) }
-    LaunchedEffect(code) { while (remaining > 0) { delay(1000); remaining-- } }
+private fun PairingDialog(code: PairingInvitation, remaining: Int, dismiss: () -> Unit) {
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text("Pair this device") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Scan from a device already in your mesh. This code can be used once.")
+                Text("A member chooses which group to add this device to. This code can be used once.")
                 if (remaining > 0) {
                     Canvas(Modifier.fillMaxWidth().aspectRatio(1f).background(Color.White)) {
                         val unit = floor(size.minDimension / (code.width + 8))
