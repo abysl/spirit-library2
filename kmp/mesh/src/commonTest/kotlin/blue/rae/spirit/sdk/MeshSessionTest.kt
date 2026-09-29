@@ -16,12 +16,12 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class PairingSessionTest {
+class MeshSessionTest {
     @Test
     fun `presence ages through poll failures at the sixty second boundary`() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = 0)
-        val session = PairingSession({ node }, "personal") { now }
+        val session = MeshSession({ node }) { now }
         val running = start(session)
 
         node.statusFailure = IllegalStateException()
@@ -44,7 +44,7 @@ class PairingSessionTest {
     fun `presence ages while a native poll is stalled`() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = 0)
-        val session = PairingSession({ node }, "personal") { now }
+        val session = MeshSession({ node }) { now }
         val running = start(session)
 
         node.statusGate = CompletableDeferred()
@@ -63,16 +63,16 @@ class PairingSessionTest {
     fun `ticket expires conservatively and rejects malformed and own values`() = runTest {
         var now = 0L
         val node = FakeNode(ticketLifetimeSeconds = 5)
-        val session = PairingSession({ node }, "personal") { now }
+        val session = MeshSession({ node }) { now }
         val running = start(session)
         val offered = session.state.value.invitation
 
         assertTrue(offered != null)
         assertEquals(5, session.state.value.invitationSecondsRemaining)
-        session.pair("not-a-ticket")
+        session.addDevice("mesh1_example", "not-a-ticket")
         assertEquals("Enter a valid pairing ticket", session.state.value.error)
         assertEquals(0, node.adds.size)
-        session.pair(offered.ticket)
+        session.addDevice("mesh1_example", offered.ticket)
         assertEquals("This pairing ticket belongs to this device", session.state.value.error)
         assertEquals(0, node.adds.size)
 
@@ -86,19 +86,19 @@ class PairingSessionTest {
     }
 
     @Test
-    fun `first scan creates a mesh and later scans reuse it`() = runTest {
-        val node = FakeNode(meshName = null)
-        val session = PairingSession({ node }, "personal") { 0L }
+    fun `scanningNeedsAChosenGroupAndNeverCreatesOne`() = runTest {
+        val node = FakeNode()
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
-
-        session.pair(" spirit1first ")
-        session.pair("spirit1second")
-
+        session.addDevice("mesh1_example", "spirit1first")
+        assertTrue(node.adds.isEmpty())
+        assertTrue(node.createdMeshes.isEmpty())
+        session.createGroup("personal")
+        session.addDevice("mesh1_example", " spirit1first ")
         assertEquals(listOf("personal"), node.createdMeshes)
-        assertEquals(listOf("spirit1first", "spirit1second"), node.adds)
-        assertNull(session.state.value.invitation)
-        assertEquals("personal", session.state.value.meshName)
-
+        assertEquals(listOf("spirit1first"), node.adds)
+        assertEquals("personal", session.state.value.groups.single().name)
+        assertTrue(session.state.value.invitation != null)
         running.cancelAndJoin()
     }
 
@@ -106,57 +106,43 @@ class PairingSessionTest {
     fun `session exposes the mesh identity from status`() = runTest {
         val node = FakeNode(meshName = "personal")
         node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "personal", emptyList())))
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
 
-        assertEquals("mesh1_example", session.state.value.meshId)
+        assertEquals("mesh1_example", session.state.value.groups.firstOrNull()?.id)
         assertEquals("self", session.state.value.nodeId)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `failed first scan withdraws the receiver ticket once the mesh exists`() = runTest {
-        var now = 0L
-        val node = FakeNode(meshName = null)
-        node.addFailure = IllegalStateException("pairing ticket has expired")
-        val session = PairingSession({ node }, "personal") { now }
+    fun `failedAdmissionLeavesGroupAndTicketAvailable`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        node.addFailure = IllegalStateException("spirit1secret")
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
-        assertTrue(session.state.value.invitation != null)
-
-        session.pair("spirit1expired")
-
-        assertEquals(listOf("personal"), node.createdMeshes)
-        assertEquals("personal", session.state.value.meshName)
-        assertNull(session.state.value.invitation)
-        assertEquals(0, session.state.value.invitationSecondsRemaining)
+        session.addDevice("mesh1_example", "spirit1secret")
         assertEquals("Could not add device", session.state.value.error)
-
-        now = 1_000
-        advanceTimeBy(1_000)
-        runCurrent()
-        assertNull(session.state.value.invitation)
-        assertEquals(0, session.state.value.invitationSecondsRemaining)
-
+        assertTrue(session.state.value.invitation != null)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `a concurrent action is rejected while another is busy and cancellation still closes the node`() = runTest {
+    fun `busy actions are queued while another is busy and cancellation still closes the node`() = runTest {
         val node = FakeNode(meshName = "personal")
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
         val gate = CompletableDeferred<Unit>()
         node.addGate = gate
 
-        val first = backgroundScope.async { session.pair("spirit1first") }
-        val second = backgroundScope.async { session.pair("spirit1second") }
+        val first = backgroundScope.async { session.addDevice("mesh1_example", "spirit1first") }
+        val second = backgroundScope.async { session.addDevice("mesh1_example", "spirit1second") }
         runCurrent()
         assertEquals(listOf("spirit1first"), node.adds)
 
         first.cancel()
         gate.complete(Unit)
         runCurrent()
-        assertEquals(listOf("spirit1first"), node.adds)
+        assertEquals(listOf("spirit1first", "spirit1second"), node.adds)
 
         running.cancelAndJoin()
         assertTrue(session.state.value.peers.isEmpty())
@@ -167,7 +153,7 @@ class PairingSessionTest {
     @Test
     fun `run cancellation clears a ticket completed before shutdown`() = runTest {
         val node = FakeNode(meshName = null)
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
         val pairGate = CompletableDeferred<Unit>()
         node.pairGate = pairGate
@@ -189,11 +175,11 @@ class PairingSessionTest {
     @Test
     fun `caller cancellation still reconciles a completed native enrollment`() = runTest {
         val node = FakeNode(meshName = "personal")
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
         val addGate = CompletableDeferred<Unit>()
         node.addGate = addGate
-        val enrollment = backgroundScope.async { session.pair("spirit1member") }
+        val enrollment = backgroundScope.async { session.addDevice("mesh1_example", "spirit1member") }
         runCurrent()
 
         enrollment.cancel()
@@ -201,7 +187,7 @@ class PairingSessionTest {
         enrollment.join()
 
         assertFalse(session.state.value.busy)
-        assertNull(session.state.value.invitation)
+        assertTrue(session.state.value.invitation != null)
         assertEquals("Added spirit1member", session.state.value.notice)
         running.cancelAndJoin()
     }
@@ -210,7 +196,7 @@ class PairingSessionTest {
     fun `cancelled opening is cleaned up after the factory returns`() = runTest {
         val opened = CompletableDeferred<MeshNode>()
         val node = FakeNode()
-        val session = PairingSession({ opened.await() }, "personal") { 0L }
+        val session = MeshSession({ opened.await() }) { 0L }
         val running = backgroundScope.launch { session.run() }
         runCurrent()
 
@@ -223,7 +209,7 @@ class PairingSessionTest {
 
     @Test
     fun `open failure becomes reusable state without leaking a node`() = runTest {
-        val session = PairingSession({ throw IllegalStateException() }, "personal") { 0L }
+        val session = MeshSession({ throw IllegalStateException() }) { 0L }
 
         session.run()
         assertFalse(session.state.value.loading)
@@ -233,7 +219,7 @@ class PairingSessionTest {
     @Test
     fun `scanner errors survive successful polls until the next action`() = runTest {
         val node = FakeNode(meshName = "personal")
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
 
         session.reportError("Camera permission denied")
@@ -245,30 +231,16 @@ class PairingSessionTest {
     }
 
     @Test
-    fun `pair reads mesh membership while holding the native operation lock`() = runTest {
-        val node = FakeNode(meshName = null)
-        val session = PairingSession({ node }, "personal") { 0L }
-        val running = start(session)
-        node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "joined", emptyList())))
-
-        session.pair("spirit1member")
-
-        assertTrue(node.createdMeshes.isEmpty())
-        assertEquals(listOf("spirit1member"), node.adds)
-        running.cancelAndJoin()
-    }
-
-    @Test
     fun `cancelled queued action does not reach the native node`() = runTest {
         val node = FakeNode(meshName = "personal")
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
         val pollGate = CompletableDeferred<Unit>()
         node.statusGate = pollGate
         advanceTimeBy(1_000)
         runCurrent()
 
-        val action = backgroundScope.async { session.pair("spirit1cancelled") }
+        val action = backgroundScope.async { session.addDevice("mesh1_example", "spirit1cancelled") }
         runCurrent()
         action.cancel()
         pollGate.complete(Unit)
@@ -282,7 +254,7 @@ class PairingSessionTest {
     fun `invalid or overflowing received ages are offline`() = runTest {
         var now = 0L
         val node = FakeNode(peerAge = -1)
-        val session = PairingSession({ node }, "personal") { now }
+        val session = MeshSession({ node }) { now }
         val running = start(session)
 
         assertFalse(session.state.value.peers.single().online)
@@ -297,120 +269,151 @@ class PairingSessionTest {
     }
 
     @Test
-    fun `leaving clears membership offers a fresh ticket and a later scan founds a new mesh`() = runTest {
+    fun `groupListAddAndLeaveOnlyTheSelectedGroup`() = runTest {
         val node = FakeNode(meshName = "personal", peerAge = 0)
-        val session = PairingSession({ node }, "personal") { 0L }
+        node.snapshot = node.snapshot.copy(meshes = listOf(
+            MeshStatus("mesh1_example", "personal", listOf(MeshMember("self", "self", 0), MeshMember("peer", "peer", 1))),
+            MeshStatus("mesh1_second", "other", listOf(MeshMember("self", "self", 0))),
+        ))
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
-        session.pair("spirit1member")
-        assertNull(session.state.value.invitation)
-
-        session.leaveMesh()
-
-        assertEquals(1, node.leaves)
-        assertNull(session.state.value.meshName)
-        assertNull(session.state.value.meshId)
-        assertTrue(session.state.value.peers.isEmpty())
-        assertTrue(session.state.value.invitation != null)
+        assertEquals(listOf("other", "personal"), session.state.value.groups.map { it.name })
+        assertTrue(session.state.value.groups.single { it.id == "mesh1_example" }.members.single { it.id == "peer" }.online)
+        assertEquals(1L, session.state.value.groups.single { it.id == "mesh1_example" }.members.single { it.id == "peer" }.generation)
+        session.addDevice("mesh1_second", "spirit1member")
+        assertEquals(listOf("mesh1_second"), node.addedTo)
+        session.leaveGroup("mesh1_example")
+        assertEquals(listOf("mesh1_second"), session.state.value.groups.map { it.id })
         assertEquals("Left personal and notified its other devices", session.state.value.notice)
         advanceTimeBy(1_000)
         runCurrent()
-        assertNull(session.state.value.meshName)
+        assertEquals(listOf("mesh1_second"), session.state.value.groups.map { it.id })
         assertEquals("Left personal and notified its other devices", session.state.value.notice)
-
-        session.pair("spirit1next")
-        assertEquals(listOf("personal"), node.createdMeshes)
-        assertEquals("personal", session.state.value.meshName)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `leaving reports devices that were not notified`() = runTest {
-        val node = FakeNode(meshName = "personal", peerAge = 0)
-        node.notifiedOnLeave = 0
-        val session = PairingSession({ node }, "personal") { 0L }
-        val running = start(session)
-
-        session.leaveMesh()
-
-        assertEquals(
-            "Left personal. Notified 0 of 1 device; the rest can also learn it when they next reach this device",
-            session.state.value.notice,
-        )
-        running.cancelAndJoin()
-    }
-
-    @Test
-    fun `leaving reports partial notification to multiple devices`() = runTest {
-        val node = FakeNode(meshName = "personal", peerAge = 0)
-        node.snapshot = node.snapshot.copy(peers = listOf(
-            NodePeer("first", "first", false, 0, null),
-            NodePeer("second", "second", false, 0, null),
-        ))
-        node.notifiedOnLeave = 1
-        val session = PairingSession({ node }, "personal") { 0L }
-        val running = start(session)
-
-        session.leaveMesh()
-
-        assertEquals(
-            "Left personal. Notified 1 of 2 devices; notified devices relay the departure; the rest can also learn it when they next reach this device",
-            session.state.value.notice,
-        )
-        running.cancelAndJoin()
-    }
-
-    @Test
-    fun `cancelling a suspending node ticket refresh after leave does not hold up teardown`() = runTest {
+    fun `additionalGroupKeepsTheEnrolledDevicesInvitation`() = runTest {
         val node = FakeNode(meshName = "personal")
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
-        node.pairGate = CompletableDeferred()
-        val leaving = backgroundScope.launch { session.leaveMesh() }
+        val offered = session.state.value.invitation
+        session.createGroup("second")
+        assertEquals(listOf("personal", "second"), session.state.value.groups.map { it.name })
+        assertEquals(offered, session.state.value.invitation)
+        assertEquals(1, node.pairCalls)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `groupMemberPresenceAgesDuringFailedPolls`() = runTest {
+        var now = 0L
+        val node = FakeNode(meshName = "personal", peerAge = 0)
+        node.snapshot = node.snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", "personal", listOf(MeshMember("peer", "peer", 2)))))
+        val session = MeshSession({ node }) { now }
+        val running = start(session)
+        assertTrue(session.state.value.groups.single().members.single().online)
+        node.statusFailure = IllegalStateException()
+        now = 60_000
+        advanceTimeBy(1_000)
         runCurrent()
-        assertEquals(1, node.leaves)
-        assertNull(session.state.value.meshName)
-        leaving.cancelAndJoin()
-        running.cancelAndJoin()
-        assertEquals(1, node.shutdowns)
-    }
-
-    @Test
-    fun `a failed leave keeps the membership and reports an error`() = runTest {
-        val node = FakeNode(meshName = "personal", peerAge = 0)
-        node.leaveFailure = IllegalStateException("device is not a mesh member")
-        val session = PairingSession({ node }, "personal") { 0L }
-        val running = start(session)
-
-        session.leaveMesh()
-
-        assertEquals("Could not leave mesh", session.state.value.error)
-        assertEquals("personal", session.state.value.meshName)
-        assertEquals(1, session.state.value.peers.size)
-        assertFalse(session.state.value.busy)
+        assertFalse(session.state.value.groups.single().members.single().online)
         running.cancelAndJoin()
     }
 
     @Test
-    fun `enrolled device does not retry a refused pairing ticket and may still add a device`() = runTest {
+    fun `enrolledDevicesRefreshTicketsAndRemoteEnrollmentConsumesThem`() = runTest {
         val node = FakeNode(meshName = "personal")
-        node.pairFailureWhileEnrolled = true
-        val session = PairingSession({ node }, "personal") { 0L }
+        val session = MeshSession({ node }) { 0L }
         val running = start(session)
-        repeat(5) { advanceTimeBy(1_000); runCurrent() }
-        assertEquals(0, node.pairCalls)
-        assertNull(session.state.value.error)
+        assertTrue(session.state.value.invitation != null)
         session.refreshTicket()
-        assertEquals(0, node.pairCalls)
-        assertEquals("Pairing QR is available only before joining a mesh", session.state.value.notice)
-        session.pair("spirit1member")
-        assertEquals(listOf("spirit1member"), node.adds)
+        assertEquals(2, node.pairCalls)
+        node.snapshot = node.snapshot.copy(meshes = node.snapshot.meshes + MeshStatus("mesh1_joined", "joined", emptyList()), ticketPending = false)
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertTrue(session.state.value.invitation != null)
+        assertEquals(3, node.pairCalls)
+        assertEquals(listOf("joined", "personal"), session.state.value.groups.map { it.name })
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `errorsCannotContainTickets`() = runTest {
+        val node = FakeNode(meshName = "personal")
+        val session = MeshSession({ node }) { 0L }
+        val running = start(session)
+        session.reportError("camera read spirit1secret")
+        assertEquals("Operation failed", session.state.value.error)
+        node.addFailure = IllegalStateException("spirit1secret")
+        session.addDevice("mesh1_example", "spirit1secret")
+        assertEquals("Could not add device", session.state.value.error)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `successful admission survives a failed status refresh`() = runTest {
+        val node = FakeNode(meshName = "home")
+        val session = MeshSession({ node }) { 0L }
+        val running = start(session)
+        node.statusFailureAfterAdd = IllegalStateException("poll failed")
+        assertEquals(AddDeviceResult.Added("spirit1other"), session.addDevice("mesh1_example", "spirit1other"))
+        assertEquals("Added spirit1other", session.state.value.notice)
         assertNull(session.state.value.error)
         running.cancelAndJoin()
     }
 
-    private fun TestScope.start(session: PairingSession) = backgroundScope.launch { session.run() }.also { runCurrent() }
+    @Test
+    fun `add failures expose typed recovery category`() = runTest {
+        val node = FakeNode(meshName = "home")
+        val session = MeshSession({ node }) { 0L }
+        val running = start(session)
+        for (category in listOf(MeshFailure.TicketRejected, MeshFailure.Unavailable, MeshFailure.MeshLimit)) {
+            node.adds.clear()
+            node.addFailure = MeshNodeException(category)
+            assertEquals(AddDeviceResult.Failed(category), session.addDevice("mesh1_example", "spirit1other"))
+            assertEquals(category, session.state.value.failure)
+        }
+        session.clearMessages()
+        assertNull(session.state.value.failure)
+        assertNull(session.state.value.error)
+        assertNull(session.state.value.notice)
+        running.cancelAndJoin()
+    }
 
-    private class FakeNode(
+    @Test
+    fun `same group readmission consumes the ticket without changing membership`() = runTest {
+        val node = FakeNode(meshName = "home")
+        val session = MeshSession({ node }) { 0L }
+        val running = start(session)
+        val previous = session.state.value.invitation
+        node.snapshot = node.snapshot.copy(ticketPending = false)
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertEquals(listOf("home"), session.state.value.groups.map { it.name })
+        assertEquals(2, node.pairCalls)
+        assertEquals(previous, session.state.value.invitation)
+        running.cancelAndJoin()
+    }
+
+    @Test
+    fun `group creation and departure return stable identities and counts`() = runTest {
+        val node = FakeNode()
+        val session = MeshSession({ node }) { 0L }
+        val running = start(session)
+        val first = session.createGroup("same")
+        val second = session.createGroup("same")
+        assertEquals(listOf("mesh1_example", "mesh1_2"), listOf(first, second))
+        val left = session.leaveGroup(first!!)
+        assertEquals(first, left?.meshId)
+        assertEquals(0, left?.remainingMembers)
+        assertEquals(0, left?.notifiedMembers)
+        running.cancelAndJoin()
+    }
+
+    private fun TestScope.start(session: MeshSession) = backgroundScope.launch { session.run() }.also { runCurrent() }
+
+    internal class FakeNode(
         meshName: String? = null,
         private val peerAge: Long? = null,
         ticketLifetimeSeconds: Int = 300,
@@ -423,55 +426,63 @@ class PairingSessionTest {
             ticketPending = false,
         )
         var statusFailure: Throwable? = null
+        var statusFailureAfterAdd: Throwable? = null
         var statusGate: CompletableDeferred<Unit>? = null
         var pairGate: CompletableDeferred<Unit>? = null
+        var pairFailure: Throwable? = null
         var addGate: CompletableDeferred<Unit>? = null
         var addFailure: Throwable? = null
         var leaveFailure: Throwable? = null
         var notifiedOnLeave: Int? = null
         var leaves = 0
         var pairCalls = 0
-        var pairFailureWhileEnrolled = false
         var shutdowns = 0
         val createdMeshes = mutableListOf<String>()
         val adds = mutableListOf<String>()
+        val addedTo = mutableListOf<String>()
         private val ticket = PairingInvitation("spirit1own", 1, byteArrayOf(1), ticketLifetimeSeconds)
 
         override suspend fun status(): NodeStatus {
             statusGate?.await()
             statusFailure?.let { throw it }
+            if (adds.isNotEmpty()) statusFailureAfterAdd?.let { throw it }
             return snapshot
         }
 
         override suspend fun createMesh(name: String): String {
             createdMeshes += name
-            snapshot = snapshot.copy(meshes = listOf(MeshStatus("mesh1_example", name, emptyList())))
-            return "mesh1_example"
+            val id = if (snapshot.meshes.isEmpty()) "mesh1_example" else "mesh1_" + createdMeshes.size
+            snapshot = snapshot.copy(meshes = snapshot.meshes + MeshStatus(id, name, emptyList()), ticketPending = if (snapshot.meshes.isEmpty()) false else snapshot.ticketPending)
+            return id
         }
 
         override suspend fun pair(): PairingInvitation {
             pairCalls++
-            if (pairFailureWhileEnrolled && snapshot.meshes.isNotEmpty()) error("pairing requires an unenrolled device")
             pairGate?.await()
+            pairFailure?.let { throw it }
+            snapshot = snapshot.copy(ticketPending = true)
             return ticket
         }
 
         override suspend fun add(meshId: String, ticket: String): String {
             adds += ticket
+            addedTo += meshId
             addGate?.await()
             addFailure?.let { throw it }
             return ticket
         }
 
-        override suspend fun ping(device: String): NodePong = NodePong(device, 0)
+        override suspend fun ping(device: String): NodePong {
+            return NodePong(device, 0)
+        }
 
         override suspend fun leaveMesh(meshId: String): LeftMesh {
             leaveFailure?.let { throw it }
-            val meshName = snapshot.meshes.single().name
+            val meshName = snapshot.meshes.single { it.id == meshId }.name
             val remaining = snapshot.peers.size
-            snapshot = snapshot.copy(meshes = emptyList(), peers = emptyList())
+            snapshot = snapshot.copy(meshes = snapshot.meshes.filterNot { it.id == meshId }, peers = emptyList(), ticketPending = false)
             leaves++
-            return LeftMesh("mesh1_example", meshName, remaining, notifiedOnLeave ?: remaining)
+            return LeftMesh(meshId, meshName, remaining, notifiedOnLeave ?: remaining)
         }
 
         override suspend fun shutdown() {

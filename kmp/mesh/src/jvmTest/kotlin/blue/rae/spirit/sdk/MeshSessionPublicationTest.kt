@@ -16,7 +16,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class PairingSessionPublicationTest {
+class MeshSessionPublicationTest {
     @Test
     fun shutdownWaitsForTicketPublication() = runTest {
         val publishing = CountDownLatch(1)
@@ -34,7 +34,7 @@ class PairingSessionPublicationTest {
                 shutdowns.incrementAndGet()
             }
         }
-        val session = PairingSession({ node }, "personal") {
+        val session = MeshSession({ node }) {
             if (clockCallsUntilPublication.getAndDecrement() == 1) {
                 publishing.countDown()
                 check(releasePublication.await(10, TimeUnit.SECONDS))
