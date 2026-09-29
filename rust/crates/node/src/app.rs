@@ -446,7 +446,8 @@ impl ProtocolHandler for AppProtocol {
 #[cfg(test)]
 mod channel_tests {
     use super::*;
-    use crate::{Node, NodeConfig};
+    use crate::{Member, Node, NodeConfig};
+    use iroh::SecretKey;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     async fn device(name: &str) -> (tempfile::TempDir, Node) {
@@ -721,5 +722,88 @@ mod channel_tests {
         fn handle(&self, _: AppCallContext, _: Vec<u8>) -> Result<Vec<u8>> {
             panic!("private panic details")
         }
+    }
+    #[tokio::test]
+    async fn outsider_flood_closes_promptly_without_evicting_member_log() {
+        let (_ad, a) = device("a").await;
+        let (_bd, b) = device("b").await;
+        let (_od, outsider) = device("outsider").await;
+        let mesh = b.new_mesh("mesh").unwrap();
+        join(&b, mesh, &a).await;
+        assert_refused(&a, &b, &request(mesh)).await;
+        let mut connections = Vec::new();
+        for _ in 0..96 {
+            connections.push(
+                outsider
+                    .shared
+                    .endpoint
+                    .connect(b.shared.endpoint.addr(), APP_ALPN)
+                    .await
+                    .unwrap(),
+            );
+        }
+        for connection in connections {
+            tokio::time::timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .unwrap();
+        }
+        assert_eq!(b.diagnostics()[0].peer, a.info().id);
+        for node in [&a, &b, &outsider] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn diagnostics_are_local_bounded_and_sanitized() {
+        let state = DiagnosticLog::default();
+        let peer = SecretKey::generate().public();
+        for index in 0..33 {
+            state.record(
+                "spirit/blob/1",
+                None,
+                peer,
+                None,
+                &format!("{index}:{}\u{202e}\n", "x".repeat(300)),
+            );
+        }
+        let entries = state.entries();
+        assert_eq!(entries.len(), DIAGNOSTICS_LIMIT);
+        assert!(entries[0].cause.starts_with("1:"));
+        assert!(entries.iter().all(|item| item.channel == "spirit/blob/1"
+            && item.cause.len() <= 256
+            && !item.cause.contains('\u{202e}')
+            && !item.cause.contains('\n')));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn app_membership_refusal_timing_at_256_admissions() {
+        let (_dir, node) = device("root").await;
+        let id = node.new_mesh("mesh").unwrap();
+        node.shared
+            .update(|state| {
+                let mesh = state.meshes.get_mut(&id).unwrap();
+                for index in 1..256 {
+                    mesh.admit(
+                        Member {
+                            id: SecretKey::generate().public(),
+                            name: index.to_string(),
+                        },
+                        &node.shared.storage.key,
+                    )?;
+                }
+                Ok(((), true))
+            })
+            .unwrap();
+        let outsider = SecretKey::generate().public();
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            std::hint::black_box(node.shared.both_current_members(id, outsider));
+        }
+        println!(
+            "known mesh outsider: {:.1} ns/call",
+            start.elapsed().as_nanos() as f64 / 100_000.0
+        );
+        node.shutdown().await.unwrap();
     }
 }
