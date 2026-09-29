@@ -15,9 +15,8 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        env = "SPIRIT_STORE",
         value_name = "DIR",
-        help = "store directory [default: ~/.spirit2/store]"
+        help = "blob store [default: ~/.spirit2/store; env: SPIRIT_STORE]; node serve opens only when --store is explicit"
     )]
     pub store: Option<PathBuf>,
 
@@ -68,10 +67,11 @@ pub enum BlobCommand {
 }
 
 pub fn store_dir(flag: Option<PathBuf>) -> PathBuf {
-    flag.unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").expect("HOME is not set");
-        PathBuf::from(home).join(".spirit2/store")
-    })
+    flag.or_else(|| std::env::var_os("SPIRIT_STORE").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").expect("HOME is not set");
+            PathBuf::from(home).join(".spirit2/store")
+        })
 }
 
 pub fn run(

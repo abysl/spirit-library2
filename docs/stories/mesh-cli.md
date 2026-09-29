@@ -22,7 +22,12 @@ spirit node serve
 
 The nickname defaults to the hostname. Use `spirit node init --name desktop` to choose one when initializing. Re-running initialization preserves the existing identity and nickname.
 
-The service runs in the foreground. Keep it running and execute other commands in another terminal. Stop it with Ctrl-C.
+The service runs in the foreground. Keep it running and execute other commands
+in another terminal. Stop it with Ctrl-C. `node serve` opens no blob store unless
+`--store <dir>` is given explicitly. With separate `--node-dir` values, two
+nodes can serve on one host without competing for the default store lock.
+A serving node with `--store` owns that store exclusively; `blob` commands
+targeting the same store fail until the serving node stops.
 
 ## Enroll another device
 
@@ -167,7 +172,11 @@ If enrollment loses its final acknowledgment, check `mesh members`: the admitted
 
 `rust/crates/cli/tests/node.rs` runs separate CLI services, exercises hostname defaults, terminal/SVG QR generation, nickname resolution, duplicate names, crash recovery, and communication with the introducer offline. `rust/crates/node/tests/mesh.rs` covers persistent identities, enrollment, transitive admission, restart, and ticket behavior. Library tests also send unauthorized requests directly over iroh and verify signed admission rejection.
 
-Blob storage commands continue to use their existing store. The CLI suite also leaves and rejoins a mesh while serving and leaves while stopped. Blob transfer, removing another device, and admission restrictions are future stories.
+Blob storage commands continue to use their existing store. A serving node
+only opens a store when `--store` is explicit; `blob` commands against that
+store fail while it serves. For now, `node serve --store` only takes ownership; it does not provide blob CLI share or fetch commands. The CLI suite also leaves and rejoins a mesh while
+serving and leaves while stopped. Removing another device and admission
+restrictions and blob transfer through the CLI are future stories.
 
 See [the node design](../../wiki/design/nodes.md) for the trust model and protocol.
 

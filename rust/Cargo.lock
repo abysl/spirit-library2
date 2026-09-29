@@ -3015,6 +3015,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "spirit-core",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",

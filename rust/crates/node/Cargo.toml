@@ -12,6 +12,7 @@ iroh.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+spirit-core.workspace = true
 subtle.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

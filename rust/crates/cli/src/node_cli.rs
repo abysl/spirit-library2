@@ -79,7 +79,7 @@ pub fn directory(flag: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-pub async fn node(command: NodeCommand, root: PathBuf) -> Result<()> {
+pub async fn node(command: NodeCommand, root: PathBuf, store: Option<PathBuf>) -> Result<()> {
     match command {
         NodeCommand::Init { name } => {
             let name = match name {
@@ -92,7 +92,7 @@ pub async fn node(command: NodeCommand, root: PathBuf) -> Result<()> {
             println!("Initialized {}.", info.name);
         }
         NodeCommand::Id => println!("{}", Node::read_info(&root)?.id),
-        NodeCommand::Serve { local } => control::serve(root, local).await?,
+        NodeCommand::Serve { local } => control::serve(root, local, store).await?,
         NodeCommand::Pair {
             ttl_seconds,
             no_qr,
