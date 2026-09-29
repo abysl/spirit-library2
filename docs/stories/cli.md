@@ -63,7 +63,8 @@ Rules the story pins down:
   `blob <hash> is corrupt (hashes to <other>)`.
 - A hash argument that is not 64 hex characters is rejected by the parser
   before the store is touched.
-- Blobs are the files `<store>/<hex>`; nothing else is written for this story.
+- Completed blobs are files `<store>/<hex>`; `tmp/` holds staging files and
+  `lock` enforces a single store owner.
 
 Covered by `rust/crates/cli/tests/cli.rs` (the binary,
 end to end), the unit tests in `crates/core/src/store.rs` (the store on its own), the
@@ -78,12 +79,13 @@ Maps to spirit's `spirit-node blob put|get` (`node/src/cli.rs`) over
 `blob has <hash>` prints `true`/`false`; `blob list` prints every hash with
 its size.
 
-## 3. Blobs larger than memory **[planned]**
+## 3. Blobs larger than memory **[partial]**
 
-`blob put` streams a file through the hasher and into the store without
-holding it in memory; `blob get --out` verifies while it streams. The
-`Blobs` API gains a reader form. Motivated by flac and video, the content
-spirit was designed for.
+The Rust store provides `import_file`, `import_reader`, `write_verified` and
+`export_file` with bounded streaming and atomic destination replacement. The
+CLI `blob put` and `blob get --out` still buffer whole files; `get --out`
+writes non-atomically. Switching those commands to the streaming API is a
+follow-up, motivated by flac and video, the content spirit was designed for.
 
 ## Small blobs and records **[deferred]**
 
