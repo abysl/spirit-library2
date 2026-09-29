@@ -23,10 +23,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import blue.rae.spirit.sdk.MeshSession
 
 @Composable
 @Preview
-fun App(store: BlobStore? = null, node: MeshNode? = null) {
+fun App(store: BlobStore? = null, session: MeshSession? = null) {
     var showDevices by remember { mutableStateOf(true) }
     MaterialTheme {
         Column(
@@ -45,8 +46,8 @@ fun App(store: BlobStore? = null, node: MeshNode? = null) {
                 TextButton(onClick = { showDevices = false }) { Text("Blobs") }
             }
             if (showDevices) {
-                if (node == null) Text("Device pairing is available on Android and desktop")
-                else MeshPanel(node)
+                if (session == null) Text("Device pairing is available on Android and desktop")
+                else MeshPanel(session)
             } else if (store == null) {
                 Text("spirit is not available on this platform")
             } else {

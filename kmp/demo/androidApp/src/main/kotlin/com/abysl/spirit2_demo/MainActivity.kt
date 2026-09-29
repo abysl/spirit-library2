@@ -10,17 +10,22 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import blue.rae.spirit.sdk.AndroidNodeContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class DeviceModel(application: Application) : AndroidViewModel(application) {
     init { AndroidNodeContext.initialize(application) }
     val store = openBlobStore(application.filesDir.resolve("spirit").path)
-    val node = openMeshNode(application.noBackupFilesDir.resolve("spirit-node").path, Build.MODEL)
+    val session = openMeshSession(application.noBackupFilesDir.resolve("spirit-node").path, Build.MODEL)
+    private val ownerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val running = ownerScope.launch { session?.run() }
 
     override fun onCleared() {
         CoroutineScope(Dispatchers.IO).launch {
-            try { node?.close() } finally { store?.close() }
+            try { running.cancelAndJoin() } finally { ownerScope.cancel(); store?.close() }
         }
     }
 }
@@ -30,6 +35,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         val model = ViewModelProvider(this)[DeviceModel::class.java]
-        setContent { App(model.store, model.node) }
+        setContent { App(model.store, model.session) }
     }
 }
