@@ -30,7 +30,7 @@ class PairingImageTest {
         val inviter = SpiritNode.open(inviterDir.toString(), "desktop", local = true)
         val joining = SpiritNode.open(joiningDir.toString(), "phone", local = true)
         try {
-            inviter.createMesh("personal")
+            val mesh = inviter.createMesh("personal")
             val code = joining.pair()
             val scale = 6
             val pixels = (code.width + 8) * scale
@@ -45,7 +45,7 @@ class PairingImageTest {
             ImageIO.write(image, "PNG", imagePath.toFile())
             val scanned = decodePairingImage(imagePath.toFile())
             assertEquals(code.ticket, scanned)
-            assertEquals("phone", inviter.add(scanned))
+            assertEquals("phone", inviter.add(mesh, scanned))
             assertEquals("phone", inviter.ping("phone").name)
         } finally {
             inviter.close()

@@ -10,7 +10,10 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [[bin]]
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
-required-features = ["uniffi/cli"]
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
 
 [dependencies]
 spirit-sdk = { workspace = true, features = ["node"] }

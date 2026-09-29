@@ -17,6 +17,18 @@ pub enum FfiError {
     Corrupt { expected: String, actual: String },
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("node is closed")]
+    NodeClosed,
+    #[error("node directory is in use")]
+    NodeBusy,
+    #[error("device has reached the 64-group limit")]
+    MeshLimit,
+    #[error("not a member: {0}")]
+    NotMember(String),
+    #[error("ticket rejected: {0}")]
+    TicketRejected(String),
+    #[error("network unavailable: {0}")]
+    Unavailable(String),
     #[error("node: {0}")]
     Node(String),
 }

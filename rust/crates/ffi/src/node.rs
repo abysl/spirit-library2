@@ -1,6 +1,6 @@
 use crate::FfiError;
 use qrcode::{Color, QrCode};
-use spirit_sdk::{Node, NodeConfig};
+use spirit_sdk::{MeshId, Node, NodeConfig};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -19,7 +19,17 @@ fn runtime() -> Result<&'static Runtime, FfiError> {
 }
 
 fn node_error(error: anyhow::Error) -> FfiError {
-    FfiError::Node(format!("{error:#}"))
+    let detail = format!("{error:#}");
+    match error.downcast_ref::<spirit_sdk::NodeError>() {
+        Some(spirit_sdk::NodeError::MeshLimit) => FfiError::MeshLimit,
+        Some(spirit_sdk::NodeError::NotMember) => FfiError::NotMember(detail),
+        Some(spirit_sdk::NodeError::TicketRejected(_)) => FfiError::TicketRejected(detail),
+        Some(spirit_sdk::NodeError::NodeClosed) => FfiError::NodeClosed,
+        Some(spirit_sdk::NodeError::NodeBusy) => FfiError::NodeBusy,
+        Some(spirit_sdk::NodeError::Invalid(_)) => FfiError::Invalid(detail),
+        Some(spirit_sdk::NodeError::Unavailable(_)) => FfiError::Unavailable(detail),
+        None => FfiError::Node(detail),
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -32,12 +42,26 @@ pub struct MeshPeer {
 }
 
 #[derive(uniffi::Record)]
+pub struct MeshMember {
+    pub id: String,
+    pub name: String,
+    pub generation: u32,
+}
+
+#[derive(uniffi::Record)]
 pub struct MeshStatus {
     pub id: String,
     pub name: String,
-    pub mesh_id: Option<String>,
-    pub mesh_name: Option<String>,
+    pub members: Vec<MeshMember>,
+}
+
+#[derive(uniffi::Record)]
+pub struct NodeStatus {
+    pub id: String,
+    pub name: String,
+    pub meshes: Vec<MeshStatus>,
     pub peers: Vec<MeshPeer>,
+    pub ticket_pending: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -73,7 +97,7 @@ impl SpiritNode {
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| FfiError::Node("node is closed".into()))
+            .ok_or(FfiError::NodeClosed)
     }
 }
 
@@ -95,10 +119,9 @@ impl SpiritNode {
         })
     }
 
-    pub fn status(&self) -> Result<MeshStatus, FfiError> {
+    pub fn status(&self) -> Result<NodeStatus, FfiError> {
         let node = self.active()?;
         let info = node.info();
-        let mesh_id = info.mesh_id;
         let peers = node
             .peers()
             .into_iter()
@@ -110,27 +133,42 @@ impl SpiritNode {
                 last_error: peer.last_error,
             })
             .collect();
-        Ok(MeshStatus {
+        Ok(NodeStatus {
             id: info.id.to_string(),
             name: info.name,
-            mesh_id: mesh_id.map(|id| id.to_string()),
-            mesh_name: info.mesh_name,
+            ticket_pending: node.has_pending_ticket(),
+            meshes: info
+                .meshes
+                .into_iter()
+                .map(|mesh| MeshStatus {
+                    id: mesh.id.to_string(),
+                    name: mesh.name,
+                    members: mesh
+                        .members
+                        .into_iter()
+                        .map(|member| MeshMember {
+                            id: member.id.to_string(),
+                            name: member.name,
+                            generation: member.generation,
+                        })
+                        .collect(),
+                })
+                .collect(),
             peers,
         })
     }
 
-    pub fn create_mesh(&self, name: String) -> Result<(), FfiError> {
-        let guard = self.node.lock().unwrap();
-        let node = guard
-            .as_ref()
-            .ok_or_else(|| FfiError::Node("node is closed".into()))?;
-        node.create_first_mesh(&name).map_err(node_error)?;
-        Ok(())
+    pub fn create_mesh(&self, name: String) -> Result<String, FfiError> {
+        let node = self.active()?;
+        let id = node.new_mesh(&name).map_err(node_error)?;
+        Ok(id.to_string())
     }
 
-    pub fn leave_mesh(&self) -> Result<LeftMesh, FfiError> {
+    pub fn leave_mesh(&self, mesh_id: String) -> Result<LeftMesh, FfiError> {
         let node = self.active()?;
-        let mesh_id = node.info().only_mesh().map_err(node_error)?;
+        let mesh_id: MeshId = mesh_id
+            .parse()
+            .map_err(|error: anyhow::Error| FfiError::Invalid(error.to_string()))?;
         let left = runtime()?
             .block_on(node.leave(mesh_id))
             .map_err(node_error)?;
@@ -145,7 +183,7 @@ impl SpiritNode {
     pub fn pair(&self) -> Result<PairingCode, FfiError> {
         let node = self.active()?;
         let ticket = runtime()?
-            .block_on(node.pair_when_unenrolled(Duration::from_secs(300)))
+            .block_on(node.pair(Duration::from_secs(300)))
             .map_err(node_error)?;
         let qr =
             QrCode::new(ticket.as_bytes()).map_err(|error| FfiError::Node(error.to_string()))?;
@@ -161,11 +199,23 @@ impl SpiritNode {
         })
     }
 
-    pub fn add(&self, ticket: String) -> Result<String, FfiError> {
+    pub fn add(&self, mesh_id: String, ticket: String) -> Result<String, FfiError> {
         let node = self.active()?;
-        let mesh_id = node.info().only_mesh().map_err(node_error)?;
+        let mesh_id: MeshId = mesh_id
+            .parse()
+            .map_err(|error: anyhow::Error| FfiError::Invalid(error.to_string()))?;
+        let ticket = ticket.trim();
+        if ticket.len() > 8_192
+            || !ticket.starts_with("spirit1")
+            || ticket.len() <= 7
+            || !ticket[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(FfiError::Invalid("invalid pairing ticket".into()));
+        }
         let member = runtime()?
-            .block_on(node.add(mesh_id, ticket.trim()))
+            .block_on(node.add(mesh_id, ticket))
             .map_err(node_error)?;
         Ok(member.name)
     }
@@ -208,56 +258,121 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_mesh_refuses_a_second_mesh_and_withdraws_a_ticket() {
+    fn maps_group_limit_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::MeshLimit.into()),
+            FfiError::MeshLimit
+        ));
+    }
+
+    #[test]
+    fn maps_not_member_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::NotMember.into()),
+            FfiError::NotMember(_)
+        ));
+    }
+
+    #[test]
+    fn maps_ticket_refusal_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::TicketRejected("refused".into()).into()),
+            FfiError::TicketRejected(_)
+        ));
+    }
+
+    #[test]
+    fn maps_node_closed_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::NodeClosed.into()),
+            FfiError::NodeClosed
+        ));
+    }
+
+    #[test]
+    fn maps_invalid_input_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::Invalid("bad".into()).into()),
+            FfiError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn maps_unavailable_by_type() {
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::Unavailable("dial failed".into()).into()),
+            FfiError::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_mesh_ids_and_closed_node_have_consistent_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = SpiritNode::open(dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
+        assert!(matches!(
+            node.add("bad id".into(), "spirit1valid".into()),
+            Err(FfiError::Invalid(_))
+        ));
+        assert!(matches!(
+            node.leave_mesh("bad id".into()),
+            Err(FfiError::Invalid(_))
+        ));
+        node.shutdown().unwrap();
+        assert!(matches!(
+            node.create_mesh("new".into()),
+            Err(FfiError::NodeClosed)
+        ));
+    }
+
+    #[test]
+    fn two_meshes_select_add_status_and_leave() {
         let a_dir = tempfile::tempdir().unwrap();
         let b_dir = tempfile::tempdir().unwrap();
         let a = SpiritNode::open(a_dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
         let b = SpiritNode::open(b_dir.path().to_str().unwrap().into(), "b".into(), true).unwrap();
-        a.create_mesh("one".into()).unwrap();
-        let stale = b.pair().unwrap();
-        b.create_mesh("two".into()).unwrap();
-        assert!(format!("{}", b.pair().err().unwrap()).contains("single-mesh until S3"));
-        assert!(a.add(stale.ticket).is_err());
-        assert!(format!("{}", b.create_mesh("three".into()).unwrap_err())
-            .contains("single-mesh until S3"));
-        assert_eq!(b.status().unwrap().mesh_name.as_deref(), Some("two"));
+        let first = a.create_mesh("one".into()).unwrap();
+        let second = a.create_mesh("two".into()).unwrap();
+        let ticket = b.pair().unwrap();
+        assert_eq!(a.add(second.clone(), ticket.ticket).unwrap(), "b");
+        let status = a.status().unwrap();
+        assert_eq!(status.meshes.len(), 2);
+        assert!(status
+            .meshes
+            .iter()
+            .any(|mesh| mesh.id == first && mesh.members.len() == 1));
+        assert!(status.meshes.iter().any(|mesh| mesh.id == second
+            && mesh
+                .members
+                .iter()
+                .any(|member| member.name == "b" && member.generation == 0)));
+        assert_eq!(a.status().unwrap().peers.len(), 1);
+        let still_valid = b.pair().unwrap();
+        b.create_mesh("three".into()).unwrap();
+        assert_eq!(a.add(first.clone(), still_valid.ticket).unwrap(), "b");
+        assert_eq!(a.status().unwrap().peers.len(), 1);
+        assert_eq!(a.leave_mesh(first).unwrap().mesh_name, "one");
+        assert_eq!(a.status().unwrap().meshes.len(), 1);
         a.shutdown().unwrap();
         b.shutdown().unwrap();
     }
 
     #[test]
-    fn concurrent_create_mesh_calls_leave_one_mesh() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = Arc::new(
-            SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap(),
-        );
-        let results: Vec<_> = (0..2)
-            .map(|index| {
-                let node = node.clone();
-                std::thread::spawn(move || node.create_mesh(format!("mesh-{index}")))
-            })
-            .map(|handle| handle.join().unwrap())
-            .collect();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert!(node.status().unwrap().mesh_id.is_some());
-        node.shutdown().unwrap();
-    }
-
-    #[test]
-    fn mesh_specific_bindings_need_selection_for_multiple_meshes() {
-        let dir = tempfile::tempdir().unwrap();
-        Node::init(dir.path(), "desktop").unwrap();
-        Node::create_mesh(dir.path(), "one").unwrap();
-        Node::create_mesh(dir.path(), "two").unwrap();
-        let ffi =
-            SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap();
-        let status = ffi.status().unwrap();
-        assert!(status.mesh_id.is_none());
-        assert!(status.mesh_name.is_none());
-        assert!(format!("{}", ffi.add("not-a-ticket".into()).unwrap_err()).contains("choose one"));
-        assert!(format!("{}", ffi.leave_mesh().err().unwrap()).contains("choose one"));
-        assert!(format!("{}", ffi.pair().err().unwrap()).contains("single-mesh until S3"));
-        ffi.shutdown().unwrap();
+    fn creating_first_mesh_withdraws_ticket() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = SpiritNode::open(a_dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
+        let b = SpiritNode::open(b_dir.path().to_str().unwrap().into(), "b".into(), true).unwrap();
+        let ticket = b.pair().unwrap();
+        assert!(b.status().unwrap().ticket_pending);
+        b.create_mesh("own".into()).unwrap();
+        assert!(!b.status().unwrap().ticket_pending);
+        let mesh = a.create_mesh("other".into()).unwrap();
+        assert!(matches!(
+            a.add(mesh, ticket.ticket),
+            Err(FfiError::TicketRejected(_))
+        ));
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
     }
 
     #[test]
@@ -272,32 +387,32 @@ mod tests {
         .unwrap();
         let b =
             SpiritNode::open(b_dir.path().to_str().unwrap().into(), "phone".into(), true).unwrap();
-        a.create_mesh("personal".into()).unwrap();
+        let mesh = a.create_mesh("personal".into()).unwrap();
         let code = b.pair().unwrap();
         assert_eq!(code.modules.len(), (code.width * code.width) as usize);
-        assert_eq!(a.add(code.ticket).unwrap(), "phone");
+        assert_eq!(a.add(mesh.clone(), code.ticket).unwrap(), "phone");
         assert_eq!(a.ping("phone".into()).unwrap().name, "phone");
         assert!(a.status().unwrap().peers[0].connected);
         assert!(b.status().unwrap().peers[0].connected);
-        let left = b.leave_mesh().unwrap();
+        let left = b.leave_mesh(mesh.clone()).unwrap();
         assert_eq!(left.mesh_name, "personal");
         assert_eq!((left.remaining_members, left.notified_members), (1, 1));
-        assert!(b.status().unwrap().mesh_id.is_none());
+        assert!(b.status().unwrap().meshes.is_empty());
         assert!(a.status().unwrap().peers.is_empty());
-        assert!(b.leave_mesh().is_err());
+        assert!(matches!(
+            b.leave_mesh(mesh.clone()),
+            Err(FfiError::NotMember(_))
+        ));
         a.shutdown().unwrap();
         b.shutdown().unwrap();
-        assert!(a.status().is_err());
+        assert!(matches!(a.status(), Err(FfiError::NodeClosed)));
         let reopened = SpiritNode::open(
             a_dir.path().to_str().unwrap().into(),
             "desktop".into(),
             true,
         )
         .unwrap();
-        assert_eq!(
-            reopened.status().unwrap().mesh_name.as_deref(),
-            Some("personal")
-        );
+        assert_eq!(reopened.status().unwrap().meshes[0].name, "personal");
         reopened.shutdown().unwrap();
     }
 }
