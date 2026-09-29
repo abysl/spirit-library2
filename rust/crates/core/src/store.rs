@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -155,8 +155,7 @@ fn open_blob(path: &Path, hash: BlobHash) -> Result<File, StoreError> {
     }
 }
 
-fn verify(path: &Path, expected: BlobHash) -> Result<(), StoreError> {
-    let mut file = open_blob(path, expected)?;
+fn verify(mut file: &File, expected: BlobHash) -> Result<(), StoreError> {
     let (actual, _) = copy_hashed(&mut file, &mut io::sink())?;
     if actual != expected {
         return Err(StoreError::Corrupt { expected, actual });
@@ -224,7 +223,7 @@ impl BlobStore {
     }
 
     fn install(&self, temp: TemporaryFile, hash: BlobHash) -> Result<(), StoreError> {
-        match verify(&self.path_of(hash), hash) {
+        match open_blob(&self.path_of(hash), hash).and_then(|file| verify(&file, hash)) {
             Ok(()) => Ok(()),
             Err(StoreError::Corrupt { .. } | StoreError::NotFound(_)) => {
                 let destination = self.path_of(hash);
@@ -290,6 +289,14 @@ impl BlobStore {
         temp.file.sync_all().map_err(StoreError::Destination)?;
         temp.commit(dest, parent).map_err(StoreError::Destination)?;
         Ok(size)
+    }
+
+    pub fn export_to(&self, hash: BlobHash, mut writer: impl Write) -> Result<u64, StoreError> {
+        let path = self.path_of(hash);
+        let mut source = open_blob(&path, hash)?;
+        verify(&source, hash)?;
+        source.seek(std::io::SeekFrom::Start(0))?;
+        io::copy(&mut source, &mut writer).map_err(StoreError::Destination)
     }
 
     pub fn open_reader(&self, hash: BlobHash) -> Result<(u64, impl Read + Send), StoreError> {

@@ -4,6 +4,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.spirit_ffi.SpiritStore as FfiStore
+import uniffi.spirit_ffi.FfiException
 
 @JvmInline
 value class BlobHash(val hex: String) {
@@ -19,11 +20,14 @@ class SpiritStore private constructor(
             storeDir: String,
             dispatcher: CoroutineDispatcher = Dispatchers.IO,
         ): SpiritStore = withContext(dispatcher) {
-            SpiritStore(FfiStore.open(storeDir), dispatcher)
+            try { SpiritStore(FfiStore.open(storeDir), dispatcher) }
+            catch (error: FfiException) { throw mapError(error) }
         }
     }
 
-    private suspend fun <T> io(block: () -> T): T = withContext(dispatcher) { block() }
+    private suspend fun <T> io(block: () -> T): T = withContext(dispatcher) {
+        try { block() } catch (error: FfiException) { throw mapError(error) }
+    }
 
     suspend fun put(bytes: ByteArray): BlobHash = io { BlobHash(ffi.putBlob(bytes)) }
 

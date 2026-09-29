@@ -1,6 +1,7 @@
-use crate::FfiError;
+use crate::{node_error, parse_hash, FfiError};
 use qrcode::{Color, QrCode};
 use spirit_sdk::{MeshId, Node, NodeConfig};
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -18,19 +19,52 @@ fn runtime() -> Result<&'static Runtime, FfiError> {
         .map_err(|error| FfiError::Node(error.to_string()))
 }
 
-fn node_error(error: anyhow::Error) -> FfiError {
-    let detail = format!("{error:#}");
-    match error.downcast_ref::<spirit_sdk::NodeError>() {
-        Some(spirit_sdk::NodeError::MeshLimit) => FfiError::MeshLimit,
-        Some(spirit_sdk::NodeError::NotMember) => FfiError::NotMember(detail),
-        Some(spirit_sdk::NodeError::TicketRejected(_)) => FfiError::TicketRejected(detail),
-        Some(spirit_sdk::NodeError::NodeClosed) => FfiError::NodeClosed,
-        Some(spirit_sdk::NodeError::StoreNotConfigured) => FfiError::Node(detail),
-        Some(spirit_sdk::NodeError::NodeBusy) => FfiError::NodeBusy,
-        Some(spirit_sdk::NodeError::Invalid(_)) => FfiError::Invalid(detail),
-        Some(spirit_sdk::NodeError::Unavailable(_)) => FfiError::Unavailable(detail),
-        None => FfiError::Node(detail),
+const SOURCE_CHUNK: usize = 1024 * 1024;
+
+#[uniffi::export(callback_interface)]
+pub trait ByteSource: Send + Sync {
+    fn read(&self, max: u32) -> Result<Vec<u8>, FfiError>;
+}
+
+#[uniffi::export(callback_interface)]
+pub trait ByteSink: Send + Sync {
+    fn write(&self, bytes: Vec<u8>) -> Result<(), FfiError>;
+    fn finish(&self) -> Result<(), FfiError>;
+}
+
+struct SourceReader(Box<dyn ByteSource>);
+
+impl Read for SourceReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let max = buf.len().min(SOURCE_CHUNK);
+        let bytes = self.0.read(max as u32).map_err(io::Error::other)?;
+        if bytes.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source exceeded requested bytes",
+            ));
+        }
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
     }
+}
+
+struct SinkWriter(Box<dyn ByteSink>);
+
+impl Write for &SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf.to_vec()).map_err(io::Error::other)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn parse_mesh(text: &str) -> Result<MeshId, FfiError> {
+    text.parse()
+        .map_err(|error: anyhow::Error| FfiError::Invalid(error.to_string()))
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -105,19 +139,105 @@ impl SpiritNode {
 #[uniffi::export]
 impl SpiritNode {
     #[uniffi::constructor]
-    pub fn open(node_dir: String, nickname: String, local: bool) -> Result<Self, FfiError> {
+    pub fn open(
+        node_dir: String,
+        nickname: String,
+        local: bool,
+        store_dir: Option<String>,
+    ) -> Result<Self, FfiError> {
+        if let Some(store_dir) = store_dir.as_ref() {
+            std::fs::create_dir_all(&node_dir).map_err(|e| FfiError::Io(e.to_string()))?;
+            std::fs::create_dir_all(store_dir).map_err(|e| FfiError::Io(e.to_string()))?;
+            let node = std::fs::canonicalize(&node_dir).map_err(|e| FfiError::Io(e.to_string()))?;
+            let store =
+                std::fs::canonicalize(store_dir).map_err(|e| FfiError::Io(e.to_string()))?;
+            if node.starts_with(&store) || store.starts_with(&node) {
+                return Err(FfiError::Invalid(
+                    "store and node directories must be separate".into(),
+                ));
+            }
+        }
         Node::init(&node_dir, &nickname).map_err(node_error)?;
-        let config = if local {
+        let mut config = if local {
             NodeConfig::local()
         } else {
             NodeConfig::default()
         };
+        if let Some(store_dir) = store_dir {
+            config = config.with_store(store_dir);
+        }
         let node = runtime()?
             .block_on(Node::bind(node_dir, config))
             .map_err(node_error)?;
         Ok(Self {
             node: Mutex::new(Some(Arc::new(node))),
         })
+    }
+
+    pub fn import_file(&self, path: String) -> Result<String, FfiError> {
+        Ok(self
+            .active()?
+            .import_file(path)
+            .map_err(node_error)?
+            .to_string())
+    }
+
+    pub fn import_source(&self, source: Box<dyn ByteSource>) -> Result<String, FfiError> {
+        Ok(self
+            .active()?
+            .import_reader(SourceReader(source))
+            .map_err(node_error)?
+            .to_string())
+    }
+
+    pub fn export_file(&self, hash: String, path: String) -> Result<u64, FfiError> {
+        self.active()?
+            .export_file(parse_hash(&hash)?, path)
+            .map_err(node_error)
+    }
+
+    pub fn export_to(&self, hash: String, sink: Box<dyn ByteSink>) -> Result<u64, FfiError> {
+        let writer = SinkWriter(sink);
+        let size = self
+            .active()?
+            .export_to(parse_hash(&hash)?, &writer)
+            .map_err(node_error)?;
+        writer.0.finish()?;
+        Ok(size)
+    }
+
+    pub fn has_blob(&self, hash: String) -> Result<bool, FfiError> {
+        self.active()?
+            .has_blob(parse_hash(&hash)?)
+            .map_err(node_error)
+    }
+
+    pub fn blob_size(&self, hash: String) -> Result<u64, FfiError> {
+        self.active()?
+            .blob_size(parse_hash(&hash)?)
+            .map_err(node_error)
+    }
+
+    pub fn set_shares(&self, mesh_id: String, hashes: Vec<String>) -> Result<(), FfiError> {
+        let hashes = hashes
+            .iter()
+            .map(|hash| parse_hash(hash))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.active()?
+            .set_shares(parse_mesh(&mesh_id)?, hashes)
+            .map_err(node_error)
+    }
+
+    pub fn share(&self, mesh_id: String, hash: String) -> Result<(), FfiError> {
+        self.active()?
+            .share(parse_mesh(&mesh_id)?, parse_hash(&hash)?)
+            .map_err(node_error)
+    }
+
+    pub fn unshare(&self, mesh_id: String, hash: String) -> Result<(), FfiError> {
+        self.active()?
+            .unshare(parse_mesh(&mesh_id)?, parse_hash(&hash)?)
+            .map_err(node_error)
     }
 
     pub fn status(&self) -> Result<NodeStatus, FfiError> {
@@ -309,7 +429,8 @@ mod tests {
     #[test]
     fn malformed_mesh_ids_and_closed_node_have_consistent_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let node = SpiritNode::open(dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
+        let node =
+            SpiritNode::open(dir.path().to_str().unwrap().into(), "a".into(), true, None).unwrap();
         assert!(matches!(
             node.add("bad id".into(), "spirit1valid".into()),
             Err(FfiError::Invalid(_))
@@ -329,8 +450,20 @@ mod tests {
     fn two_meshes_select_add_status_and_leave() {
         let a_dir = tempfile::tempdir().unwrap();
         let b_dir = tempfile::tempdir().unwrap();
-        let a = SpiritNode::open(a_dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
-        let b = SpiritNode::open(b_dir.path().to_str().unwrap().into(), "b".into(), true).unwrap();
+        let a = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "a".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().to_str().unwrap().into(),
+            "b".into(),
+            true,
+            None,
+        )
+        .unwrap();
         let first = a.create_mesh("one".into()).unwrap();
         let second = a.create_mesh("two".into()).unwrap();
         let ticket = b.pair().unwrap();
@@ -361,8 +494,20 @@ mod tests {
     fn creating_first_mesh_withdraws_ticket() {
         let a_dir = tempfile::tempdir().unwrap();
         let b_dir = tempfile::tempdir().unwrap();
-        let a = SpiritNode::open(a_dir.path().to_str().unwrap().into(), "a".into(), true).unwrap();
-        let b = SpiritNode::open(b_dir.path().to_str().unwrap().into(), "b".into(), true).unwrap();
+        let a = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "a".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().to_str().unwrap().into(),
+            "b".into(),
+            true,
+            None,
+        )
+        .unwrap();
         let ticket = b.pair().unwrap();
         assert!(b.status().unwrap().ticket_pending);
         b.create_mesh("own".into()).unwrap();
@@ -384,10 +529,16 @@ mod tests {
             a_dir.path().to_str().unwrap().into(),
             "desktop".into(),
             true,
+            None,
         )
         .unwrap();
-        let b =
-            SpiritNode::open(b_dir.path().to_str().unwrap().into(), "phone".into(), true).unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().to_str().unwrap().into(),
+            "phone".into(),
+            true,
+            None,
+        )
+        .unwrap();
         let mesh = a.create_mesh("personal".into()).unwrap();
         let code = b.pair().unwrap();
         assert_eq!(code.modules.len(), (code.width * code.width) as usize);
@@ -411,9 +562,73 @@ mod tests {
             a_dir.path().to_str().unwrap().into(),
             "desktop".into(),
             true,
+            None,
         )
         .unwrap();
         assert_eq!(reopened.status().unwrap().meshes[0].name, "personal");
         reopened.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod store_binding_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Source(Mutex<io::Cursor<Vec<u8>>>);
+    impl ByteSource for Source {
+        fn read(&self, max: u32) -> Result<Vec<u8>, FfiError> {
+            let mut buf = vec![0; max as usize];
+            let n = self.0.lock().unwrap().read(&mut buf).unwrap();
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl ByteSink for Sink {
+        fn write(&self, bytes: Vec<u8>) -> Result<(), FfiError> {
+            self.0.lock().unwrap().extend(bytes);
+            Ok(())
+        }
+        fn finish(&self) -> Result<(), FfiError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streams_source_and_verified_export_and_refuses_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let node = SpiritNode::open(
+            dir.path().join("node").to_str().unwrap().into(),
+            "a".into(),
+            true,
+            Some(store.to_str().unwrap().into()),
+        )
+        .unwrap();
+        let bytes = vec![73; 2 * SOURCE_CHUNK + 5];
+        let hash = node
+            .import_source(Box::new(Source(Mutex::new(io::Cursor::new(bytes.clone())))))
+            .unwrap();
+        assert!(node.has_blob(hash.clone()).unwrap());
+        assert_eq!(node.blob_size(hash.clone()).unwrap(), bytes.len() as u64);
+        let sink = Box::new(Sink(Arc::new(Mutex::new(Vec::new()))));
+        assert_eq!(
+            node.export_to(hash.clone(), sink).unwrap(),
+            bytes.len() as u64
+        );
+        let mesh = node.create_mesh("test".into()).unwrap();
+        node.set_shares(mesh.clone(), vec![hash.clone()]).unwrap();
+        node.unshare(mesh.clone(), hash.clone()).unwrap();
+        node.share(mesh, hash.clone()).unwrap();
+        std::fs::write(store.join(&hash), b"corrupt").unwrap();
+        let contents = Arc::new(Mutex::new(Vec::new()));
+        assert!(matches!(
+            node.export_to(hash, Box::new(Sink(contents.clone()))),
+            Err(FfiError::Corrupt { .. })
+        ));
+        assert!(contents.lock().unwrap().is_empty());
+        node.shutdown().unwrap();
     }
 }

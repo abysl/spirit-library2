@@ -1,7 +1,6 @@
 package blue.rae.spirit.sdk
 
 import kotlinx.coroutines.runBlocking
-import uniffi.spirit_ffi.FfiException
 import java.nio.file.Files
 import kotlin.io.path.absolutePathString
 import kotlin.test.Test
@@ -27,6 +26,16 @@ class SpiritStoreTest {
     }
 
     @Test
+    fun lockedStoreIsNodeBusy() = runBlocking {
+        val dir = tempStore()
+        SpiritStore.open(dir).use {
+            assertEquals(MeshFailure.NodeBusy, assertFailsWith<MeshNodeException> {
+                SpiritStore.open(dir)
+            }.failure)
+        }
+    }
+
+    @Test
     fun `put is idempotent`() {
         runBlocking {
             SpiritStore.open(tempStore()).use { store ->
@@ -43,7 +52,7 @@ class SpiritStoreTest {
             SpiritStore.open(tempStore()).use { store ->
                 val zero = BlobHash("0".repeat(64))
                 assertFalse(store.has(zero))
-                assertFailsWith<FfiException.Missing> { store.get(zero) }
+                assertEquals(MeshFailure.Missing, assertFailsWith<MeshNodeException> { store.get(zero) }.failure)
             }
         }
     }
@@ -52,7 +61,7 @@ class SpiritStoreTest {
     fun `a malformed hash is rejected before the store is touched`() {
         runBlocking {
             SpiritStore.open(tempStore()).use { store ->
-                assertFailsWith<FfiException.Invalid> { store.get(BlobHash("not-a-hash")) }
+                assertEquals(MeshFailure.Invalid, assertFailsWith<MeshNodeException> { store.get(BlobHash("not-a-hash")) }.failure)
             }
         }
     }

@@ -6,6 +6,11 @@ import kotlinx.coroutines.runBlocking
 import uniffi.spirit_ffi.FfiException
 import uniffi.spirit_ffi.SpiritNode as FfiNode
 import java.nio.file.Files
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -145,7 +150,7 @@ class SpiritNodeLeaseTest {
     @Test
     fun nativeDirectoryLockIsMappedToNodeBusy() = runBlocking {
         val dir = Files.createTempDirectory("spirit-native-lock").toString()
-        FfiNode.open(dir, "device", true).use { native ->
+        FfiNode.open(dir, "device", true, null).use { native ->
             try {
                 val error = assertFailsWith<MeshNodeException> { SpiritNode.open(dir, "device", local = true) }
                 assertEquals(MeshFailure.NodeBusy, error.failure)
@@ -168,5 +173,95 @@ class SpiritNodeErrorMappingTest {
             FfiException.NodeBusy() to MeshFailure.NodeBusy,
         )
         for ((error, expected) in cases) assertEquals(expected, mapError(error).failure)
+    }
+}
+
+class SpiritNodeStoreTest {
+    @Test
+    fun importAndExportThroughNodeStoreAndStreams() = runBlocking {
+        val dir = Files.createTempDirectory("spirit-node-store")
+        val store = dir.resolve("store").toString()
+        SpiritNode.open(dir.resolve("node").toString(), "a", local = true, storeDir = store).use { node ->
+            val bytes = ByteArray(1024 * 1024 + 3) { (it % 251).toByte() }
+            val hash = node.importStream { bytes.inputStream() }
+            assertTrue(node.hasBlob(hash))
+            assertEquals(bytes.size.toLong(), node.blobSize(hash))
+            val output = java.io.ByteArrayOutputStream()
+            assertEquals(bytes.size.toLong(), node.exportToStream(hash) { output })
+            assertTrue(bytes.contentEquals(output.toByteArray()))
+            val mesh = node.createMesh("group")
+            node.setShares(mesh, listOf(hash))
+            node.unshare(mesh, hash)
+            node.share(mesh, hash)
+            val path = dir.resolve("copy")
+            assertEquals(bytes.size.toLong(), node.exportFile(hash, path.toString()))
+            assertTrue(bytes.contentEquals(Files.readAllBytes(path)))
+        }
+    }
+}
+
+class SpiritNodeCallbackTest {
+    @Test
+    fun callbacksKeepOriginalCauses() = runBlocking {
+        val dir = Files.createTempDirectory("spirit-callback")
+        SpiritNode.open(dir.resolve("node").toString(), "a", local = true,
+            storeDir = dir.resolve("store").toString()).use { node ->
+            val read = IOException("reader failed")
+            val failure = assertFailsWith<MeshNodeException> {
+                node.importSource { object : MeshSource {
+                    override fun read(max: Int): ByteArray = throw read
+                    override fun close() = Unit
+                } }
+            }
+            assertEquals(MeshFailure.SourceRead, failure.failure)
+            assertEquals(read, failure.cause)
+            val hash = node.importSource { object : MeshSource {
+                private var done = false
+                override fun read(max: Int): ByteArray = if (done) byteArrayOf() else "a".encodeToByteArray().also { done = true }
+                override fun close() = Unit
+            } }
+            for (finishFails in listOf(false, true)) {
+                val cause = IOException("sink failed")
+                val error = assertFailsWith<MeshNodeException> {
+                    node.exportTo(hash, object : MeshSink {
+                        override fun write(bytes: ByteArray) { if (!finishFails) throw cause }
+                        override fun finish() { if (finishFails) throw cause }
+                    })
+                }
+                assertEquals(MeshFailure.Destination, error.failure)
+                assertEquals(cause, error.cause)
+            }
+        }
+    }
+
+    @Test
+    fun closingWaitsForSlowImportBeforeReopening() = runBlocking {
+        val dir = Files.createTempDirectory("spirit-close-import")
+        val started = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val node = SpiritNode.open(dir.resolve("node").toString(), "a", local = true,
+            storeDir = dir.resolve("store").toString())
+        val importing = async(Dispatchers.IO) {
+            assertFailsWith<MeshNodeException> {
+                node.importSource { object : MeshSource {
+                    override fun read(max: Int): ByteArray {
+                        started.countDown()
+                        resume.await(5, TimeUnit.SECONDS)
+                        return byteArrayOf(1)
+                    }
+                    override fun close() = Unit
+                } }
+            }
+        }
+        try {
+            assertTrue(withContext(Dispatchers.IO) { started.await(5, TimeUnit.SECONDS) })
+            val closing = async(Dispatchers.IO) { node.close() }
+            delay(50)
+            resume.countDown()
+            closing.await()
+            importing.await()
+            SpiritNode.open(dir.resolve("node").toString(), "a", local = true,
+                storeDir = dir.resolve("store").toString()).use { assertEquals("a", it.status().name) }
+        } finally { resume.countDown(); node.close() }
     }
 }

@@ -25,5 +25,7 @@ Staging files are removed on normal errors and panic unwind; `open` cleans crash
 fsync is best-effort for every error: a renamed file may already be visible even when the directory cannot be opened or synced.
 Non-Unix platforms skip directory sync.
 
+When the node opens with a store, it owns its lock for the node lifetime. Do not open a standalone `SpiritStore` on the same directory: the exclusive lock conflicts. Blocking imports and exports run on the FFI caller's thread; dispatch them to an I/O worker rather than the node's small Tokio runtime pool. `export_to` verifies the complete blob before sending any bytes to a sink, then reads again to stream it; destination errors are not atomic for external streams.
+
 The node-owned store serves only per-mesh shares. `has` and `size` inspect metadata.
 `fetch` verifies `open_reader` bytes with `write_verified` before exposing them and cleans up staging on cancellation.

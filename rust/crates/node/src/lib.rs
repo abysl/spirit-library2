@@ -47,7 +47,7 @@ use network::{Protocol, Shared, DEPART_ALPN, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
 use serde::{Deserialize, Serialize};
 use spirit_core::{BlobHash, BlobStore};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -336,6 +336,10 @@ impl Node {
 
     pub fn export_file(&self, hash: BlobHash, path: impl AsRef<Path>) -> Result<u64> {
         Ok(self.store()?.export_file(hash, path)?)
+    }
+
+    pub fn export_to(&self, hash: BlobHash, writer: impl Write) -> Result<u64> {
+        Ok(self.store()?.export_to(hash, writer)?)
     }
 
     pub fn has_blob(&self, hash: BlobHash) -> Result<bool> {
