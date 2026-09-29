@@ -133,6 +133,7 @@ pub(crate) struct Shared {
     pub store: Option<Arc<spirit_core::BlobStore>>,
     pub shares: Mutex<BTreeMap<MeshId, BTreeSet<spirit_core::BlobHash>>>,
     pub uploads: Mutex<BTreeMap<NodeId, usize>>,
+    pub fetches: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Serialize, Deserialize)]
