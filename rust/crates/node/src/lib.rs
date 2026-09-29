@@ -414,12 +414,19 @@ impl Node {
             provider,
             hash,
             expected_size,
-            progress,
+            transfer::FetchCallbacks {
+                progress,
+                queued: || {},
+            },
             &mut cancel,
         )
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserve the public cancellable fetch API"
+    )]
     pub async fn fetch_cancellable(
         &self,
         mesh: MeshId,
@@ -427,6 +434,7 @@ impl Node {
         hash: BlobHash,
         expected_size: Option<u64>,
         progress: impl Fn(u64, u64),
+        queued: impl Fn(),
         mut cancel: watch::Receiver<bool>,
     ) -> std::result::Result<u64, FetchError> {
         self.ensure_open()?;
@@ -436,7 +444,7 @@ impl Node {
             provider,
             hash,
             expected_size,
-            progress,
+            transfer::FetchCallbacks { progress, queued },
             &mut cancel,
         )
         .await

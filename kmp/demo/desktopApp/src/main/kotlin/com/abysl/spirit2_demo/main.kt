@@ -13,7 +13,7 @@ fun main() = application {
     val home = System.getProperty("user.home")
     val store = remember { openBlobStore("$home/.spirit2/ktdemo") }
     val nickname = remember { System.getenv("SPIRIT_NODE_NAME") ?: runCatching { InetAddress.getLocalHost().hostName }.getOrDefault("desktop") }
-    val session = remember { openMeshSession(System.getenv("SPIRIT_NODE_DIR") ?: "$home/.spirit2/ktdemo-node", nickname, System.getenv("SPIRIT_LOCAL") == "1") }
+    val session = remember { openMeshSession(System.getenv("SPIRIT_NODE_DIR") ?: "$home/.spirit2/ktdemo-node", nickname, System.getenv("SPIRIT_LOCAL") == "1", store) }
     val scope = rememberCoroutineScope()
     val running = remember(session) { scope.launch { session?.run() } }
     var closing by remember { mutableStateOf(false) }

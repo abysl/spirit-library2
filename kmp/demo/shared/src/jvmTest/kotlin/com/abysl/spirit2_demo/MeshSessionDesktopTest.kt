@@ -18,16 +18,21 @@ class MeshSessionDesktopTest {
         val first = assertNotNull(openMeshSession(dir, "desktop", true))
         val running = launch(Dispatchers.IO) { first.run() }
         withTimeout(10_000) { first.state.first { !it.loading && it.invitation != null } }
+        assertNotNull(withTimeout(10_000) { first.files.first { it != null } })
         first.createGroup("personal")
         running.cancelAndJoin()
+        assertEquals(null, first.files.value)
 
         val second = assertNotNull(openMeshSession(dir, "desktop", true))
         val reopened = launch(Dispatchers.IO) { second.run() }
         try {
             val state = withTimeout(10_000) { second.state.first { !it.loading && it.groups.isNotEmpty() } }
             assertEquals("personal", state.groups.single().name)
+            assertNotNull(second.files.value)
         } finally {
             reopened.cancelAndJoin()
+            assertEquals(null, second.files.value)
         }
+        Unit
     }
 }

@@ -58,6 +58,7 @@ class MeshSession(
     private val actions = Mutex()
     private val tracking = Mutex()
     private val mutableState = MutableStateFlow(MeshState())
+    private val mutableFiles = MutableStateFlow<MeshFiles?>(null)
     private var node: MeshNode? = null
     private var started = false
     private var offeredInitialTicket = false
@@ -67,6 +68,7 @@ class MeshSession(
     private var meshSamples: List<MeshStatus> = emptyList()
 
     val state: StateFlow<MeshState> = mutableState.asStateFlow()
+    val files: StateFlow<MeshFiles?> = mutableFiles.asStateFlow()
 
     suspend fun run() {
         operations.withLock {
@@ -305,7 +307,10 @@ class MeshSession(
         try {
             withContext(NonCancellable) {
                 val opened = nodeFactory()
-                operations.withLock { node = opened }
+                operations.withLock {
+                    node = opened
+                    mutableFiles.value = opened as? MeshFiles
+                }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -320,6 +325,7 @@ class MeshSession(
         operations.withLock {
             val closing = node
             node = null
+            mutableFiles.value = null
             try {
                 closing?.shutdown()
             } catch (_: Exception) {

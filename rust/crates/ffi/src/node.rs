@@ -71,11 +71,13 @@ fn parse_mesh(text: &str) -> Result<MeshId, FfiError> {
 
 #[uniffi::export(callback_interface)]
 pub trait FetchListener: Send + Sync {
+    fn on_queued(&self);
     fn on_progress(&self, received: u64, total: u64);
     fn on_complete(&self, size: Option<u64>, error: Option<FfiError>);
 }
 
 enum FetchEvent {
+    Queued,
     Progress(u64, u64),
     Complete(Result<u64, FfiError>),
 }
@@ -376,6 +378,9 @@ impl SpiritNode {
             .spawn(move || {
                 for event in events {
                     match event {
+                        FetchEvent::Queued => {
+                            let _ = catch_unwind(AssertUnwindSafe(|| listener.on_queued()));
+                        }
                         FetchEvent::Progress(received, total) => {
                             let _ = catch_unwind(AssertUnwindSafe(|| {
                                 listener.on_progress(received, total)
@@ -402,6 +407,9 @@ impl SpiritNode {
                     expected_size,
                     |received, total| {
                         let _ = sender.send(FetchEvent::Progress(received, total));
+                    },
+                    || {
+                        let _ = sender.send(FetchEvent::Queued);
                     },
                     receiver,
                 )
@@ -913,6 +921,7 @@ mod fetch_binding_tests {
     }
 
     impl FetchListener for Listener {
+        fn on_queued(&self) {}
         fn on_progress(&self, received: u64, total: u64) {
             assert!(received <= total);
             self.events.fetch_add(1, Ordering::SeqCst);
@@ -934,6 +943,9 @@ mod fetch_binding_tests {
 
     struct ForwardListener(Arc<Listener>);
     impl FetchListener for ForwardListener {
+        fn on_queued(&self) {
+            self.0.on_queued();
+        }
         fn on_progress(&self, received: u64, total: u64) {
             self.0.on_progress(received, total);
         }
@@ -944,6 +956,7 @@ mod fetch_binding_tests {
 
     struct PanickingListener(Sender<Result<u64, FfiError>>);
     impl FetchListener for PanickingListener {
+        fn on_queued(&self) {}
         fn on_progress(&self, _: u64, _: u64) {
             panic!("listener failed");
         }
