@@ -1,9 +1,11 @@
+mod app;
 mod membership;
 mod mesh_id;
 mod network;
 mod presence;
 mod storage;
 
+pub use app::verify_app;
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
 pub use mesh_id::MeshId;
@@ -495,6 +497,11 @@ impl Node {
     fn ensure_open(&self) -> Result<()> {
         ensure!(!self.closed.load(Ordering::Acquire), NodeError::NodeClosed);
         Ok(())
+    }
+
+    pub fn sign_app(&self, domain: &str, bytes: &[u8]) -> Result<String> {
+        self.ensure_open()?;
+        app::sign_app(&self.shared.storage.key, domain, bytes)
     }
 
     pub async fn shutdown(&self) -> Result<()> {

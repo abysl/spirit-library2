@@ -101,7 +101,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn decode_signature(signature: &str) -> Result<Signature> {
+pub(crate) fn decode_signature(signature: &str) -> Result<Signature> {
     let bytes: [u8; 64] = URL_SAFE_NO_PAD
         .decode(signature)?
         .try_into()
@@ -110,7 +110,7 @@ fn decode_signature(signature: &str) -> Result<Signature> {
 }
 
 impl Admission {
-    fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
+    pub(crate) fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
         if self.generation > 0 {
             return Ok(postcard::to_stdvec(&(
                 "spirit/mesh/readmission/1",
@@ -167,7 +167,7 @@ impl Admission {
 }
 
 impl Departure {
-    fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
+    pub(crate) fn payload(&self, mesh: &Mesh) -> Result<Vec<u8>> {
         Ok(postcard::to_stdvec(&(
             "spirit/mesh/departure/1",
             mesh.id,

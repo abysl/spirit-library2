@@ -59,6 +59,10 @@ Connection and exchange stages each have a ten-second deadline, or three seconds
 
 Membership propagation is eventual. Peers must have exchanged membership and usable addresses before the introducer goes offline. Once they have, the introducer need not remain online for authentication, pinging, or further enrollment.
 
+## Application signatures
+
+`node.sign_app(domain, bytes)` and offline `verify_app(device, domain, bytes, signature)` sign and verify Ed25519 over Postcard `("spirit/app-signature/1", domain, bytes)`. Domain names are 1–64 ASCII bytes from `[a-z0-9._/-]`, excluding the `spirit/` prefix. Signatures are exactly 86 unpadded URL-safe base64 characters. The distinct tuple prefix prevents an application signature from authenticating admissions, departures, or readmissions.
+
 ## Persistence and local control
 
 The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` or `SPIRIT_NODE_DIR`. Blob storage continues to use its separate `--store` setting.
