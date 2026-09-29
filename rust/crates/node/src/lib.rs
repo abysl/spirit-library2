@@ -4,6 +4,7 @@ mod mesh_id;
 mod network;
 mod presence;
 mod storage;
+mod transfer;
 mod upload;
 
 pub use app::{verify_app, AppCallContext, AppHandler, Diagnostic};
@@ -33,6 +34,7 @@ pub enum NodeError {
 
 pub use presence::{PeerStatus, CONNECTED_WINDOW, HEARTBEAT_INTERVAL};
 pub use storage::write_private;
+pub use transfer::FetchError;
 
 use anyhow::{bail, ensure, Context, Result};
 use app::{
@@ -291,6 +293,7 @@ impl Node {
             store,
             shares: Mutex::new(BTreeMap::new()),
             uploads: Mutex::new(BTreeMap::new()),
+            fetches: Arc::new(tokio::sync::Semaphore::new(transfer::MAX_FETCHES)),
         });
         let app = Arc::new(AppState::default());
         let router = Router::builder(endpoint)
@@ -388,6 +391,18 @@ impl Node {
             set.remove(&hash);
             Ok(())
         })
+    }
+
+    pub async fn fetch(
+        &self,
+        mesh: MeshId,
+        provider: NodeId,
+        hash: BlobHash,
+        expected_size: Option<u64>,
+        progress: impl Fn(u64, u64),
+    ) -> std::result::Result<u64, FetchError> {
+        self.ensure_open()?;
+        transfer::fetch(&self.shared, mesh, provider, hash, expected_size, progress).await
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {
@@ -602,9 +617,12 @@ impl Node {
         })
     }
 
-    fn ensure_open(&self) -> Result<()> {
-        ensure!(!self.closed.load(Ordering::Acquire), NodeError::NodeClosed);
-        Ok(())
+    fn ensure_open(&self) -> std::result::Result<(), NodeError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(NodeError::NodeClosed)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn register_app_handler(&self, protocol: &str, handler: Arc<dyn AppHandler>) -> Result<()> {

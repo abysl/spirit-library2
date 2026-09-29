@@ -26,3 +26,4 @@ fsync is best-effort for every error: a renamed file may already be visible even
 Non-Unix platforms skip directory sync.
 
 The node-owned store serves only per-mesh shares. `has` and `size` inspect metadata.
+`fetch` verifies `open_reader` bytes with `write_verified` before exposing them and cleans up staging on cancellation.

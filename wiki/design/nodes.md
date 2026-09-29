@@ -47,6 +47,7 @@ Older `/1` clients cannot exchange membership with `/2` nodes; upgrade all devic
 | `spirit/ping/1` | JSON string `"ping"` | JSON string `"pong"` | Authenticated peer shares any current mesh |
 | `spirit/depart/1` | Departed mesh copy without addresses | JSON string `"recorded"` | The authenticated peer's own signed departure, for the named current mesh |
 | `spirit/app/1` | Named mesh, protocol and opaque bytes | Opaque bytes or generic failure | Both endpoints are current members of the selected mesh |
+| `spirit/blob/1` | Mesh ID and blob hash | Refusal or length and bytes | Both current members; mesh share set and local blob |
 
 Each exchange uses one bidirectional QUIC stream, with EOF delimiting the JSON message. Membership sync is routed by the request snapshot's mesh ID. Unknown meshes and requesters that are not current members of that mesh get the same generic failure, with no metadata; a departed device may reply to a member's signed snapshot with its retained departed copy. After signature verification, a requester key already known locally to have departed takes the fast refusal path before the full-state merge, including forged requests from that departed key. Ping is authorized across the union of current meshes. Unknown peers may perform a transport handshake and submit pairing or membership evidence; they receive no pong without membership. A stale introducer's pairing refusal includes the departed mesh copy, which the introducer records before retrying. A departed device's sync reply also includes its retained departed copy.
 
@@ -110,7 +111,7 @@ Consumers enable the `node` feature on `spirit-sdk`. Blob-only Rust SDK consumer
 
 ## Deferred operations
 
-This version supports multiple independent meshes per device. CLI `mesh status` and `mesh members` display every mesh; `mesh members --mesh <id>` selects one mesh, and `mesh add` and `mesh leave` accept `--mesh <id>` (required when several meshes exist); FFI status returns the current meshes with their member names and admission generations plus the deduplicated union of peer presence, with no singular mesh ID or name. FFI `createMesh` returns the new mesh ID, `pair` works while enrolled, and `add(meshId, ticket)` and `leaveMesh(meshId)` select a group. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer remains outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
+This version supports multiple independent meshes per device. CLI `mesh status` and `mesh members` display every mesh; `mesh members --mesh <id>` selects one mesh, and `mesh add` and `mesh leave` accept `--mesh <id>` (required when several meshes exist); FFI status returns the current meshes with their member names and admission generations plus the deduplicated union of peer presence, with no singular mesh ID or name. FFI `createMesh` returns the new mesh ID, `pair` works while enrolled, and `add(meshId, ticket)` and `leaveMesh(meshId)` select a group. Nicknames are fixed at initialization. Removing another device, key revocation, renaming, merging meshes, and restricting admission require new signed update and policy rules. Blob transfer bindings and file catalogs remain outside this phase. Kotlin node bindings and Android/desktop pairing controls are available through the KMP app.
 
 The protocol is an initial version intended for small personal meshes. Its automatic exchanges favor straightforward convergence over large-network efficiency. At the 64-mesh × 256-admission bound, state occupied 10,191,744 bytes; every `update()` clones it, including rejected outsider syncs; changed states are then saved under the lock, measured at 109 ms in this host's release-profile run (host-dependent). At the membership bounds, requests from outsider keys take about 25 ms, including unknown-mesh and forged-same-ID attempts. Requests from keys already known to have departed take the faster path at about 21.6 ms, including forged-by-departed attempts, because they skip `update()`’s full-state clone. This reveals to a departed device only that the responder still holds the mesh. One heartbeat also opens one QUIC connection per shared mesh before its single peer ping. The per-mesh dial uses only its own hint or a verified direct address. All three are known limits, not optimized in S2.
 
@@ -126,12 +127,80 @@ From `rust/`, run `cargo fmt --all --check`, `cargo test --workspace --all-featu
 
 ## Connectivity and KMP integration
 
-Connectivity is in-memory state measured using a monotonic clock. Only a validated heartbeat message marks a member as received. A green peer has received an authenticated valid ping or pong from that member less than 60 seconds ago. A transport, protocol, or heartbeat error is retained as a diagnostic of at most 256 UTF-8 bytes without Unicode control or format characters, without changing green status; a subsequent valid ping or pong clears it. Never-seen peers start red. Restarting clears presence without removing memberships.
+Connectivity is in-memory state measured using a monotonic clock. Only a validated heartbeat message
+marks a member as received. A green peer has received an authenticated valid ping or pong from that
+member less than 60 seconds ago. A transport, protocol, or heartbeat error is retained as a diagnostic of
+at most 256 UTF-8 bytes without Unicode control or format characters, without changing green status; a
+subsequent valid ping or pong clears it. Never-seen peers start red. Restarting clears presence without
+removing memberships.
 
-Membership snapshots and enrollment messages do not count. Unauthenticated traffic, malformed messages, and sent requests do not make a device connected. Heartbeat timeouts are recorded as diagnostics, and pending probes are canceled before the next interval. The regular request deadlines still apply to manual operations.
+Membership snapshots and enrollment messages do not count. Unauthenticated traffic, malformed messages,
+and sent requests do not make a device connected. Heartbeat timeouts are recorded as diagnostics, and
+pending probes are canceled before the next interval. The regular request deadlines still apply to manual
+operations.
 
-`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types. `NodeStatus.meshes` and `MeshState.groups` expose group identity and current members separately from node identity. `MeshSession` owns one node and one invitation, queues group-scoped actions, and measures per-member presence from the deduplicated peer list. The Android ViewModel or desktop window starts the session once, passes it to the panel, then cancels and joins it before closing the owner; composable recomposition never opens another node. Pairing returns the original ticket plus QR modules generated from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a configurable ticket lifetime, keeping the embedded contract minimal.
+`spirit-ffi` runs nodes on a shared Tokio runtime and exposes synchronous operations that the Kotlin SDK
+dispatches to IO threads. Its `SpiritNode` object supports explicit shutdown; dropping an unclosed handle
+also schedules shutdown. Status maps into records with string IDs so the KMP UI does not need iroh types.
+`NodeStatus.meshes` and `MeshState.groups` expose group identity and current members separately from node
+identity. `MeshSession` owns one node and one invitation, queues group-scoped actions, and measures
+per-member presence from the deduplicated peer list. The Android ViewModel or desktop window starts the
+session once, passes it to the panel, then cancels and joins it before closing the owner; composable
+recomposition never opens another node. Pairing returns the original ticket plus QR modules generated
+from those exact bytes. The FFI pairing window is fixed at 300 seconds; the CLI alone offers a
+configurable ticket lifetime, keeping the embedded contract minimal.
 
-The Android JNI initialization holds the application context in a global reference for the process lifetime and installs it once before constructing an iroh endpoint. This lifetime is required by iroh's DNS integration; a temporary activity reference must never be substituted. Device identity is stored in Android's non-backup directory so OS backup restoration does not duplicate an endpoint identity onto another phone.
+The Android JNI initialization holds the application context in a global reference for the process
+lifetime and installs it once before constructing an iroh endpoint. This lifetime is required by iroh's
+DNS integration; a temporary activity reference must never be substituted. Device identity is stored in
+Android's non-backup directory so OS backup restoration does not duplicate an endpoint identity onto
+another phone.
 
-The KMP list polls status every second. It displays both a colored dot and textual state, keeps disconnected members visible, and shows a short ID when nicknames collide. Manual ping targets the member's full ID even though the interface displays its nickname. Camera permission denial leaves ticket pasting available.
+The KMP list polls status every second. It displays both a colored dot and textual state, keeps
+disconnected members visible, and shows a short ID when nicknames collide. Manual ping targets the
+member's full ID even though the interface displays its nickname. Camera permission denial leaves ticket
+pasting available.
+
+## Mesh-scoped blob transfer
+
+`NodeConfig::with_store(path)` makes the running node the single store owner; `node serve` opens a store
+only with explicit `--store`. `Node` exposes `import_file`, `import_reader`, `export_file`, `has_blob`,
+and `blob_size`. One store holds bytes for all meshes; it does not authorize network access.
+
+AFM reconciles each mesh's in-memory share set using `set_shares(mesh, hashes)`; `share` and `unshare`
+adjust one hash. Sets have at most 65,536 hashes and are cleared on leave or loss of current membership.
+Restart serves nothing until AFM reconciles; unsharing does not erase bytes.
+
+`spirit/blob/1` accepts EOF-delimited JSON `{"mesh_id":"mesh1_...","hash":"<64 lowercase hex>"}` on an
+authenticated bidirectional QUIC stream. Both endpoints must currently belong to the named mesh, the hash
+must be shared there, and the blob must exist locally. Otherwise all cases return one byte `0x00`, with
+bounded details recorded locally only. Success sends `0x01`, a big-endian u64 size, then raw bytes
+through EOF. Uploads are limited to four per node and two per peer; 64 KiB disk reads run off the async
+runtime behind a bounded two-chunk channel. A member that reads at least 64 KiB every 30 seconds can hold
+an upload slot indefinitely; this is acceptable for the MVP.
+
+The timing of blob refusals is not constant. In 40 samples each, unknown mesh, a mesh only the responder
+belongs to, and a hash not shared all had medians of about 3.49 ms. A hash shared but missing locally had
+a median of about 4.12 ms. Only a current member naming a shared hash can observe this gap.
+
+`fetch(mesh, provider, hash, expected_size, progress).await` checks local membership and skips the
+network for locally existing hashes only when their size matches `expected_size`. A bounded channel
+bridges the stream into `write_verified`, which installs only complete BLAKE3-verified bytes. Provisional
+`(received, total)` progress is reported after 1 MiB or 250 ms, plus a final update. Dropping the future
+cancels the stream and removes staging files. Connections use `request_timeout`, chunks a 30-second idle
+timeout, with no total deadline. Callers should pass the catalog entry size: a mismatched header is
+rejected before file bytes stream. Without a known size, received bytes are limited to the claimed header
+total. Four concurrent fetches per node hold blocking-pool writer threads; a fifth waits for a permit and
+cancellation while waiting takes none. Authorization occurs at request start; later catalog changes do
+not revoke in-flight transfers. There is no resume.
+
+`NodeError` represents shared node failures: `MeshLimit`, `NotMember`, `TicketRejected`, `NodeClosed`,
+`NodeBusy`, `Invalid`, `Unavailable`, and `StoreNotConfigured`. Public node operations return
+`NodeClosed` after shutdown, even if the blob is locally present. App names, oversized app data, and
+share limits return `Invalid`; app requests from nonmembers return `NotMember`, and refusals or network
+failures return `Unavailable`. `FetchError::Node(NodeError)` reuses `NotMember`, `Unavailable`,
+`NodeClosed`, and `StoreNotConfigured`; `Interrupted`, `Corrupt`, `Timeout`, and `Io` are fetch-specific.
+Core `StoreError` distinguishes `NotFound`, `Corrupt`, `InvalidHash`, store `Io`, and destination
+`Destination`. Fetch maps store `Corrupt` to fetch `Corrupt`, missing blobs to node `Unavailable`, and
+store I/O or destination errors to fetch `Io`; no store maps to node `StoreNotConfigured`. The current
+FFI maps this last error to its generic `Node` category until S7 adds a dedicated mapping.
