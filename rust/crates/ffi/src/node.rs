@@ -25,6 +25,7 @@ fn node_error(error: anyhow::Error) -> FfiError {
         Some(spirit_sdk::NodeError::NotMember) => FfiError::NotMember(detail),
         Some(spirit_sdk::NodeError::TicketRejected(_)) => FfiError::TicketRejected(detail),
         Some(spirit_sdk::NodeError::NodeClosed) => FfiError::NodeClosed,
+        Some(spirit_sdk::NodeError::StoreNotConfigured) => FfiError::Node(detail),
         Some(spirit_sdk::NodeError::NodeBusy) => FfiError::NodeBusy,
         Some(spirit_sdk::NodeError::Invalid(_)) => FfiError::Invalid(detail),
         Some(spirit_sdk::NodeError::Unavailable(_)) => FfiError::Unavailable(detail),

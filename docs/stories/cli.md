@@ -16,7 +16,11 @@ adopts part of it.
 The binary is `spirit`, built from the `spirit-cli` crate. The store lives
 at `--store <dir>`, else `$SPIRIT_STORE`, else `~/.spirit2/store`. The
 default deliberately differs from spirit's `~/.spirit/store` so the two
-never share a directory while spirit is live.
+never share a directory while spirit is live. `node serve` opens a blob
+store only with an explicit `--store <dir>`; without it, multiple nodes with
+separate `--node-dir` values can serve on the same host. The store has one
+process owner: `blob` commands targeting that store fail while a serving node
+owns it, so stop that node before importing with the CLI.
 
 ## Crates
 

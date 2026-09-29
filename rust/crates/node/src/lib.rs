@@ -4,6 +4,7 @@ mod mesh_id;
 mod network;
 mod presence;
 mod storage;
+mod upload;
 
 pub use app::{verify_app, AppCallContext, AppHandler, Diagnostic};
 pub use iroh::EndpointId as NodeId;
@@ -20,6 +21,8 @@ pub enum NodeError {
     TicketRejected(String),
     #[error("node is closed")]
     NodeClosed,
+    #[error("node blob store is not configured")]
+    StoreNotConfigured,
     #[error("node directory is in use")]
     NodeBusy,
     #[error("invalid input: {0}")]
@@ -40,7 +43,11 @@ use iroh::{endpoint::presets, protocol::Router, Endpoint, EndpointAddr, SecretKe
 use membership::Mesh;
 use network::{Protocol, Shared, DEPART_ALPN, PAIR_ALPN, PING_ALPN, SYNC_ALPN};
 use serde::{Deserialize, Serialize};
+use spirit_core::{BlobHash, BlobStore};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,8 +119,9 @@ impl NodeInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NodeConfig {
+    pub store: Option<PathBuf>,
     pub local: bool,
     pub request_timeout: Duration,
 }
@@ -122,15 +130,22 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             local: false,
+            store: None,
             request_timeout: Duration::from_secs(10),
         }
     }
 }
 
 impl NodeConfig {
+    pub fn with_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.store = Some(path.into());
+        self
+    }
+
     pub fn local() -> Self {
         Self {
             local: true,
+            store: None,
             request_timeout: Duration::from_secs(3),
         }
     }
@@ -251,6 +266,12 @@ impl Node {
             "request timeout must be positive"
         );
         let (storage, state) = Storage::open(root.as_ref())?;
+        let store = config
+            .store
+            .as_ref()
+            .map(BlobStore::open)
+            .transpose()?
+            .map(Arc::new);
         let builder = if config.local {
             Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
@@ -267,6 +288,9 @@ impl Node {
             diagnostics: Default::default(),
             endpoint: endpoint.clone(),
             config,
+            store,
+            shares: Mutex::new(BTreeMap::new()),
+            uploads: Mutex::new(BTreeMap::new()),
         });
         let app = Arc::new(AppState::default());
         let router = Router::builder(endpoint)
@@ -275,6 +299,7 @@ impl Node {
             .accept(PING_ALPN, Protocol::ping(shared.clone()))
             .accept(DEPART_ALPN, Protocol::depart(shared.clone()))
             .accept(APP_ALPN, AppProtocol::new(shared.clone(), app.clone()))
+            .accept(upload::BLOB_ALPN, upload::BlobProtocol(shared.clone()))
             .spawn();
         let gossip = tokio::spawn(network::gossip(shared.clone()));
         Ok(Self {
@@ -288,6 +313,81 @@ impl Node {
 
     pub fn has_pending_ticket(&self) -> bool {
         self.shared.pending.lock().unwrap().is_some()
+    }
+
+    fn store(&self) -> Result<&BlobStore> {
+        self.ensure_open()?;
+        self.shared
+            .store
+            .as_deref()
+            .ok_or(NodeError::StoreNotConfigured.into())
+    }
+
+    pub fn import_file(&self, path: impl AsRef<Path>) -> Result<BlobHash> {
+        Ok(self.store()?.import_file(path)?)
+    }
+
+    pub fn import_reader(&self, reader: impl Read) -> Result<BlobHash> {
+        Ok(self.store()?.import_reader(reader)?)
+    }
+
+    pub fn export_file(&self, hash: BlobHash, path: impl AsRef<Path>) -> Result<u64> {
+        Ok(self.store()?.export_file(hash, path)?)
+    }
+
+    pub fn has_blob(&self, hash: BlobHash) -> Result<bool> {
+        Ok(self.store()?.has(hash))
+    }
+
+    pub fn blob_size(&self, hash: BlobHash) -> Result<u64> {
+        Ok(self.store()?.size(hash)?)
+    }
+
+    fn update_shares(
+        &self,
+        mesh: MeshId,
+        change: impl FnOnce(&mut BTreeSet<BlobHash>) -> Result<()>,
+    ) -> Result<()> {
+        self.store()?;
+        let state = self.shared.state.lock().unwrap();
+        ensure!(state.current_member(mesh), NodeError::NotMember);
+        let mut shares = self.shared.shares.lock().unwrap();
+        change(shares.entry(mesh).or_default())
+    }
+
+    pub fn set_shares(
+        &self,
+        mesh: MeshId,
+        hashes: impl IntoIterator<Item = BlobHash>,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        let hashes: BTreeSet<_> = hashes.into_iter().collect();
+        ensure!(
+            hashes.len() <= upload::MAX_SHARES_PER_MESH,
+            NodeError::Invalid("mesh share limit exceeded".into())
+        );
+        self.update_shares(mesh, |set| {
+            *set = hashes;
+            Ok(())
+        })
+    }
+
+    pub fn share(&self, mesh: MeshId, hash: BlobHash) -> Result<()> {
+        self.update_shares(mesh, |set| {
+            ensure!(
+                set.contains(&hash) || set.len() < upload::MAX_SHARES_PER_MESH,
+                NodeError::Invalid("mesh share limit exceeded".into())
+            );
+            set.insert(hash);
+            Ok(())
+        })
+    }
+
+    pub fn unshare(&self, mesh: MeshId, hash: BlobHash) -> Result<()> {
+        self.update_shares(mesh, |set| {
+            set.remove(&hash);
+            Ok(())
+        })
     }
 
     pub fn peers(&self) -> Vec<PeerStatus> {

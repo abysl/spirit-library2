@@ -165,11 +165,15 @@ async fn interrupted() -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(root: PathBuf, local: bool) -> Result<()> {
+pub async fn serve(root: PathBuf, local: bool, store: Option<PathBuf>) -> Result<()> {
     let config = if local {
         NodeConfig::local()
     } else {
         NodeConfig::default()
+    };
+    let config = match store {
+        Some(store) => config.with_store(store),
+        None => config,
     };
     let node = Arc::new(Node::bind(&root, config).await?);
     let listener = TcpListener::bind("127.0.0.1:0").await?;

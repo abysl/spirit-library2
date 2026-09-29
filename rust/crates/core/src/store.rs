@@ -292,7 +292,7 @@ impl BlobStore {
         Ok(size)
     }
 
-    pub fn open_reader(&self, hash: BlobHash) -> Result<(u64, impl Read), StoreError> {
+    pub fn open_reader(&self, hash: BlobHash) -> Result<(u64, impl Read + Send), StoreError> {
         let file = open_blob(&self.path_of(hash), hash)?;
         let size = file.metadata()?.len();
         Ok((size, file))

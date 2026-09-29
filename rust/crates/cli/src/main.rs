@@ -30,7 +30,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .map_err(|error| anyhow::anyhow!("{error}"))
         }
-        Command::Node(command) => node_cli::node(command, node_cli::directory(cli.node_dir)?).await,
+        Command::Node(command) => {
+            node_cli::node(command, node_cli::directory(cli.node_dir)?, cli.store).await
+        }
         Command::Mesh(command) => node_cli::mesh(command, node_cli::directory(cli.node_dir)?).await,
     }
 }

@@ -130,6 +130,9 @@ pub(crate) struct Shared {
     pub diagnostics: crate::app::DiagnosticLog,
     pub endpoint: Endpoint,
     pub config: NodeConfig,
+    pub store: Option<Arc<spirit_core::BlobStore>>,
+    pub shares: Mutex<BTreeMap<MeshId, BTreeSet<spirit_core::BlobHash>>>,
+    pub uploads: Mutex<BTreeMap<NodeId, usize>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -352,6 +355,10 @@ impl Shared {
             self.storage.save(&next)?;
             *state = next;
         }
+        self.shares
+            .lock()
+            .unwrap()
+            .retain(|mesh, _| state.current_member(*mesh));
         let members: BTreeSet<_> = state
             .meshes
             .values()
@@ -654,6 +661,14 @@ pub(crate) async fn finish_incoming(
         .await
         .context("incoming request timed out")
         .and_then(|result| result);
+    finish_incoming_result(connection, result, record)
+}
+
+pub(crate) fn finish_incoming_result(
+    connection: &Connection,
+    result: Result<()>,
+    record: impl FnOnce(&anyhow::Error),
+) -> Result<(), AcceptError> {
     connection.close(0u32.into(), b"finished");
     if let Err(error) = &result {
         record(error);

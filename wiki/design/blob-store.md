@@ -24,3 +24,5 @@ store-level error handling is needed.
 Staging files are removed on normal errors and panic unwind; `open` cleans crash leftovers. After a successful rename, directory
 fsync is best-effort for every error: a renamed file may already be visible even when the directory cannot be opened or synced.
 Non-Unix platforms skip directory sync.
+
+The node-owned store serves only per-mesh shares. `has` and `size` inspect metadata.
