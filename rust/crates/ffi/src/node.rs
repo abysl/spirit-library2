@@ -1,6 +1,6 @@
 use crate::{node_error, parse_hash, FfiError};
 use qrcode::{Color, QrCode};
-use spirit_sdk::{MeshId, Node, NodeConfig, NodeId};
+use spirit_sdk::{AppCallContext, MeshId, Node, NodeConfig, NodeId};
 use std::io::{self, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -110,6 +110,75 @@ impl FetchHandle {
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
     }
+}
+
+#[derive(uniffi::Object)]
+pub struct AppCall {
+    context: AppCallContext,
+}
+
+#[uniffi::export]
+impl AppCall {
+    pub fn mesh_id(&self) -> String {
+        self.context.mesh().to_string()
+    }
+
+    pub fn peer(&self) -> String {
+        self.context.peer().to_string()
+    }
+
+    pub fn protocol(&self) -> String {
+        self.context.protocol().to_string()
+    }
+
+    pub fn remaining_ms(&self) -> u64 {
+        self.context.remaining().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.context.is_cancelled()
+    }
+}
+
+#[uniffi::export(callback_interface)]
+pub trait AppHandler: Send + Sync {
+    fn handle(&self, call: Arc<AppCall>, payload: Vec<u8>) -> Result<Vec<u8>, FfiError>;
+}
+
+#[uniffi::export(callback_interface)]
+pub trait AppResponseListener: Send + Sync {
+    fn on_complete(&self, bytes: Option<Vec<u8>>, error: Option<FfiError>);
+}
+
+struct HandlerAdapter(Box<dyn AppHandler>);
+
+impl spirit_sdk::AppHandler for HandlerAdapter {
+    fn handle(&self, context: AppCallContext, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        Ok(self.0.handle(Arc::new(AppCall { context }), payload)?)
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct Diagnostic {
+    pub channel: String,
+    pub mesh: String,
+    pub peer: String,
+    pub protocol: String,
+    pub cause: String,
+}
+
+#[uniffi::export]
+pub fn verify_app(
+    device_id: String,
+    domain: String,
+    bytes: Vec<u8>,
+    signature: String,
+) -> Result<bool, FfiError> {
+    let device: NodeId = device_id
+        .parse::<NodeId>()
+        .map_err(|error| FfiError::Invalid(error.to_string()))?;
+    spirit_sdk::validate_app_name(&domain).map_err(node_error)?;
+    Ok(spirit_sdk::verify_app(device, &domain, &bytes, &signature).is_ok())
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -347,6 +416,94 @@ impl SpiritNode {
             completion.complete(result);
         });
         Ok(handle)
+    }
+
+    pub fn register_app_handler(
+        &self,
+        protocol: String,
+        handler: Box<dyn AppHandler>,
+    ) -> Result<(), FfiError> {
+        self.active()?
+            .register_app_handler(&protocol, Arc::new(HandlerAdapter(handler)))
+            .map_err(node_error)
+    }
+
+    pub fn unregister_app_handler(&self, protocol: String) -> Result<(), FfiError> {
+        self.active()?
+            .unregister_app_handler(&protocol)
+            .map_err(node_error)
+    }
+
+    pub fn start_app_request(
+        &self,
+        mesh_id: String,
+        peer: String,
+        protocol: String,
+        bytes: Vec<u8>,
+        listener: Box<dyn AppResponseListener>,
+    ) -> Result<Arc<FetchHandle>, FfiError> {
+        let node = self.active()?;
+        let mesh = parse_mesh(&mesh_id)?;
+        let peer: NodeId = peer
+            .parse::<NodeId>()
+            .map_err(|error| FfiError::Invalid(error.to_string()))?;
+        let (cancel, mut receiver) = watch::channel(false);
+        let handle = Arc::new(FetchHandle { cancel });
+        runtime()?.spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = async {
+                    while !*receiver.borrow() {
+                        if receiver.changed().await.is_err() { break; }
+                    }
+                } => Err(FfiError::Cancelled),
+                value = node.app_request(mesh, peer, &protocol, bytes) => value.map_err(node_error),
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = catch_unwind(AssertUnwindSafe(|| match result {
+                    Ok(bytes) => listener.on_complete(Some(bytes), None),
+                    Err(error) => listener.on_complete(None, Some(error)),
+                }));
+            })
+            .await;
+        });
+        Ok(handle)
+    }
+
+    pub fn app_request(
+        &self,
+        mesh_id: String,
+        peer: String,
+        protocol: String,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let node = self.active()?;
+        let mesh = parse_mesh(&mesh_id)?;
+        let peer: NodeId = peer
+            .parse::<NodeId>()
+            .map_err(|error| FfiError::Invalid(error.to_string()))?;
+        runtime()?
+            .block_on(node.app_request(mesh, peer, &protocol, bytes))
+            .map_err(node_error)
+    }
+
+    pub fn sign_app(&self, domain: String, bytes: Vec<u8>) -> Result<String, FfiError> {
+        self.active()?.sign_app(&domain, &bytes).map_err(node_error)
+    }
+
+    pub fn diagnostics(&self) -> Result<Vec<Diagnostic>, FfiError> {
+        Ok(self
+            .active()?
+            .diagnostics()
+            .into_iter()
+            .map(|entry| Diagnostic {
+                channel: entry.channel.to_string(),
+                mesh: entry.mesh.map(|mesh| mesh.to_string()).unwrap_or_default(),
+                peer: entry.peer.to_string(),
+                protocol: entry.protocol.unwrap_or_default(),
+                cause: entry.cause,
+            })
+            .collect())
     }
 
     pub fn status(&self) -> Result<NodeStatus, FfiError> {
@@ -920,5 +1077,138 @@ mod fetch_binding_tests {
         assert_eq!(std::fs::read_dir(b_store.join("tmp")).unwrap().count(), 0);
         a.shutdown().unwrap();
         b.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod app_binding_tests {
+    use super::*;
+    use std::sync::mpsc::{channel, Sender};
+
+    struct Echo(Sender<(String, String, String, u64, bool)>);
+
+    impl AppHandler for Echo {
+        fn handle(&self, call: Arc<AppCall>, payload: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            self.0
+                .send((
+                    call.mesh_id(),
+                    call.peer(),
+                    call.protocol(),
+                    call.remaining_ms(),
+                    call.is_cancelled(),
+                ))
+                .unwrap();
+            Ok(payload)
+        }
+    }
+
+    struct UntilCancelled(Sender<()>, Sender<bool>);
+
+    impl AppHandler for UntilCancelled {
+        fn handle(&self, call: Arc<AppCall>, _: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            self.0.send(()).unwrap();
+            let end = std::time::Instant::now() + Duration::from_secs(6);
+            while !call.is_cancelled() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.1.send(call.is_cancelled()).unwrap();
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn app_calls_and_signatures_work_without_a_verifying_node() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "a".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().to_str().unwrap().into(),
+            "b".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let mesh = a.create_mesh("group".into()).unwrap();
+        a.add(mesh.clone(), b.pair().unwrap().ticket).unwrap();
+        let a_id = a.status().unwrap().id;
+        let b_id = b.status().unwrap().id;
+        let (tx, rx) = channel();
+        b.register_app_handler("afm/catalog/1".into(), Box::new(Echo(tx)))
+            .unwrap();
+        assert_eq!(
+            a.app_request(
+                mesh.clone(),
+                b_id.clone(),
+                "afm/catalog/1".into(),
+                b"catalog".to_vec()
+            )
+            .unwrap(),
+            b"catalog"
+        );
+        let (seen_mesh, peer, protocol, remaining, cancelled) =
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            (seen_mesh, peer, protocol),
+            (mesh.clone(), a_id.clone(), "afm/catalog/1".into())
+        );
+        assert!(remaining > 0);
+        assert!(!cancelled);
+        let signature = a
+            .sign_app("afm/catalog/op/1".into(), b"op".to_vec())
+            .unwrap();
+        a.shutdown().unwrap();
+        assert!(verify_app(
+            a_id.clone(),
+            "afm/catalog/op/1".into(),
+            b"op".to_vec(),
+            signature.clone()
+        )
+        .unwrap());
+        assert!(!verify_app(a_id, "afm/catalog/op/2".into(), b"op".to_vec(), signature).unwrap());
+        assert!(matches!(
+            verify_app("bad".into(), "afm/catalog/op/1".into(), vec![], "x".into()),
+            Err(FfiError::Invalid(_))
+        ));
+        b.unregister_app_handler("afm/catalog/1".into()).unwrap();
+        b.shutdown().unwrap();
+    }
+
+    #[test]
+    fn app_call_observes_shutdown_cancellation() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = SpiritNode::open(
+            a_dir.path().to_str().unwrap().into(),
+            "a".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().to_str().unwrap().into(),
+            "b".into(),
+            true,
+            None,
+        )
+        .unwrap();
+        let mesh = a.create_mesh("group".into()).unwrap();
+        a.add(mesh.clone(), b.pair().unwrap().ticket).unwrap();
+        let b_id = b.status().unwrap().id;
+        let (tx, rx) = channel();
+        let (done, cancelled) = channel();
+        b.register_app_handler("afm/catalog/1".into(), Box::new(UntilCancelled(tx, done)))
+            .unwrap();
+        let request =
+            std::thread::spawn(move || a.app_request(mesh, b_id, "afm/catalog/1".into(), vec![]));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        b.shutdown().unwrap();
+        assert!(cancelled.recv_timeout(Duration::from_secs(5)).unwrap());
+        request.join().unwrap().ok();
     }
 }

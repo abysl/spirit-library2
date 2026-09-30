@@ -34,6 +34,7 @@ plugins {
 rootProject.name = "spirit2-kmp"
 
 include(":mesh")
+include(":mesh-testing")
 include(":sdk")
 include(":demo")
 include(":demo:androidApp")

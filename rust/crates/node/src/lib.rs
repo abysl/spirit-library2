@@ -7,7 +7,7 @@ mod storage;
 mod transfer;
 mod upload;
 
-pub use app::{verify_app, AppCallContext, AppHandler, Diagnostic};
+pub use app::{validate_app_name, verify_app, AppCallContext, AppHandler, Diagnostic};
 pub use iroh::EndpointId as NodeId;
 pub use membership::Member;
 pub use mesh_id::MeshId;

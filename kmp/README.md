@@ -63,3 +63,18 @@ devenv shell -- idea .
 ```
 
 Quit existing IntelliJ processes before using this command. The project-local IntelliJ settings use the Gradle wrapper and the devenv-provided Gradle JVM.
+
+## File sharing and app-channel bindings
+
+`MeshFiles` supplies suspend imports from paths or `MeshSource`, verified exports to paths or
+`MeshSink`, per-mesh share-set replacement, cancellable fetch with progress, signed app operations,
+app requests and synchronous app handlers. Android can pass content streams using `importStream`
+and `exportToStream` in `:sdk`; neither requires a filesystem path. Node store operations block
+the caller, so the SDK dispatches them to `Dispatchers.IO`, not Spirit's Tokio runtime workers.
+App handlers run on a blocking native worker and must observe live `AppCallInfo.remainingMs` and
+`isCancelled` and return promptly. Native fetch listeners run on dedicated forwarding threads,
+not Tokio workers; do not call `SpiritNode` synchronously from a listener. The SDK moves progress
+into a child coroutine and joins it before returning. Coroutine cancellation cancels and awaits
+the native transfer, including cancellation while its start call is in flight.
+`verifyApp` also exists as a top-level SDK function and needs no open node; false means the
+signature does not verify. `FakeMeshFiles` ships only in `:mesh-testing`; AFM must depend on this module in `commonTest`, never production. It uses a non-cryptographic 64-hex content digest (not BLAKE3) and deterministic `fake-unsigned:` tokens, **not cryptographic signatures**. Do not use the fake for authentication or production file persistence.

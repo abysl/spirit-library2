@@ -75,6 +75,40 @@ Before accepting a stream, the responder closes authenticated outsiders who shar
 
 The FFI fetch listener receives progress and exactly one completion callback on a dedicated forwarding thread, never a Tokio runtime worker. Listeners must not call `SpiritNode` synchronously; a blocked listener delays its own completion. Listener panics are isolated from the runtime. Cancellation signals the receive loop, closes its input, and joins the blocking writer before reporting `Cancelled`; Kotlin dispatches progress to a child coroutine, joins it before returning, and awaits native completion even when the coroutine is cancelled. UniFFI does not lower `Result` as a callback parameter, so completion carries mutually exclusive nullable size and typed error fields.
 
+The Kotlin `ByteSource.read` and `ByteSink.write`/`finish` callbacks execute on the calling
+SDK IO dispatcher while Rust imports and exports bytes. `finish` is called only after
+successful verification and writes; on failure, a caller creating a partial SAF document
+must delete it. Throwing from a source or sink passes a typed `SourceRead` or
+`Destination` error through UniFFI; the Kotlin caller receives a `MeshNodeException`
+with the original exception as its cause. `AppHandler` executes on a native blocking
+worker, with live `AppCallInfo.remainingMs` and `isCancelled` until the handler returns;
+its call object is closed on return. A thrown `MeshNodeException` records its typed
+category in local diagnostics. An unexpected exception records `Node`, never a Rust
+panic. The requester always receives generic `Unavailable` for handler refusal,
+including the responder's per-peer concurrency limit; it cannot distinguish that
+limit from other refusals. Cancelling a Kotlin app request cancels its native future
+without occupying an SDK IO thread until timeout.
+
+| FFI error | `MeshFailure` |
+|---|---|
+| `Invalid` | `Invalid` |
+| `NodeClosed` | `NodeClosed` |
+| `NodeBusy` | `NodeBusy` |
+| `MeshLimit` | `MeshLimit` |
+| `NotMember` | `NotMember` |
+| `TicketRejected` | `TicketRejected` |
+| `Unavailable` | `Unavailable` |
+| `StoreNotConfigured` | `StoreNotConfigured` |
+| `Interrupted` | `Interrupted` |
+| `Cancelled` | `Cancelled` |
+| `Corrupt { expected, actual }` | `Corrupt`, retaining both hashes |
+| `Timeout` | `Timeout` |
+| `Missing` | `Missing` |
+| `SourceRead` | `SourceRead` |
+| `Destination` | `Destination` |
+| `Io` | `Io` |
+| `Node` | `Node` |
+
 ## Persistence and local control
 
 The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` or `SPIRIT_NODE_DIR`. Blob storage continues to use its separate `--store` setting.
@@ -205,5 +239,6 @@ failures return `Unavailable`. `FetchError::Node(NodeError)` reuses `NotMember`,
 Core `StoreError` distinguishes `NotFound`, `Corrupt`, `InvalidHash`, store `Io`, and destination
 `Destination`. Fetch maps store `Corrupt` to fetch `Corrupt`, missing blobs to node `Unavailable`, and
 store I/O or destination errors to fetch `Io`; no store maps to node `StoreNotConfigured`. The FFI
-reports the requested hash as `Corrupt.expected`; `FetchError::Corrupt` carries no actual hash, so
-`Corrupt.actual` is empty for fetch failures. Store corruption retains both hashes.
+preserves this as `StoreNotConfigured` and reports the requested hash as `Corrupt.expected`;
+`FetchError::Corrupt` carries no actual hash, so `Corrupt.actual` is empty for fetch failures.
+Store corruption retains both hashes.

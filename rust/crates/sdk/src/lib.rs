@@ -5,6 +5,7 @@ pub use spirit_core::{
 
 #[cfg(feature = "node")]
 pub use spirit_node::{
-    write_private, FetchError, LeftMesh, Member, MeshId, MeshInfo, MeshMember, Node, NodeConfig,
-    NodeError, NodeId, NodeInfo, PeerStatus, Pong, CONNECTED_WINDOW, HEARTBEAT_INTERVAL,
+    validate_app_name, verify_app, write_private, AppCallContext, AppHandler, Diagnostic,
+    FetchError, LeftMesh, Member, MeshId, MeshInfo, MeshMember, Node, NodeConfig, NodeError,
+    NodeId, NodeInfo, PeerStatus, Pong, CONNECTED_WINDOW, HEARTBEAT_INTERVAL,
 };
