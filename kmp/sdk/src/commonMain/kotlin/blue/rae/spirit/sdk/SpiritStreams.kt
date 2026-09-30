@@ -5,7 +5,7 @@ import java.io.OutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
-suspend fun MeshFiles.importStream(open: () -> InputStream): String = importSource {
+suspend fun MeshFiles.importStream(open: () -> InputStream): ImportedBlob = importSource {
     val input = open()
     object : MeshSource {
         override fun read(max: Int): ByteArray {

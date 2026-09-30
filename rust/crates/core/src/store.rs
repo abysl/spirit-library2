@@ -236,13 +236,27 @@ impl BlobStore {
     }
 
     pub fn import_file(&self, path: impl AsRef<Path>) -> Result<BlobHash, StoreError> {
-        self.import_reader(File::open(path)?)
+        Ok(self.import_file_with_size(path)?.0)
+    }
+
+    pub fn import_file_with_size(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(BlobHash, u64), StoreError> {
+        self.import_reader_with_size(File::open(path)?)
     }
 
     pub fn import_reader(&self, reader: impl Read) -> Result<BlobHash, StoreError> {
-        let (temp, hash, _) = self.stage(reader)?;
+        Ok(self.import_reader_with_size(reader)?.0)
+    }
+
+    pub fn import_reader_with_size(
+        &self,
+        reader: impl Read,
+    ) -> Result<(BlobHash, u64), StoreError> {
+        let (temp, hash, size) = self.stage(reader)?;
         self.install(temp, hash)?;
-        Ok(hash)
+        Ok((hash, size))
     }
 
     pub fn write_verified(&self, expected: BlobHash, reader: impl Read) -> Result<u64, StoreError> {

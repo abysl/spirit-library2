@@ -72,9 +72,9 @@ Quit existing IntelliJ processes before using this command. The project-local In
 
 ## File sharing and app-channel bindings
 
-`MeshFiles` supplies suspend imports from paths or `MeshSource`, verified exports to paths or
-`MeshSink`, per-mesh share-set replacement, cancellable fetch with progress, signed app operations,
-app requests and synchronous app handlers. Android can pass content streams using `importStream`
+`MeshFiles` supplies suspend imports from paths or `MeshSource` returning `ImportedBlob(hash, size)`, verified exports to paths or
+`MeshSink`, per-mesh share-set replacement, cancellable fetch with progress, signed app operations, trusted `admitted(meshId, deviceId, generation)` history for current
+mesh members (including departed authors), app requests and synchronous app handlers. Android can pass content streams using `importStream`
 and `exportToStream` in `:sdk`; neither requires a filesystem path. Node store operations block
 the caller, so the SDK dispatches them to `Dispatchers.IO`, not Spirit's Tokio runtime workers.
 App handlers run on a blocking native worker and must observe live `AppCallInfo.remainingMs` and

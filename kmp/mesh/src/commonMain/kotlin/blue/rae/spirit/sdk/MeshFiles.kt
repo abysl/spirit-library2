@@ -19,9 +19,12 @@ interface AppCallInfo {
 }
 data class Diagnostic(val channel: String, val mesh: String, val peer: String, val protocol: String, val cause: String)
 
+data class ImportedBlob(val hash: String, val size: Long)
+
 interface MeshFiles {
-    suspend fun importFile(path: String): String
-    suspend fun importSource(open: () -> MeshSource): String
+    suspend fun importFile(path: String): ImportedBlob
+    suspend fun importSource(open: () -> MeshSource): ImportedBlob
+    suspend fun admitted(meshId: String, deviceId: String, generation: Long): Boolean
     suspend fun exportFile(hash: String, path: String): Long
     suspend fun exportTo(hash: String, sink: MeshSink): Long
     suspend fun hasBlob(hash: String): Boolean

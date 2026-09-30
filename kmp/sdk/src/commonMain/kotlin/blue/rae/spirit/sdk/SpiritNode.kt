@@ -133,6 +133,7 @@ class SpiritNode private constructor(
     private val activeCalls = Object()
     private var callCount = 0
     private var teardownClaimed = false
+    private val pendingHandles = mutableSetOf<uniffi.spirit_ffi.FetchHandle>()
 
     companion object {
         suspend fun open(
@@ -187,6 +188,16 @@ class SpiritNode private constructor(
         } finally { endCall() }
     }
 
+    private fun trackHandle(handle: uniffi.spirit_ffi.FetchHandle) = synchronized(activeCalls) {
+        if (closed.get()) handle.cancel() else pendingHandles.add(handle)
+    }
+
+    private fun releaseHandle(handle: uniffi.spirit_ffi.FetchHandle?) {
+        if (handle == null) return
+        synchronized(activeCalls) { pendingHandles.remove(handle) }
+        handle.close()
+    }
+
     private fun finishClose() {
         try { ffi.shutdown() } finally { try { ffi.close() } finally { lease.release() } }
     }
@@ -195,9 +206,11 @@ class SpiritNode private constructor(
         MeshNodeException(failure, error.message ?: failure.name, error)
 
 
-    override suspend fun importFile(path: String): String = io { ffi.importFile(path) }
+    override suspend fun importFile(path: String): ImportedBlob = io {
+        ffi.importFile(path).let { ImportedBlob(it.hash, it.size.toLong()) }
+    }
 
-    override suspend fun importSource(open: () -> MeshSource): String = io {
+    override suspend fun importSource(open: () -> MeshSource): ImportedBlob = io {
         val source = open()
         val original = AtomicReference<Exception?>()
         try {
@@ -211,7 +224,7 @@ class SpiritNode private constructor(
                         if (error is MeshNodeException && error.failure == MeshFailure.NodeClosed) throw FfiException.NodeClosed()
                         throw FfiException.SourceRead(error.message ?: "source read failed")
                     }
-                })
+                }).let { ImportedBlob(it.hash, it.size.toLong()) }
             } catch (error: FfiException) {
                 original.get()?.let {
                     if (it is MeshNodeException && it.failure == MeshFailure.NodeClosed) throw it
@@ -256,6 +269,11 @@ class SpiritNode private constructor(
         }
     }
 
+    override suspend fun admitted(meshId: String, deviceId: String, generation: Long): Boolean = io {
+        if (generation !in 0..UInt.MAX_VALUE.toLong()) throw MeshNodeException(MeshFailure.Invalid)
+        ffi.admitted(meshId, deviceId, generation.toUInt())
+    }
+
     override suspend fun hasBlob(hash: String): Boolean = io { ffi.hasBlob(hash) }
     override suspend fun blobSize(hash: String): Long = io { ffi.blobSize(hash).toLong() }
     override suspend fun setShares(meshId: String, hashes: List<String>) = io { ffi.setShares(meshId, hashes) }
@@ -263,6 +281,7 @@ class SpiritNode private constructor(
     override suspend fun unshare(meshId: String, hash: String) = io { ffi.unshare(meshId, hash) }
 
     override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onQueued: () -> Unit, onProgress: (Long, Long) -> Unit): Long = coroutineScope {
+        if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
         if (expectedSize != null && expectedSize < 0) throw MeshNodeException(MeshFailure.Invalid)
         beginCall()
         val completion = CompletableDeferred<Long>()
@@ -289,6 +308,7 @@ class SpiritNode private constructor(
                                 else completion.completeExceptionally(MeshNodeException(MeshFailure.Node))
                             }
                         }))
+                        trackHandle(checkNotNull(handle.get()))
                     } catch (error: FfiException) { throw mapError(error) }
                 }
                 coroutineContext.ensureActive()
@@ -301,7 +321,7 @@ class SpiritNode private constructor(
         } finally {
             progress.close()
             withContext(NonCancellable) { worker.join() }
-            handle.get()?.close()
+            releaseHandle(handle.get())
             endCall()
         }
     }
@@ -340,6 +360,7 @@ class SpiritNode private constructor(
                                 else completion.completeExceptionally(MeshNodeException(MeshFailure.Node))
                             }
                         }))
+                        trackHandle(checkNotNull(handle.get()))
                     } catch (error: FfiException) { throw mapError(error) }
                 }
                 coroutineContext.ensureActive()
@@ -350,7 +371,7 @@ class SpiritNode private constructor(
                 throw error
             }
         } finally {
-            handle.get()?.close()
+            releaseHandle(handle.get())
             endCall()
         }
     }
@@ -393,6 +414,7 @@ class SpiritNode private constructor(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
+            synchronized(activeCalls) { pendingHandles.forEach { it.cancel() } }
             val deadline = System.nanoTime() + 15_000_000_000L
             val finish = synchronized(activeCalls) {
                 while (callCount != 0) {

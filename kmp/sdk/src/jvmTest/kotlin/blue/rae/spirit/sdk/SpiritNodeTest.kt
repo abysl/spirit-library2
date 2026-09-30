@@ -60,12 +60,25 @@ class SpiritNodeLeaveTest {
             SpiritNode.open(leaverDir, "phone", local = true).use { leaver ->
                 val mesh = member.createMesh("personal")
                 assertEquals("phone", member.add(mesh, leaver.pair().ticket))
+                val id = leaver.status().id
+                assertTrue(member.admitted(mesh, id, 0))
                 val left = leaver.leaveMesh(mesh)
                 assertEquals(LeftMesh(mesh, "personal", 1, 1), left)
                 assertEquals(null, leaver.status().meshes.firstOrNull()?.name)
                 assertTrue(leaver.status().peers.isEmpty())
                 assertTrue(member.status().peers.isEmpty())
+                assertTrue(member.admitted(mesh, id, 0))
+                assertFalse(member.admitted(mesh, id, 1))
+                assertEquals(MeshFailure.NotMember, assertFailsWith<MeshNodeException> {
+                    leaver.admitted(mesh, id, 0)
+                }.failure)
                 assertEquals("phone", member.add(mesh, leaver.pair().ticket))
+                assertTrue(member.admitted(mesh, id, 0))
+                assertTrue(member.admitted(mesh, id, 1))
+                assertFalse(member.admitted(mesh, id, 2))
+                assertEquals(MeshFailure.Invalid, assertFailsWith<MeshNodeException> {
+                    member.admitted(mesh, id, -1)
+                }.failure)
                 assertEquals("personal", leaver.status().meshes.firstOrNull()?.name)
                 assertEquals("phone", member.ping("phone").name)
             }
@@ -194,6 +207,10 @@ class SpiritNodeErrorMappingTest {
         assertEquals("bad input", mapError(FfiException.Invalid("bad input")).message)
         assertEquals("offline", mapError(FfiException.Unavailable("offline")).message)
         assertEquals("io", mapError(FfiException.Io("io")).message)
+        val corrupt = mapError(FfiException.Corrupt("0".repeat(64), "1".repeat(64)))
+        assertEquals("0".repeat(64), corrupt.expectedHash)
+        assertEquals("1".repeat(64), corrupt.actualHash)
+        assertEquals("ticket rejected", mapError(FfiException.TicketRejected("sensitive ticket")).message)
     }
 }
 
@@ -204,8 +221,13 @@ class SpiritNodeStoreTest {
         val store = dir.resolve("store").toString()
         SpiritNode.open(dir.resolve("node").toString(), "a", local = true, storeDir = store).use { node ->
             val bytes = ByteArray(1024 * 1024 + 3) { (it % 251).toByte() }
-            val hash = node.importStream { bytes.inputStream() }
+            val imported = node.importStream { bytes.inputStream() }
+            assertEquals(bytes.size.toLong(), imported.size)
+            val hash = imported.hash
             assertTrue(node.hasBlob(hash))
+            val inputPath = dir.resolve("source")
+            Files.write(inputPath, bytes)
+            assertEquals(imported, node.importFile(inputPath.toString()))
             assertEquals(bytes.size.toLong(), node.blobSize(hash))
             val output = java.io.ByteArrayOutputStream()
             assertEquals(bytes.size.toLong(), node.exportToStream(hash) { output })
@@ -240,7 +262,7 @@ class SpiritNodeCallbackTest {
                 private var done = false
                 override fun read(max: Int): ByteArray = if (done) byteArrayOf() else "a".encodeToByteArray().also { done = true }
                 override fun close() = Unit
-            } }
+            } }.hash
             for (finishFails in listOf(false, true)) {
                 val cause = IOException("sink failed")
                 val error = assertFailsWith<MeshNodeException> {
@@ -298,7 +320,7 @@ class SpiritNodeFetchTest {
                 first.add(mesh, second.pair().ticket)
                 val provider = first.status().id
                 val bytes = ByteArray(5 * 1024 * 1024) { 7 }
-                val source = first.importSource { byteSource(bytes) }
+                val source = first.importSource { byteSource(bytes) }.hash
                 first.share(mesh, source)
                 var updates = 0
                 assertEquals(bytes.size.toLong(), second.fetch(mesh, provider, source, bytes.size.toLong()) { received, total ->
@@ -316,7 +338,7 @@ class SpiritNodeFetchTest {
                 assertEquals(progressFailure.message, assertFailsWith<IOException> {
                     second.fetch(mesh, provider, source, null) { _, _ -> throw progressFailure }
                 }.message)
-                val big = first.importSource { byteSource(ByteArray(64 * 1024 * 1024) { 8 }) }
+                val big = first.importSource { byteSource(ByteArray(64 * 1024 * 1024) { 8 }) }.hash
                 first.share(mesh, big)
                 val started = kotlinx.coroutines.CompletableDeferred<Unit>()
                 val transfer = async {
@@ -332,6 +354,42 @@ class SpiritNodeFetchTest {
     }
 
     @Test
+    fun closeDrainsRunningFetchBeforeReopen() = runBlocking {
+        val aDir = Files.createTempDirectory("spirit-fetch-close-a")
+        val bDir = Files.createTempDirectory("spirit-fetch-close-b")
+        SpiritNode.open(aDir.resolve("node").toString(), "a", local = true,
+            storeDir = aDir.resolve("store").toString()).use { provider ->
+            val bNode = bDir.resolve("node").toString()
+            val bStore = bDir.resolve("store").toString()
+            val consumer = SpiritNode.open(bNode, "b", local = true, storeDir = bStore)
+            try {
+                val mesh = provider.createMesh("group")
+                provider.add(mesh, consumer.pair().ticket)
+                val hash = provider.importSource { byteSource(ByteArray(16 * 1024 * 1024) { 5 }) }.hash
+                provider.share(mesh, hash)
+                val started = CountDownLatch(1)
+                val resume = CountDownLatch(1)
+                val transfer = async(Dispatchers.IO) {
+                    runCatching {
+                        consumer.fetch(mesh, provider.status().id, hash, null) { _, _ ->
+                            started.countDown()
+                            resume.await(5, TimeUnit.SECONDS)
+                        }
+                    }
+                }
+                assertTrue(withContext(Dispatchers.IO) { started.await(5, TimeUnit.SECONDS) })
+                val closing = async(Dispatchers.IO) { consumer.close() }
+                delay(50)
+                resume.countDown()
+                kotlinx.coroutines.withTimeout(10_000) { closing.await(); transfer.await() }
+                SpiritNode.open(bNode, "b", local = true, storeDir = bStore).use {
+                    assertEquals("b", it.status().name)
+                }
+            } finally { consumer.close() }
+        }
+    }
+
+    @Test
     fun cancellationWhileStartIsQueuedDoesNotLeakTransfer() = runBlocking {
         val dir = Files.createTempDirectory("spirit-fetch-cancel-start")
         val providerDir = Files.createTempDirectory("spirit-fetch-cancel-provider")
@@ -342,7 +400,7 @@ class SpiritNodeFetchTest {
                     storeDir = dir.resolve("store").toString(), dispatcher = dispatcher).use { node ->
                     val mesh = provider.createMesh("group")
                     provider.add(mesh, node.pair().ticket)
-                    val hash = provider.importSource { byteSource(ByteArray(4 * 1024 * 1024) { 8 }) }
+                    val hash = provider.importSource { byteSource(ByteArray(4 * 1024 * 1024) { 8 }) }.hash
                     provider.share(mesh, hash)
                     val entered = CountDownLatch(1)
                     val resume = CountDownLatch(1)

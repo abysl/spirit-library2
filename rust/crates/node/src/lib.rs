@@ -328,11 +328,19 @@ impl Node {
     }
 
     pub fn import_file(&self, path: impl AsRef<Path>) -> Result<BlobHash> {
-        Ok(self.store()?.import_file(path)?)
+        Ok(self.import_file_with_size(path)?.0)
+    }
+
+    pub fn import_file_with_size(&self, path: impl AsRef<Path>) -> Result<(BlobHash, u64)> {
+        Ok(self.store()?.import_file_with_size(path)?)
     }
 
     pub fn import_reader(&self, reader: impl Read) -> Result<BlobHash> {
-        Ok(self.store()?.import_reader(reader)?)
+        Ok(self.import_reader_with_size(reader)?.0)
+    }
+
+    pub fn import_reader_with_size(&self, reader: impl Read) -> Result<(BlobHash, u64)> {
+        Ok(self.store()?.import_reader_with_size(reader)?)
     }
 
     pub fn export_file(&self, hash: BlobHash, path: impl AsRef<Path>) -> Result<u64> {
@@ -361,6 +369,16 @@ impl Node {
         ensure!(state.current_member(mesh), NodeError::NotMember);
         let mut shares = self.shared.shares.lock().unwrap();
         change(shares.entry(mesh).or_default())
+    }
+
+    pub fn admitted(&self, mesh: MeshId, device: NodeId, generation: u32) -> Result<bool> {
+        self.ensure_open()?;
+        let state = self.shared.state.lock().unwrap();
+        ensure!(state.current_member(mesh), NodeError::NotMember);
+        Ok(state.meshes[&mesh]
+            .admissions
+            .iter()
+            .any(|admission| admission.member.id == device && admission.generation == generation))
     }
 
     pub fn set_shares(
@@ -662,7 +680,7 @@ impl Node {
         })
     }
 
-    fn ensure_open(&self) -> std::result::Result<(), NodeError> {
+    pub fn ensure_open(&self) -> std::result::Result<(), NodeError> {
         if self.closed.load(Ordering::Acquire) {
             Err(NodeError::NodeClosed)
         } else {
@@ -772,6 +790,13 @@ mod tests {
                 .downcast_ref::<NodeError>(),
             Some(NodeError::NodeClosed)
         ));
+        let mesh = MeshId::legacy(node.info().id);
+        assert!(matches!(
+            node.admitted(mesh, node.info().id, 0)
+                .unwrap_err()
+                .downcast_ref::<NodeError>(),
+            Some(NodeError::NodeClosed)
+        ));
         assert!(matches!(
             node.ping(node.info().id)
                 .await
@@ -779,6 +804,39 @@ mod tests {
                 .downcast_ref::<NodeError>(),
             Some(NodeError::NodeClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn admission_history_survives_departure_and_readmission() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        Node::init(a_dir.path(), "a").unwrap();
+        Node::init(b_dir.path(), "b").unwrap();
+        let a = Node::bind(a_dir.path(), NodeConfig::local()).await.unwrap();
+        let b = Node::bind(b_dir.path(), NodeConfig::local()).await.unwrap();
+        let mesh = a.new_mesh("group").unwrap();
+        let id = b.info().id;
+        assert!(!a.admitted(mesh, id, 0).unwrap());
+        a.add(mesh, &b.pair(Duration::from_secs(300)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(a.admitted(mesh, id, 0).unwrap());
+        b.leave(mesh).await.unwrap();
+        assert!(a.admitted(mesh, id, 0).unwrap());
+        assert!(matches!(
+            b.admitted(mesh, id, 0)
+                .unwrap_err()
+                .downcast_ref::<NodeError>(),
+            Some(NodeError::NotMember)
+        ));
+        a.add(mesh, &b.pair(Duration::from_secs(300)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(a.admitted(mesh, id, 0).unwrap());
+        assert!(a.admitted(mesh, id, 1).unwrap());
+        assert!(!a.admitted(mesh, id, 2).unwrap());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     #[test]

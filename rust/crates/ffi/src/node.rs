@@ -34,12 +34,18 @@ pub trait ByteSink: Send + Sync {
     fn finish(&self) -> Result<(), FfiError>;
 }
 
-struct SourceReader(Box<dyn ByteSource>);
+struct SourceReader {
+    source: Box<dyn ByteSource>,
+    node: Arc<Node>,
+}
 
 impl Read for SourceReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.node
+            .ensure_open()
+            .map_err(|_| io::Error::other(FfiError::NodeClosed))?;
         let max = buf.len().min(SOURCE_CHUNK);
-        let bytes = self.0.read(max as u32).map_err(io::Error::other)?;
+        let bytes = self.source.read(max as u32).map_err(io::Error::other)?;
         if bytes.len() > max {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -51,11 +57,17 @@ impl Read for SourceReader {
     }
 }
 
-struct SinkWriter(Box<dyn ByteSink>);
+struct SinkWriter {
+    sink: Box<dyn ByteSink>,
+    node: Arc<Node>,
+}
 
 impl Write for &SinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf.to_vec()).map_err(io::Error::other)?;
+        self.node
+            .ensure_open()
+            .map_err(|_| io::Error::other(FfiError::NodeClosed))?;
+        self.sink.write(buf.to_vec()).map_err(io::Error::other)?;
         Ok(buf.len())
     }
 
@@ -237,6 +249,12 @@ pub struct PingReply {
     pub elapsed_ms: u64,
 }
 
+#[derive(uniffi::Record)]
+pub struct ImportedBlob {
+    pub hash: String,
+    pub size: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct SpiritNode {
     node: Mutex<Option<Arc<Node>>>,
@@ -290,20 +308,43 @@ impl SpiritNode {
         })
     }
 
-    pub fn import_file(&self, path: String) -> Result<String, FfiError> {
-        Ok(self
+    pub fn import_file(&self, path: String) -> Result<ImportedBlob, FfiError> {
+        let (hash, size) = self
             .active()?
-            .import_file(path)
-            .map_err(node_error)?
-            .to_string())
+            .import_file_with_size(path)
+            .map_err(node_error)?;
+        Ok(ImportedBlob {
+            hash: hash.to_string(),
+            size,
+        })
     }
 
-    pub fn import_source(&self, source: Box<dyn ByteSource>) -> Result<String, FfiError> {
-        Ok(self
-            .active()?
-            .import_reader(SourceReader(source))
-            .map_err(node_error)?
-            .to_string())
+    pub fn import_source(&self, source: Box<dyn ByteSource>) -> Result<ImportedBlob, FfiError> {
+        let node = self.active()?;
+        let (hash, size) = node
+            .import_reader_with_size(SourceReader {
+                source,
+                node: node.clone(),
+            })
+            .map_err(node_error)?;
+        Ok(ImportedBlob {
+            hash: hash.to_string(),
+            size,
+        })
+    }
+
+    pub fn admitted(
+        &self,
+        mesh_id: String,
+        device_id: String,
+        generation: u32,
+    ) -> Result<bool, FfiError> {
+        let node = self.active()?;
+        let device: NodeId = device_id
+            .parse::<NodeId>()
+            .map_err(|error| FfiError::Invalid(error.to_string()))?;
+        node.admitted(parse_mesh(&mesh_id)?, device, generation)
+            .map_err(node_error)
     }
 
     pub fn export_file(&self, hash: String, path: String) -> Result<u64, FfiError> {
@@ -313,12 +354,16 @@ impl SpiritNode {
     }
 
     pub fn export_to(&self, hash: String, sink: Box<dyn ByteSink>) -> Result<u64, FfiError> {
-        let writer = SinkWriter(sink);
-        let size = self
-            .active()?
+        let node = self.active()?;
+        let writer = SinkWriter {
+            sink,
+            node: node.clone(),
+        };
+        let size = node
             .export_to(parse_hash(&hash)?, &writer)
             .map_err(node_error)?;
-        writer.0.finish()?;
+        node.ensure_open().map_err(|_| FfiError::NodeClosed)?;
+        writer.sink.finish()?;
         Ok(size)
     }
 
@@ -335,12 +380,12 @@ impl SpiritNode {
     }
 
     pub fn set_shares(&self, mesh_id: String, hashes: Vec<String>) -> Result<(), FfiError> {
+        let node = self.active()?;
         let hashes = hashes
             .iter()
             .map(|hash| parse_hash(hash))
             .collect::<Result<Vec<_>, _>>()?;
-        self.active()?
-            .set_shares(parse_mesh(&mesh_id)?, hashes)
+        node.set_shares(parse_mesh(&mesh_id)?, hashes)
             .map_err(node_error)
     }
 
@@ -701,6 +746,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overlapping_node_and_store_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("node");
+        for store in [&node, &node.join("store"), dir.path()] {
+            assert!(matches!(
+                SpiritNode::open(
+                    node.to_str().unwrap().into(),
+                    "a".into(),
+                    true,
+                    Some(store.to_str().unwrap().into())
+                ),
+                Err(FfiError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
     fn malformed_mesh_ids_and_closed_node_have_consistent_errors() {
         let dir = tempfile::tempdir().unwrap();
         let node =
@@ -870,6 +932,95 @@ mod store_binding_tests {
         }
     }
 
+    struct ErrorSource;
+    impl ByteSource for ErrorSource {
+        fn read(&self, _: u32) -> Result<Vec<u8>, FfiError> {
+            Err(FfiError::SourceRead("callback failed".into()))
+        }
+    }
+
+    struct ErrorSink;
+    impl ByteSink for ErrorSink {
+        fn write(&self, _: Vec<u8>) -> Result<(), FfiError> {
+            Err(FfiError::Destination("callback failed".into()))
+        }
+        fn finish(&self) -> Result<(), FfiError> {
+            panic!("finish on failed export")
+        }
+    }
+
+    struct ClosingSource(Arc<SpiritNode>, std::sync::atomic::AtomicBool);
+
+    impl ByteSource for ClosingSource {
+        fn read(&self, _: u32) -> Result<Vec<u8>, FfiError> {
+            if self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                panic!("read after shutdown");
+            }
+            self.0.shutdown().unwrap();
+            Ok(vec![1])
+        }
+    }
+
+    struct ClosingSink(Arc<SpiritNode>, std::sync::atomic::AtomicBool);
+
+    impl ByteSink for ClosingSink {
+        fn write(&self, _: Vec<u8>) -> Result<(), FfiError> {
+            if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.0.shutdown().unwrap();
+            }
+            Ok(())
+        }
+        fn finish(&self) -> Result<(), FfiError> {
+            panic!("finish after shutdown")
+        }
+    }
+
+    #[test]
+    fn raw_streams_stop_when_node_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            SpiritNode::open(
+                dir.path().join("node").to_str().unwrap().into(),
+                "a".into(),
+                true,
+                Some(dir.path().join("store").to_str().unwrap().into()),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            node.import_source(Box::new(ClosingSource(node.clone(), Default::default()))),
+            Err(FfiError::NodeClosed)
+        ));
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("store/tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let other = Arc::new(
+            SpiritNode::open(
+                dir.path().join("node").to_str().unwrap().into(),
+                "a".into(),
+                true,
+                Some(dir.path().join("store").to_str().unwrap().into()),
+            )
+            .unwrap(),
+        );
+        let imported = other
+            .import_source(Box::new(Source(Mutex::new(io::Cursor::new(vec![
+                2;
+                64 * 1024
+            ])))))
+            .unwrap();
+        assert!(matches!(
+            other.export_to(
+                imported.hash,
+                Box::new(ClosingSink(other.clone(), Default::default()))
+            ),
+            Err(FfiError::NodeClosed)
+        ));
+    }
+
     #[test]
     fn streams_source_and_verified_export_and_refuses_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -881,12 +1032,22 @@ mod store_binding_tests {
             Some(store.to_str().unwrap().into()),
         )
         .unwrap();
+        assert!(matches!(
+            node.import_source(Box::new(ErrorSource)),
+            Err(FfiError::SourceRead(_))
+        ));
         let bytes = vec![73; 2 * SOURCE_CHUNK + 5];
-        let hash = node
+        let imported = node
             .import_source(Box::new(Source(Mutex::new(io::Cursor::new(bytes.clone())))))
             .unwrap();
+        assert_eq!(imported.size, bytes.len() as u64);
+        let hash = imported.hash;
         assert!(node.has_blob(hash.clone()).unwrap());
         assert_eq!(node.blob_size(hash.clone()).unwrap(), bytes.len() as u64);
+        assert!(matches!(
+            node.export_to(hash.clone(), Box::new(ErrorSink)),
+            Err(FfiError::Destination(_))
+        ));
         let sink = Box::new(Sink(Arc::new(Mutex::new(Vec::new()))));
         assert_eq!(
             node.export_to(hash.clone(), sink).unwrap(),
@@ -998,7 +1159,8 @@ mod fetch_binding_tests {
             .import_source(Box::new(super::store_binding_tests::Source(Mutex::new(
                 io::Cursor::new(vec![3; 5 * 1024 * 1024]),
             ))))
-            .unwrap();
+            .unwrap()
+            .hash;
         a.share(mesh.clone(), small.clone()).unwrap();
         let (tx, rx) = channel();
         let listener = Box::new(Listener {
@@ -1063,7 +1225,8 @@ mod fetch_binding_tests {
             .import_source(Box::new(super::store_binding_tests::Source(Mutex::new(
                 io::Cursor::new(vec![8; 32 * 1024 * 1024]),
             ))))
-            .unwrap();
+            .unwrap()
+            .hash;
         a.share(mesh.clone(), large.clone()).unwrap();
         let (tx, rx) = channel();
         let listener = Arc::new(Listener {

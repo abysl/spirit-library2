@@ -40,7 +40,7 @@ internal class NodeBlobStore(override val dir: String) : BlobStore {
             }
             override fun close() = Unit
         }
-    }
+    }.hash
 
     override suspend fun get(hash: String): ByteArray {
         val output = ByteArrayOutputStream()
