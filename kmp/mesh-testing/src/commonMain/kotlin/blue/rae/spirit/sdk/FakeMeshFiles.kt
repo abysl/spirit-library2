@@ -63,7 +63,7 @@ class FakeMeshFiles(val deviceId: String = "fake-node") : MeshFiles {
     override suspend fun unshare(meshId: String, hash: String) {
         mutex.withLock { shared[meshId]?.remove(hash) }
     }
-    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long {
+    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onQueued: () -> Unit, onProgress: (Long, Long) -> Unit): Long {
         val size = blobSize(hash)
         if (expectedSize != null && expectedSize != size) throw MeshNodeException(MeshFailure.Corrupt)
         onProgress(size, size)

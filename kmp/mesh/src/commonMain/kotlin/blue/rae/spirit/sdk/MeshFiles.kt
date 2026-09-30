@@ -29,7 +29,7 @@ interface MeshFiles {
     suspend fun setShares(meshId: String, hashes: List<String>)
     suspend fun share(meshId: String, hash: String)
     suspend fun unshare(meshId: String, hash: String)
-    suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long
+    suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onQueued: () -> Unit = {}, onProgress: (Long, Long) -> Unit): Long
     suspend fun registerAppHandler(protocol: String, handler: (AppCallInfo, ByteArray) -> ByteArray)
     suspend fun unregisterAppHandler(protocol: String)
     suspend fun appRequest(meshId: String, peer: String, protocol: String, bytes: ByteArray): ByteArray

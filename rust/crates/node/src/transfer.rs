@@ -69,13 +69,18 @@ impl Read for ChannelReader {
     }
 }
 
+pub(crate) struct FetchCallbacks<P, Q> {
+    pub(crate) progress: P,
+    pub(crate) queued: Q,
+}
+
 pub(crate) async fn fetch(
     shared: &Arc<Shared>,
     mesh: MeshId,
     provider: NodeId,
     hash: BlobHash,
     expected_size: Option<u64>,
-    progress: impl Fn(u64, u64),
+    callbacks: FetchCallbacks<impl Fn(u64, u64), impl Fn()>,
     cancel: &mut watch::Receiver<bool>,
 ) -> std::result::Result<u64, FetchError> {
     if !shared.both_current_members(mesh, provider) {
@@ -87,11 +92,26 @@ pub(crate) async fn fetch(
         if expected_size.is_some_and(|expected| expected != size) {
             return Err(FetchError::Corrupt);
         }
-        progress(size, size);
+        (callbacks.progress)(size, size);
         return Ok(size);
     }
-    let _permit = tokio::select! { biased; _ = cancelled(cancel) => return Err(FetchError::Cancelled), permit = shared.fetches.clone().acquire_owned() => permit }
-        .map_err(|_| FetchError::Node(NodeError::Unavailable("fetch queue closed".into())))?;
+    let _permit = match shared.fetches.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            (callbacks.queued)();
+            tokio::select! {
+                biased;
+                _ = cancelled(cancel) => return Err(FetchError::Cancelled),
+                permit = shared.fetches.clone().acquire_owned() => permit,
+            }
+            .map_err(|_| FetchError::Node(NodeError::Unavailable("fetch queue closed".into())))?
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err(FetchError::Node(NodeError::Unavailable(
+                "fetch queue closed".into(),
+            )));
+        }
+    };
     let address = shared.address_for_mesh(provider, mesh);
     let connection = tokio::select! { biased; _ = cancelled(cancel) => return Err(FetchError::Cancelled), result = tokio::time::timeout(shared.config.request_timeout, shared.endpoint.connect(address, BLOB_ALPN)) => result }
     .map_err(|_| unavailable())?
@@ -102,7 +122,7 @@ pub(crate) async fn fetch(
         mesh,
         hash,
         expected_size,
-        progress,
+        callbacks.progress,
         cancel,
     )
     .await;
@@ -374,12 +394,25 @@ mod tests {
             );
         }
         assert_eq!(b.shared.fetches.available_permits(), 0);
-        let fifth = b.fetch(mesh, a.info().id, hash, None, |_, _| {});
+        let queued = AtomicUsize::new(0);
+        let (_sender, cancel) = watch::channel(false);
+        let fifth = b.fetch_cancellable(
+            mesh,
+            a.info().id,
+            hash,
+            None,
+            |_, _| {},
+            || {
+                queued.fetch_add(1, Ordering::Relaxed);
+            },
+            cancel,
+        );
         tokio::pin!(fifth);
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut fifth)
             .await
             .is_err());
         assert_eq!(b.shared.fetches.available_permits(), 0);
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
         drop(permits);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(10), fifth)

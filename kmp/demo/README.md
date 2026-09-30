@@ -29,3 +29,16 @@ The parent development environment builds the sibling `../rust` FFI crate, gener
 The **Devices** tab lists groups and their members, lets you create groups, paste or scan a ticket from within a chosen group, show this device’s QR, leave a group, and ping its members. **Blobs** retains local put/get. Android scans QR codes with the camera; desktop imports PNG/JPEG QR images. The [pairing guide](../README.md#device-pairing-and-presence) describes ticket use and node handover.
 
 Green means an authenticated valid ping or pong was received from that member less than 60 seconds ago; red means no previous heartbeat or at least 60 seconds of silence. The demo does not display per-peer network error diagnostics; transport connection flags and errors do not determine this presence color. Rust heartbeats run every five seconds independently of UI polling.
+
+The Blobs tab now imports and exports through the same `SpiritNode` owned by the
+Devices session; no separate `SpiritStore` takes a second lock. Desktop keeps its
+blob directory at `~/.spirit2/ktdemo`. Android now stores blobs under the app's
+non-backed-up `spirit-store` directory, alongside the non-backed-up node identity,
+instead of the old backed-up `files/spirit` directory. Old demo blobs are not
+migrated automatically. If they matter, back up the old app-private `files/spirit`
+contents before upgrading, then restore them to `no_backup/spirit-store` while the
+upgraded demo is stopped, before its first store open. This requires an app-data
+capable tool (for example `adb run-as` on a debuggable build); the destination
+cannot be copied into before upgrade. Node opening
+happens once per session and blob requests wait until the node is bound. Closing
+the session releases the store lock before Android's next activity opens a node.

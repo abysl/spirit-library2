@@ -262,14 +262,16 @@ class SpiritNode private constructor(
     override suspend fun share(meshId: String, hash: String) = io { ffi.share(meshId, hash) }
     override suspend fun unshare(meshId: String, hash: String) = io { ffi.unshare(meshId, hash) }
 
-    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long = coroutineScope {
+    override suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onQueued: () -> Unit, onProgress: (Long, Long) -> Unit): Long = coroutineScope {
         if (expectedSize != null && expectedSize < 0) throw MeshNodeException(MeshFailure.Invalid)
         beginCall()
         val completion = CompletableDeferred<Long>()
-        val progress = Channel<Pair<Long, Long>>(Channel.CONFLATED)
+        val progress = Channel<Pair<Long?, Long?>>(Channel.BUFFERED)
         val handle = AtomicReference<uniffi.spirit_ffi.FetchHandle?>()
         val worker = launch(dispatcher) {
-            for ((received, total) in progress) onProgress(received, total)
+            for ((received, total) in progress) {
+                if (received == null) onQueued() else onProgress(received, checkNotNull(total))
+            }
         }
         try {
             try {
@@ -277,6 +279,7 @@ class SpiritNode private constructor(
                     if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
                     try {
                         handle.set(ffi.startFetch(meshId, provider, hash, expectedSize?.toULong(), object : FetchListener {
+                            override fun onQueued() { progress.trySend(null to null) }
                             override fun onProgress(received: ULong, total: ULong) {
                                 progress.trySend(received.toLong() to total.toLong())
                             }

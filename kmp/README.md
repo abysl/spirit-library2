@@ -38,7 +38,13 @@ Native preparation compiles the sibling Rust workspace before the consuming Grad
 
 The portable `:mesh` contract has `MeshNode.status(): NodeStatus` (identity, a list of groups with member IDs, names and generations, and deduplicated peer presence, plus native pending-ticket state), `createMesh(name): String`, `pair(): PairingInvitation`, `add(meshId, ticket): String`, `leaveMesh(meshId): LeftMesh`, `ping(device): NodePong`, and `shutdown()`. The JVM/Android `SpiritNode` implements it over UniFFI; it dispatches native operations off the main thread.
 
-`MeshSession(nodeFactory, nowMillis)` owns one node during `run()`. `run()` may be called only once per session. The host creates one session in its owner scope and cancels and joins its run job before closing other resources. Native operations and state publication already in progress finish before shutdown, so cancellation does not roll back enrollment. An open failure becomes state and ends `run()`; it is not an invitation to reopen the directory in the composable. It publishes `StateFlow<MeshState>` with `groups: List<GroupState>`, each containing its current members and their presence, a deduplicated `peers` list, the device's invitation and remaining seconds, `busy`, `error`, typed `failure: MeshFailure?`, and `notice`. Use `createGroup(name): String?` to identify the new group even when names collide; `addDevice(meshId, ticket): AddDeviceResult` distinguishes an admitted device from typed failures; `leaveGroup(meshId): LeftMesh?` returns the remaining/notified counts. Use `refreshTicket()` and `clearMessages()` to manage QR and notice/error/failure. `ping(deviceId)` and `reportError(message)` are available to the host. There is no automatic group creation.
+`MeshSession(nodeFactory, nowMillis)` owns one node during `run()`. Its
+`files: StateFlow<MeshFiles?>` publishes the node's file contract on every open,
+before the first poll, and clears it on close. AFM can observe it to register a
+catalog handler and reapply share sets for each opening without retaining a
+stale node. Nodes that do not implement `MeshFiles` publish null.
+
+`MeshSession.run()` may be called only once per session. The host creates one session in its owner scope and cancels and joins its run job before closing other resources. Native operations and state publication already in progress finish before shutdown, so cancellation does not roll back enrollment. An open failure becomes state and ends `run()`; it is not an invitation to reopen the directory in the composable. It publishes `StateFlow<MeshState>` with `groups: List<GroupState>`, each containing its current members and their presence, a deduplicated `peers` list, the device's invitation and remaining seconds, `busy`, `error`, typed `failure: MeshFailure?`, and `notice`. Use `createGroup(name): String?` to identify the new group even when names collide; `addDevice(meshId, ticket): AddDeviceResult` distinguishes an admitted device from typed failures; `leaveGroup(meshId): LeftMesh?` returns the remaining/notified counts. Use `refreshTicket()` and `clearMessages()` to manage QR and notice/error/failure. `ping(deviceId)` and `reportError(message)` are available to the host. There is no automatic group creation.
 
 An invitation is offered on initial status even when enrolled. Tickets are five-minute, single-use bearer credentials: anyone holding one can add the device to a group they choose. An invitation is withdrawn when native status says its ticket is no longer pending (even if readmission was into an existing group), when a first group is created locally, or when it expires. First-group creation and leaving withdraw the current ticket and offer one fresh ticket; subsequent group creation preserves the pending invitation. The QR countdown starts before native generation and uses monotonic time. Tickets are trimmed, limited to 8,192 UTF-8 bytes and checked for `spirit1` URL-safe syntax before native calls; the session rejects its own invitation and never includes a ticket in its error text. Rust validates payloads, expiry, self pairing and replay.
 
@@ -72,9 +78,14 @@ app requests and synchronous app handlers. Android can pass content streams usin
 and `exportToStream` in `:sdk`; neither requires a filesystem path. Node store operations block
 the caller, so the SDK dispatches them to `Dispatchers.IO`, not Spirit's Tokio runtime workers.
 App handlers run on a blocking native worker and must observe live `AppCallInfo.remainingMs` and
-`isCancelled` and return promptly. Native fetch listeners run on dedicated forwarding threads,
+`isCancelled` and return promptly. Native fetches each use one OS thread for listener forwarding,
 not Tokio workers; do not call `SpiritNode` synchronously from a listener. The SDK moves progress
-into a child coroutine and joins it before returning. Coroutine cancellation cancels and awaits
-the native transfer, including cancellation while its start call is in flight.
+into a child coroutine and joins it before returning. Slow consumers may miss progress updates,
+but the completion result is always delivered. Closing the node during a fetch reports `Cancelled`,
+not `NodeClosed`; calls starting after close report `NodeClosed`. Coroutine cancellation cancels and awaits
+the native transfer, including cancellation while its start call is in flight. Adapters catch
+`Exception`; a JVM `Error` instead becomes an opaque `Node` failure. `onQueued`
+reports permit waiting separately from `onProgress`; a local blob hit reports one final
+progress update without entering the transfer queue.
 `verifyApp` also exists as a top-level SDK function and needs no open node; false means the
 signature does not verify. `FakeMeshFiles` ships only in `:mesh-testing`; AFM must depend on this module in `commonTest`, never production. It uses a non-cryptographic 64-hex content digest (not BLAKE3) and deterministic `fake-unsigned:` tokens, **not cryptographic signatures**. Do not use the fake for authentication or production file persistence.

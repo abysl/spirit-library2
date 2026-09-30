@@ -18,8 +18,8 @@ import kotlinx.coroutines.launch
 
 class DeviceModel(application: Application) : AndroidViewModel(application) {
     init { AndroidNodeContext.initialize(application) }
-    val store = openBlobStore(application.filesDir.resolve("spirit").path)
-    val session = openMeshSession(application.noBackupFilesDir.resolve("spirit-node").path, Build.MODEL)
+    val store = openBlobStore(application.noBackupFilesDir.resolve("spirit-store").path)
+    val session = openMeshSession(application.noBackupFilesDir.resolve("spirit-node").path, Build.MODEL, store = store)
     private val ownerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val running = ownerScope.launch { session?.run() }
 
