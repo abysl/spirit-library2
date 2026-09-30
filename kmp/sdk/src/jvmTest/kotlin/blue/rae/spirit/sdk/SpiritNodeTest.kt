@@ -11,6 +11,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.asCoroutineDispatcher
+import java.util.concurrent.Executors
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -171,8 +173,27 @@ class SpiritNodeErrorMappingTest {
             FfiException.NotMember("not enrolled") to MeshFailure.NotMember,
             FfiException.NodeClosed() to MeshFailure.NodeClosed,
             FfiException.NodeBusy() to MeshFailure.NodeBusy,
+            FfiException.Node("generic") to MeshFailure.Node,
+            FfiException.Unavailable("offline") to MeshFailure.Unavailable,
+            FfiException.MeshLimit() to MeshFailure.MeshLimit,
+            FfiException.StoreNotConfigured() to MeshFailure.StoreNotConfigured,
+            FfiException.Interrupted() to MeshFailure.Interrupted,
+            FfiException.Corrupt("0".repeat(64), "1".repeat(64)) to MeshFailure.Corrupt,
+            FfiException.Timeout() to MeshFailure.Timeout,
+            FfiException.Missing("missing") to MeshFailure.Missing,
+            FfiException.Destination("sink") to MeshFailure.Destination,
+            FfiException.SourceRead("source") to MeshFailure.SourceRead,
+            FfiException.Io("io") to MeshFailure.Io,
+            FfiException.Cancelled() to MeshFailure.Cancelled,
         )
-        for ((error, expected) in cases) assertEquals(expected, mapError(error).failure)
+        for ((error, expected) in cases) {
+            val mapped = mapError(error)
+            assertEquals(expected, mapped.failure)
+            assertEquals(error, mapped.cause)
+        }
+        assertEquals("bad input", mapError(FfiException.Invalid("bad input")).message)
+        assertEquals("offline", mapError(FfiException.Unavailable("offline")).message)
+        assertEquals("io", mapError(FfiException.Io("io")).message)
     }
 }
 
@@ -263,5 +284,90 @@ class SpiritNodeCallbackTest {
             SpiritNode.open(dir.resolve("node").toString(), "a", local = true,
                 storeDir = dir.resolve("store").toString()).use { assertEquals("a", it.status().name) }
         } finally { resume.countDown(); node.close() }
+    }
+}
+
+class SpiritNodeFetchTest {
+    @Test
+    fun fetchSharesProgressAndWaitsForCancellationCleanup() = runBlocking {
+        val firstDir = Files.createTempDirectory("spirit-fetch-a")
+        val secondDir = Files.createTempDirectory("spirit-fetch-b")
+        SpiritNode.open(firstDir.resolve("node").toString(), "a", local = true, storeDir = firstDir.resolve("store").toString()).use { first ->
+            SpiritNode.open(secondDir.resolve("node").toString(), "b", local = true, storeDir = secondDir.resolve("store").toString()).use { second ->
+                val mesh = first.createMesh("group")
+                first.add(mesh, second.pair().ticket)
+                val provider = first.status().id
+                val bytes = ByteArray(5 * 1024 * 1024) { 7 }
+                val source = first.importSource { byteSource(bytes) }
+                first.share(mesh, source)
+                var updates = 0
+                assertEquals(bytes.size.toLong(), second.fetch(mesh, provider, source, bytes.size.toLong()) { received, total ->
+                    assertTrue(received <= total)
+                    updates++
+                })
+                assertTrue(updates > 0)
+                val exported = java.io.ByteArrayOutputStream()
+                second.exportTo(source, object : MeshSink {
+                    override fun write(bytes: ByteArray) { exported.write(bytes) }
+                    override fun finish() = Unit
+                })
+                assertTrue(bytes.contentEquals(exported.toByteArray()))
+                val progressFailure = IOException("progress failed")
+                assertEquals(progressFailure.message, assertFailsWith<IOException> {
+                    second.fetch(mesh, provider, source, null) { _, _ -> throw progressFailure }
+                }.message)
+                val big = first.importSource { byteSource(ByteArray(64 * 1024 * 1024) { 8 }) }
+                first.share(mesh, big)
+                val started = kotlinx.coroutines.CompletableDeferred<Unit>()
+                val transfer = async {
+                    second.fetch(mesh, provider, big, null) { _, _ -> started.complete(Unit) }
+                }
+                kotlinx.coroutines.withTimeout(20_000) { started.await() }
+                transfer.cancel()
+                kotlinx.coroutines.withTimeout(20_000) { transfer.join() }
+                assertFalse(second.hasBlob(big))
+                assertEquals(0L, Files.list(secondDir.resolve("store/tmp")).use { it.count() })
+            }
+        }
+    }
+
+    @Test
+    fun cancellationWhileStartIsQueuedDoesNotLeakTransfer() = runBlocking {
+        val dir = Files.createTempDirectory("spirit-fetch-cancel-start")
+        val providerDir = Files.createTempDirectory("spirit-fetch-cancel-provider")
+        SpiritNode.open(providerDir.resolve("node").toString(), "provider", local = true,
+            storeDir = providerDir.resolve("store").toString()).use { provider ->
+            Executors.newSingleThreadExecutor().asCoroutineDispatcher().use { dispatcher ->
+                SpiritNode.open(dir.resolve("node").toString(), "receiver", local = true,
+                    storeDir = dir.resolve("store").toString(), dispatcher = dispatcher).use { node ->
+                    val mesh = provider.createMesh("group")
+                    provider.add(mesh, node.pair().ticket)
+                    val hash = provider.importSource { byteSource(ByteArray(4 * 1024 * 1024) { 8 }) }
+                    provider.share(mesh, hash)
+                    val entered = CountDownLatch(1)
+                    val resume = CountDownLatch(1)
+                    dispatcher.executor.execute { entered.countDown(); resume.await(5, TimeUnit.SECONDS) }
+                    try {
+                        assertTrue(withContext(Dispatchers.IO) { entered.await(5, TimeUnit.SECONDS) })
+                        val transfer = async { node.fetch(mesh, provider.status().id, hash, null) { _, _ -> } }
+                        delay(50)
+                        transfer.cancel()
+                        resume.countDown()
+                        withContext(Dispatchers.IO) { kotlinx.coroutines.withTimeout(5_000) { transfer.join() } }
+                        assertFalse(node.hasBlob(hash))
+                        assertEquals(0L, Files.list(dir.resolve("store/tmp")).use { it.count() })
+                    } finally { resume.countDown() }
+                }
+            }
+        }
+    }
+
+    private fun byteSource(bytes: ByteArray): MeshSource = object : MeshSource {
+        private var offset = 0
+        override fun read(max: Int): ByteArray {
+            val end = (offset + max).coerceAtMost(bytes.size)
+            return bytes.copyOfRange(offset, end).also { offset = end }
+        }
+        override fun close() = Unit
     }
 }

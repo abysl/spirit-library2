@@ -13,6 +13,8 @@ pub enum FfiError {
     StoreNotConfigured,
     #[error("blob transfer interrupted")]
     Interrupted,
+    #[error("fetch cancelled")]
+    Cancelled,
     #[error("transfer timed out")]
     Timeout,
     #[error("store io: {0}")]
@@ -65,6 +67,10 @@ impl From<StoreError> for FfiError {
 }
 
 fn node_error(error: anyhow::Error) -> FfiError {
+    node_error_with_hash(error, None)
+}
+
+fn node_error_with_hash(error: anyhow::Error, expected_hash: Option<BlobHash>) -> FfiError {
     for cause in error.chain() {
         if let Some(callback) = cause.downcast_ref::<FfiError>() {
             return match callback {
@@ -80,8 +86,9 @@ fn node_error(error: anyhow::Error) -> FfiError {
         return match error {
             spirit_sdk::FetchError::Node(error) => map_node_error(error, detail),
             spirit_sdk::FetchError::Interrupted => FfiError::Interrupted,
+            spirit_sdk::FetchError::Cancelled => FfiError::Cancelled,
             spirit_sdk::FetchError::Corrupt => FfiError::Corrupt {
-                expected: String::new(),
+                expected: expected_hash.map_or_else(String::new, |hash| hash.to_string()),
                 actual: String::new(),
             },
             spirit_sdk::FetchError::Timeout => FfiError::Timeout,

@@ -20,4 +20,5 @@ interface MeshFiles {
     suspend fun setShares(meshId: String, hashes: List<String>)
     suspend fun share(meshId: String, hash: String)
     suspend fun unshare(meshId: String, hash: String)
+    suspend fun fetch(meshId: String, provider: String, hash: String, expectedSize: Long?, onProgress: (Long, Long) -> Unit): Long
 }

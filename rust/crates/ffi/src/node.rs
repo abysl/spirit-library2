@@ -1,10 +1,12 @@
 use crate::{node_error, parse_hash, FfiError};
 use qrcode::{Color, QrCode};
-use spirit_sdk::{MeshId, Node, NodeConfig};
+use spirit_sdk::{MeshId, Node, NodeConfig, NodeId};
 use std::io::{self, Read, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 
 fn runtime() -> Result<&'static Runtime, FfiError> {
     static RUNTIME: OnceLock<Result<Runtime, std::io::Error>> = OnceLock::new();
@@ -65,6 +67,49 @@ impl Write for &SinkWriter {
 fn parse_mesh(text: &str) -> Result<MeshId, FfiError> {
     text.parse()
         .map_err(|error: anyhow::Error| FfiError::Invalid(error.to_string()))
+}
+
+#[uniffi::export(callback_interface)]
+pub trait FetchListener: Send + Sync {
+    fn on_progress(&self, received: u64, total: u64);
+    fn on_complete(&self, size: Option<u64>, error: Option<FfiError>);
+}
+
+enum FetchEvent {
+    Progress(u64, u64),
+    Complete(Result<u64, FfiError>),
+}
+
+struct FetchCompletion(Option<mpsc::Sender<FetchEvent>>);
+
+impl FetchCompletion {
+    fn complete(mut self, result: Result<u64, FfiError>) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(FetchEvent::Complete(result));
+        }
+    }
+}
+
+impl Drop for FetchCompletion {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(FetchEvent::Complete(Err(FfiError::Node(
+                "fetch task panicked".into(),
+            ))));
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct FetchHandle {
+    cancel: watch::Sender<bool>,
+}
+
+#[uniffi::export]
+impl FetchHandle {
+    pub fn cancel(&self) {
+        self.cancel.send_replace(true);
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -238,6 +283,70 @@ impl SpiritNode {
         self.active()?
             .unshare(parse_mesh(&mesh_id)?, parse_hash(&hash)?)
             .map_err(node_error)
+    }
+
+    pub fn start_fetch(
+        &self,
+        mesh_id: String,
+        provider: String,
+        hash: String,
+        expected_size: Option<u64>,
+        listener: Box<dyn FetchListener>,
+    ) -> Result<Arc<FetchHandle>, FfiError> {
+        let node = self.active()?;
+        let mesh = parse_mesh(&mesh_id)?;
+        let provider: NodeId = provider
+            .parse::<NodeId>()
+            .map_err(|error| FfiError::Invalid(error.to_string()))?;
+        let hash = parse_hash(&hash)?;
+        let (cancel, receiver) = watch::channel(false);
+        let handle = Arc::new(FetchHandle { cancel });
+        let (sender, events) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("spirit-fetch-listener".into())
+            .spawn(move || {
+                for event in events {
+                    match event {
+                        FetchEvent::Progress(received, total) => {
+                            let _ = catch_unwind(AssertUnwindSafe(|| {
+                                listener.on_progress(received, total)
+                            }));
+                        }
+                        FetchEvent::Complete(result) => {
+                            let _ = catch_unwind(AssertUnwindSafe(|| match result {
+                                Ok(size) => listener.on_complete(Some(size), None),
+                                Err(error) => listener.on_complete(None, Some(error)),
+                            }));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| FfiError::Node(error.to_string()))?;
+        let completion = FetchCompletion(Some(sender.clone()));
+        runtime()?.spawn(async move {
+            let fetch = tokio::spawn(async move {
+                node.fetch_cancellable(
+                    mesh,
+                    provider,
+                    hash,
+                    expected_size,
+                    |received, total| {
+                        let _ = sender.send(FetchEvent::Progress(received, total));
+                    },
+                    receiver,
+                )
+                .await
+            });
+            let result = match fetch.await {
+                Ok(result) => {
+                    result.map_err(|error| crate::node_error_with_hash(error.into(), Some(hash)))
+                }
+                Err(error) => Err(FfiError::Node(format!("fetch task failed: {error}"))),
+            };
+            completion.complete(result);
+        });
+        Ok(handle)
     }
 
     pub fn status(&self) -> Result<NodeStatus, FfiError> {
@@ -575,7 +684,7 @@ mod store_binding_tests {
     use super::*;
     use std::sync::Mutex;
 
-    struct Source(Mutex<io::Cursor<Vec<u8>>>);
+    pub(super) struct Source(pub(crate) Mutex<io::Cursor<Vec<u8>>>);
     impl ByteSource for Source {
         fn read(&self, max: u32) -> Result<Vec<u8>, FfiError> {
             let mut buf = vec![0; max as usize];
@@ -630,5 +739,186 @@ mod store_binding_tests {
         ));
         assert!(contents.lock().unwrap().is_empty());
         node.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fetch_binding_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+
+    struct Listener {
+        events: AtomicUsize,
+        handle: Mutex<Option<Arc<FetchHandle>>>,
+        cancel_on_progress: bool,
+        complete: Sender<Result<u64, FfiError>>,
+    }
+
+    impl FetchListener for Listener {
+        fn on_progress(&self, received: u64, total: u64) {
+            assert!(received <= total);
+            self.events.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_on_progress {
+                if let Some(handle) = self.handle.lock().unwrap().as_ref() {
+                    handle.cancel();
+                }
+            }
+        }
+        fn on_complete(&self, size: Option<u64>, error: Option<FfiError>) {
+            let result = match (size, error) {
+                (Some(size), None) => Ok(size),
+                (None, Some(error)) => Err(error),
+                _ => panic!("invalid completion"),
+            };
+            self.complete.send(result).unwrap();
+        }
+    }
+
+    struct ForwardListener(Arc<Listener>);
+    impl FetchListener for ForwardListener {
+        fn on_progress(&self, received: u64, total: u64) {
+            self.0.on_progress(received, total);
+        }
+        fn on_complete(&self, size: Option<u64>, error: Option<FfiError>) {
+            self.0.on_complete(size, error);
+        }
+    }
+
+    struct PanickingListener(Sender<Result<u64, FfiError>>);
+    impl FetchListener for PanickingListener {
+        fn on_progress(&self, _: u64, _: u64) {
+            panic!("listener failed");
+        }
+        fn on_complete(&self, size: Option<u64>, error: Option<FfiError>) {
+            self.0
+                .send(match (size, error) {
+                    (Some(size), None) => Ok(size),
+                    (None, Some(error)) => Err(error),
+                    _ => panic!("invalid completion"),
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn fetch_reports_progress_and_cancel_after_writer_cleanup() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a_store = a_dir.path().join("store");
+        let b_store = b_dir.path().join("store");
+        let a = SpiritNode::open(
+            a_dir.path().join("node").to_str().unwrap().into(),
+            "a".into(),
+            true,
+            Some(a_store.to_str().unwrap().into()),
+        )
+        .unwrap();
+        let b = SpiritNode::open(
+            b_dir.path().join("node").to_str().unwrap().into(),
+            "b".into(),
+            true,
+            Some(b_store.to_str().unwrap().into()),
+        )
+        .unwrap();
+        let mesh = a.create_mesh("group".into()).unwrap();
+        a.add(mesh.clone(), b.pair().unwrap().ticket).unwrap();
+        let provider = a.status().unwrap().id;
+        let small = a
+            .import_source(Box::new(super::store_binding_tests::Source(Mutex::new(
+                io::Cursor::new(vec![3; 5 * 1024 * 1024]),
+            ))))
+            .unwrap();
+        a.share(mesh.clone(), small.clone()).unwrap();
+        let (tx, rx) = channel();
+        let listener = Box::new(Listener {
+            events: AtomicUsize::new(0),
+            handle: Mutex::new(None),
+            cancel_on_progress: false,
+            complete: tx,
+        });
+        let handle = b
+            .start_fetch(
+                mesh.clone(),
+                provider.clone(),
+                small.clone(),
+                None,
+                listener,
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            5 * 1024 * 1024
+        );
+        assert!(b.has_blob(small.clone()).unwrap());
+        let (tx, rx) = channel();
+        let panicking = b
+            .start_fetch(
+                mesh.clone(),
+                provider.clone(),
+                small.clone(),
+                None,
+                Box::new(PanickingListener(tx)),
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            5 * 1024 * 1024
+        );
+        drop(panicking);
+        let (tx, rx) = channel();
+        let mismatch = b
+            .start_fetch(
+                mesh.clone(),
+                provider.clone(),
+                small.clone(),
+                Some(1),
+                Box::new(Listener {
+                    events: AtomicUsize::new(0),
+                    handle: Mutex::new(None),
+                    cancel_on_progress: false,
+                    complete: tx,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Err(FfiError::Corrupt { expected, actual }) if expected == small && actual.is_empty()
+        ));
+        mismatch.cancel();
+        handle.cancel();
+        assert!(b.has_blob(small).unwrap());
+        drop(handle);
+        let large = a
+            .import_source(Box::new(super::store_binding_tests::Source(Mutex::new(
+                io::Cursor::new(vec![8; 32 * 1024 * 1024]),
+            ))))
+            .unwrap();
+        a.share(mesh.clone(), large.clone()).unwrap();
+        let (tx, rx) = channel();
+        let listener = Arc::new(Listener {
+            events: AtomicUsize::new(0),
+            handle: Mutex::new(None),
+            cancel_on_progress: true,
+            complete: tx,
+        });
+        let handle = b
+            .start_fetch(
+                mesh.clone(),
+                provider,
+                large.clone(),
+                None,
+                Box::new(ForwardListener(listener.clone())),
+            )
+            .unwrap();
+        *listener.handle.lock().unwrap() = Some(handle.clone());
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Err(FfiError::Cancelled)
+        ));
+        assert!(!b.has_blob(large).unwrap());
+        assert_eq!(std::fs::read_dir(b_store.join("tmp")).unwrap().count(), 0);
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
     }
 }

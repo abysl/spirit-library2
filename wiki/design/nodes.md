@@ -73,6 +73,8 @@ Before accepting a stream, the responder closes authenticated outsiders who shar
 
 `node.register_app_handler(name, Arc<dyn AppHandler>)`, `node.unregister_app_handler(name)`, and `node.app_request(mesh, peer, name, bytes).await` expose the channel. The context has private fields with `mesh()`, `peer()`, `protocol()`, `remaining()` (monotonic handler budget), and `is_cancelled()` accessors. The handler budget reserves 250 ms of `request_timeout` for encoding and sending the reply; it saturates at zero for shorter timeouts. `node.diagnostics()` returns the last 32 oldest-first local `Diagnostic` entries, with a channel (currently `"spirit/app/1"`), optional mesh and protocol, peer and a sanitized cause of at most 256 UTF-8 bytes. Outsider refusals never evict member diagnostics. Transport errors alone enter presence diagnostics. No application data or diagnostics are persisted or merged. The union outsider gate scans current admissions under the state lock, costing about 1.0 ms per outsider connection at 64 meshes × 256 admissions on this host. This is a known limit; the generic failure is not timing-indistinguishable.
 
+The FFI fetch listener receives progress and exactly one completion callback on a dedicated forwarding thread, never a Tokio runtime worker. Listeners must not call `SpiritNode` synchronously; a blocked listener delays its own completion. Listener panics are isolated from the runtime. Cancellation signals the receive loop, closes its input, and joins the blocking writer before reporting `Cancelled`; Kotlin dispatches progress to a child coroutine, joins it before returning, and awaits native completion even when the coroutine is cancelled. UniFFI does not lower `Result` as a callback parameter, so completion carries mutually exclusive nullable size and typed error fields.
+
 ## Persistence and local control
 
 The node directory defaults to `~/.spirit2/node`, overridden with `--node-dir` or `SPIRIT_NODE_DIR`. Blob storage continues to use its separate `--store` setting.
@@ -202,5 +204,6 @@ failures return `Unavailable`. `FetchError::Node(NodeError)` reuses `NotMember`,
 `NodeClosed`, and `StoreNotConfigured`; `Interrupted`, `Corrupt`, `Timeout`, and `Io` are fetch-specific.
 Core `StoreError` distinguishes `NotFound`, `Corrupt`, `InvalidHash`, store `Io`, and destination
 `Destination`. Fetch maps store `Corrupt` to fetch `Corrupt`, missing blobs to node `Unavailable`, and
-store I/O or destination errors to fetch `Io`; no store maps to node `StoreNotConfigured`. The current
-FFI maps this last error to its generic `Node` category until S7 adds a dedicated mapping.
+store I/O or destination errors to fetch `Io`; no store maps to node `StoreNotConfigured`. The FFI
+reports the requested hash as `Corrupt.expected`; `FetchError::Corrupt` carries no actual hash, so
+`Corrupt.actual` is empty for fetch failures. Store corruption retains both hashes.
