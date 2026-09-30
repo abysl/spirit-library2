@@ -2,6 +2,7 @@ package blue.rae.spirit.sdk
 
 import java.nio.file.Paths
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
@@ -11,6 +12,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.spirit_ffi.SpiritNode as FfiNode
 import uniffi.spirit_ffi.FfiException
+import uniffi.spirit_ffi.ByteSource
+import uniffi.spirit_ffi.ByteSink
 
 internal fun mapError(error: FfiException): MeshNodeException = MeshNodeException(when (error) {
     is FfiException.Invalid -> MeshFailure.Invalid
@@ -20,8 +23,19 @@ internal fun mapError(error: FfiException): MeshNodeException = MeshNodeExceptio
     is FfiException.NotMember -> MeshFailure.NotMember
     is FfiException.TicketRejected -> MeshFailure.TicketRejected
     is FfiException.Unavailable -> MeshFailure.Unavailable
-    else -> MeshFailure.Node
-})
+    is FfiException.StoreNotConfigured -> MeshFailure.StoreNotConfigured
+    is FfiException.Interrupted -> MeshFailure.Interrupted
+    is FfiException.Corrupt -> MeshFailure.Corrupt
+    is FfiException.Timeout -> MeshFailure.Timeout
+    is FfiException.Missing -> MeshFailure.Missing
+    is FfiException.Destination -> MeshFailure.Destination
+    is FfiException.Io -> MeshFailure.Io
+    is FfiException.SourceRead -> MeshFailure.SourceRead
+    is FfiException.Node -> MeshFailure.Node
+}, if (error is FfiException.TicketRejected) "ticket rejected" else error.message ?: "native error",
+    expectedHash = (error as? FfiException.Corrupt)?.expected,
+    actualHash = (error as? FfiException.Corrupt)?.actual,
+)
 
 
 private const val NODE_LEASE_TIMEOUT_MILLIS = 15_000L
@@ -65,14 +79,18 @@ class SpiritNode private constructor(
     private val ffi: FfiNode,
     private val lease: NodeDirectoryLeases.Lease,
     private val dispatcher: CoroutineDispatcher,
-) : MeshNode, AutoCloseable {
+) : MeshNode, MeshFiles, AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val activeCalls = Object()
+    private var callCount = 0
+    private var teardownClaimed = false
 
     companion object {
         suspend fun open(
             nodeDir: String,
             nickname: String,
             local: Boolean = false,
+            storeDir: String? = null,
             dispatcher: CoroutineDispatcher = Dispatchers.IO,
             leaseTimeoutMillis: Long = NODE_LEASE_TIMEOUT_MILLIS,
         ): SpiritNode {
@@ -82,7 +100,7 @@ class SpiritNode private constructor(
                 return withContext(dispatcher) {
                     val lease = NodeDirectoryLeases.acquire(nodeDir, leaseTimeoutMillis)
                     acquired = lease
-                    val native = FfiNode.open(nodeDir, nickname, local)
+                    val native = FfiNode.open(nodeDir, nickname, local, storeDir)
                     opened = native
                     SpiritNode(native, lease, dispatcher)
                 }
@@ -97,9 +115,99 @@ class SpiritNode private constructor(
     }
 
     private suspend fun <T> io(block: () -> T): T = withContext(dispatcher) {
-        if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
-        try { block() } catch (error: FfiException) { throw mapError(error) }
+        synchronized(activeCalls) {
+            if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+            callCount++
+        }
+        try {
+            try { block() } catch (error: FfiException) { throw mapError(error) }
+        } finally {
+            val finish = synchronized(activeCalls) {
+                callCount--
+                activeCalls.notifyAll()
+                if (closed.get() && callCount == 0 && !teardownClaimed) {
+                    teardownClaimed = true
+                    true
+                } else false
+            }
+            if (finish) finishClose()
+        }
     }
+
+    private fun finishClose() {
+        try { ffi.shutdown() } finally { try { ffi.close() } finally { lease.release() } }
+    }
+
+    private fun callbackFailure(failure: MeshFailure, error: Exception): MeshNodeException =
+        MeshNodeException(failure, error.message ?: failure.name, error)
+
+
+    override suspend fun importFile(path: String): String = io { ffi.importFile(path) }
+
+    override suspend fun importSource(open: () -> MeshSource): String = io {
+        val source = open()
+        val original = AtomicReference<Exception?>()
+        try {
+            try {
+                ffi.importSource(object : ByteSource {
+                    override fun read(max: UInt): ByteArray = try {
+                        if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+                        source.read(max.toInt())
+                    } catch (error: Exception) {
+                        original.compareAndSet(null, error)
+                        if (error is MeshNodeException && error.failure == MeshFailure.NodeClosed) throw FfiException.NodeClosed()
+                        throw FfiException.SourceRead(error.message ?: "source read failed")
+                    }
+                })
+            } catch (error: FfiException) {
+                original.get()?.let {
+                    if (it is MeshNodeException && it.failure == MeshFailure.NodeClosed) throw it
+                    throw callbackFailure(MeshFailure.SourceRead, it)
+                }
+                throw error
+            }
+        } finally {
+            source.close()
+        }
+    }
+
+    override suspend fun exportFile(hash: String, path: String): Long = io { ffi.exportFile(hash, path).toLong() }
+
+    override suspend fun exportTo(hash: String, sink: MeshSink): Long = io {
+        val original = AtomicReference<Exception?>()
+        try {
+            ffi.exportTo(hash, object : ByteSink {
+                override fun write(bytes: ByteArray) = try {
+                    if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+                    sink.write(bytes)
+                } catch (error: Exception) {
+                    original.compareAndSet(null, error)
+                    if (error is MeshNodeException && error.failure == MeshFailure.NodeClosed) throw FfiException.NodeClosed()
+                    throw FfiException.Destination(error.message ?: "destination write failed")
+                }
+                override fun finish() = try {
+                    if (closed.get()) throw MeshNodeException(MeshFailure.NodeClosed)
+                    sink.finish()
+                } catch (error: Exception) {
+                    original.compareAndSet(null, error)
+                    if (error is MeshNodeException && error.failure == MeshFailure.NodeClosed) throw FfiException.NodeClosed()
+                    throw FfiException.Destination(error.message ?: "destination finish failed")
+                }
+            }).toLong()
+        } catch (error: FfiException) {
+            original.get()?.let {
+                if (it is MeshNodeException && it.failure == MeshFailure.NodeClosed) throw it
+                throw callbackFailure(MeshFailure.Destination, it)
+            }
+            throw error
+        }
+    }
+
+    override suspend fun hasBlob(hash: String): Boolean = io { ffi.hasBlob(hash) }
+    override suspend fun blobSize(hash: String): Long = io { ffi.blobSize(hash).toLong() }
+    override suspend fun setShares(meshId: String, hashes: List<String>) = io { ffi.setShares(meshId, hashes) }
+    override suspend fun share(meshId: String, hash: String) = io { ffi.share(meshId, hash) }
+    override suspend fun unshare(meshId: String, hash: String) = io { ffi.unshare(meshId, hash) }
 
     override suspend fun status(): NodeStatus = io {
         val status = ffi.status()
@@ -133,7 +241,22 @@ class SpiritNode private constructor(
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
-            try { ffi.shutdown() } finally { try { ffi.close() } finally { lease.release() } }
+            val deadline = System.nanoTime() + 15_000_000_000L
+            val finish = synchronized(activeCalls) {
+                while (callCount != 0) {
+                    val remaining = (deadline - System.nanoTime()) / 1_000_000
+                    if (remaining <= 0) break
+                    try { activeCalls.wait(remaining) } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
+                if (callCount == 0 && !teardownClaimed) {
+                    teardownClaimed = true
+                    true
+                } else false
+            }
+            if (finish) finishClose()
         }
     }
 }

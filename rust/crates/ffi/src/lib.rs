@@ -9,8 +9,16 @@ uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
+    #[error("node blob store is not configured")]
+    StoreNotConfigured,
+    #[error("blob transfer interrupted")]
+    Interrupted,
+    #[error("transfer timed out")]
+    Timeout,
     #[error("store io: {0}")]
     Io(String),
+    #[error("source read: {0}")]
+    SourceRead(String),
     #[error("destination io: {0}")]
     Destination(String),
     #[error("blob {0} not in store")]
@@ -35,6 +43,12 @@ pub enum FfiError {
     Node(String),
 }
 
+impl From<uniffi::UnexpectedUniFFICallbackError> for FfiError {
+    fn from(error: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        FfiError::Node(error.reason)
+    }
+}
+
 impl From<StoreError> for FfiError {
     fn from(error: StoreError) -> Self {
         match error {
@@ -47,6 +61,61 @@ impl From<StoreError> for FfiError {
             },
             StoreError::InvalidHash(e) => FfiError::Invalid(e.to_string()),
         }
+    }
+}
+
+fn node_error(error: anyhow::Error) -> FfiError {
+    for cause in error.chain() {
+        if let Some(callback) = cause.downcast_ref::<FfiError>() {
+            return match callback {
+                FfiError::SourceRead(message) => FfiError::SourceRead(message.clone()),
+                FfiError::Destination(message) => FfiError::Destination(message.clone()),
+                FfiError::NodeClosed => FfiError::NodeClosed,
+                _ => FfiError::Node(callback.to_string()),
+            };
+        }
+    }
+    let detail = format!("{error:#}");
+    if let Some(error) = error.downcast_ref::<spirit_sdk::FetchError>() {
+        return match error {
+            spirit_sdk::FetchError::Node(error) => map_node_error(error, detail),
+            spirit_sdk::FetchError::Interrupted => FfiError::Interrupted,
+            spirit_sdk::FetchError::Corrupt => FfiError::Corrupt {
+                expected: String::new(),
+                actual: String::new(),
+            },
+            spirit_sdk::FetchError::Timeout => FfiError::Timeout,
+            spirit_sdk::FetchError::Io(_) => FfiError::Io(detail),
+        };
+    }
+    if let Some(error) = error.downcast_ref::<spirit_sdk::NodeError>() {
+        return map_node_error(error, detail);
+    }
+    if let Some(error) = error.downcast_ref::<StoreError>() {
+        return match error {
+            StoreError::Io(_) => FfiError::Io(detail),
+            StoreError::Destination(_) => FfiError::Destination(detail),
+            StoreError::NotFound(hash) => FfiError::Missing(hash.to_string()),
+            StoreError::Corrupt { expected, actual } => FfiError::Corrupt {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            },
+            StoreError::InvalidHash(_) => FfiError::Invalid(detail),
+        };
+    }
+    FfiError::Node(detail)
+}
+
+fn map_node_error(error: &spirit_sdk::NodeError, detail: String) -> FfiError {
+    match error {
+        spirit_sdk::NodeError::MeshLimit => FfiError::MeshLimit,
+        spirit_sdk::NodeError::NotMember => FfiError::NotMember(detail),
+        spirit_sdk::NodeError::TicketRejected(_) => FfiError::TicketRejected(detail),
+        spirit_sdk::NodeError::NodeClosed => FfiError::NodeClosed,
+        spirit_sdk::NodeError::StoreNotConfigured => FfiError::StoreNotConfigured,
+        spirit_sdk::NodeError::NodeBusy => FfiError::NodeBusy,
+        spirit_sdk::NodeError::Invalid(_) => FfiError::Invalid(detail),
+        spirit_sdk::NodeError::Unavailable(_) => FfiError::Unavailable(detail),
     }
 }
 
@@ -65,7 +134,12 @@ impl SpiritStore {
     #[uniffi::constructor]
     pub fn open(store_dir: String) -> Result<Self, FfiError> {
         Ok(Self {
-            store: BlobStore::open(store_dir)?,
+            store: BlobStore::open(store_dir).map_err(|error| match &error {
+                StoreError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock => {
+                    FfiError::NodeBusy
+                }
+                _ => error.into(),
+            })?,
         })
     }
 
@@ -103,6 +177,76 @@ mod tests {
         assert!(matches!(
             FfiError::from(StoreError::Destination(io::Error::other("write failed"))),
             FfiError::Destination(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn maps_all_transfer_and_store_failures_without_text_matching() {
+        let hash = BlobHash::of(b"expected");
+        let actual = BlobHash::of(b"actual");
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::StoreNotConfigured.into()),
+            FfiError::StoreNotConfigured
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::FetchError::Interrupted.into()),
+            FfiError::Interrupted
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::FetchError::Timeout.into()),
+            FfiError::Timeout
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::FetchError::Corrupt.into()),
+            FfiError::Corrupt { .. }
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::FetchError::Io(io::Error::other("test")).into()),
+            FfiError::Io(_)
+        ));
+        assert!(matches!(
+            node_error(StoreError::NotFound(hash).into()),
+            FfiError::Missing(_)
+        ));
+        assert!(matches!(
+            node_error(
+                StoreError::Corrupt {
+                    expected: hash,
+                    actual
+                }
+                .into()
+            ),
+            FfiError::Corrupt { .. }
+        ));
+        assert!(matches!(
+            node_error(StoreError::Destination(io::Error::other("test")).into()),
+            FfiError::Destination(_)
+        ));
+        assert!(matches!(
+            node_error(StoreError::Io(io::Error::other("test")).into()),
+            FfiError::Io(_)
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::NodeError::NodeBusy.into()),
+            FfiError::NodeBusy
+        ));
+        assert!(matches!(
+            node_error(spirit_sdk::FetchError::Node(spirit_sdk::NodeError::NodeBusy).into()),
+            FfiError::NodeBusy
+        ));
+        assert!(matches!(
+            node_error(StoreError::InvalidHash("bad".parse::<BlobHash>().unwrap_err()).into()),
+            FfiError::Invalid(_)
+        ));
+        assert!(matches!(
+            node_error(anyhow::anyhow!("unknown")),
+            FfiError::Node(_)
         ));
     }
 }

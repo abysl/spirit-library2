@@ -15,9 +15,15 @@ data class PairingInvitation(val ticket: String, val width: Int, val modules: By
 data class NodePong(val name: String, val elapsedMs: Long)
 data class LeftMesh(val meshId: String, val meshName: String, val remainingMembers: Int, val notifiedMembers: Int)
 
-enum class MeshFailure { Invalid, NodeClosed, NodeBusy, MeshLimit, NotMember, TicketRejected, Unavailable, Node }
+enum class MeshFailure { Invalid, NodeClosed, NodeBusy, MeshLimit, NotMember, TicketRejected, Unavailable, StoreNotConfigured, Interrupted, Corrupt, Timeout, Missing, Destination, SourceRead, Io, Node }
 
-class MeshNodeException(val failure: MeshFailure) : Exception(failure.name)
+class MeshNodeException(
+    val failure: MeshFailure,
+    message: String = failure.name,
+    cause: Throwable? = null,
+    val expectedHash: String? = null,
+    val actualHash: String? = null,
+) : Exception(message, cause)
 
 interface MeshNode {
     suspend fun status(): NodeStatus
