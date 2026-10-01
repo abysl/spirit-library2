@@ -98,7 +98,11 @@ impl SpiritNode {
     pub fn status(&self) -> Result<MeshStatus, FfiError> {
         let node = self.active()?;
         let info = node.info();
-        let mesh_id = info.mesh_id;
+        let mesh_id = if info.meshes.is_empty() {
+            None
+        } else {
+            Some(info.only_mesh().map_err(node_error)?)
+        };
         let peers = node
             .peers()
             .into_iter()
@@ -210,10 +214,11 @@ mod tests {
             SpiritNode::open(dir.path().to_str().unwrap().into(), "desktop".into(), true).unwrap();
         node.create_mesh("one".into()).unwrap();
         node.create_mesh("two".into()).unwrap();
-        let status = node.status().unwrap();
-        assert!(status.mesh_id.is_none());
-        assert!(status.mesh_name.is_none());
-        for error in [node.add("invalid".into()).err(), node.leave_mesh().err()] {
+        for error in [
+            node.status().err(),
+            node.add("invalid".into()).err(),
+            node.leave_mesh().err(),
+        ] {
             assert!(format!("{}", error.unwrap())
                 .contains("this device is in several meshes; choose one"));
         }

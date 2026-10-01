@@ -1,10 +1,5 @@
 {
-  "addresses": {
-    "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e": {
-      "id": "8348a651a82fec682872b9ef17f8adc60367e60af57da9e84cfa1265c97e500e",
-      "addrs": []
-    }
-  },
+  "addresses": {},
   "departed": {
     "mesh1_V273VIE7D7aH-rDEIA4mtAlQlqrkPlcPfGumQM4_PuY": {
       "admissions": [

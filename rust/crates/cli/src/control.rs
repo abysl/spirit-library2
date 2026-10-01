@@ -24,9 +24,9 @@ pub enum Operation {
     Info,
     Create { name: String },
     Pair { ttl_seconds: u64 },
-    Add { mesh_id: MeshId, ticket: String },
+    Add { ticket: String },
     Ping { device: String },
-    Leave { mesh_id: MeshId },
+    Leave,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,12 +129,14 @@ async fn execute(node: &Node, operation: Operation) -> Result<Reply> {
         Operation::Pair { ttl_seconds } => Ok(Reply::Ticket(
             node.pair(Duration::from_secs(ttl_seconds)).await?,
         )),
-        Operation::Add { mesh_id, ticket } => Ok(Reply::Added(node.add(mesh_id, &ticket).await?)),
+        Operation::Add { ticket } => Ok(Reply::Added(
+            node.add(node.info().only_mesh()?, &ticket).await?,
+        )),
         Operation::Ping { device } => {
             let member = node.info().resolve(&device)?;
             Ok(Reply::Pong(node.ping(member.id).await?))
         }
-        Operation::Leave { mesh_id } => Ok(Reply::Left(node.leave(mesh_id).await?)),
+        Operation::Leave => Ok(Reply::Left(node.leave(node.info().only_mesh()?).await?)),
     }
 }
 
@@ -255,48 +257,19 @@ mod tests {
         previous.as_object_mut().unwrap().remove("meshes");
         let restored: NodeInfo = serde_json::from_value(previous).unwrap();
         assert!(restored.meshes.is_empty());
-        let mut meshes = Vec::new();
-        let mut members = std::collections::BTreeMap::new();
-        for mesh_index in 0..64 {
-            let mut mesh = info.meshes[0].clone();
-            mesh.id = format!(
-                "mesh1_{}{}",
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[mesh_index]
-                    as char,
-                "A".repeat(42)
-            )
-            .parse()
-            .unwrap();
-            mesh.name = "\"".repeat(128);
-            mesh.members = (0..256)
-                .map(|_| {
-                    let id = iroh::SecretKey::generate().public();
-                    let member = spirit_sdk::MeshMember {
-                        id,
-                        name: "\"".repeat(128),
-                        generation: 0,
-                    };
-                    members.insert(
-                        id,
-                        spirit_sdk::Member {
-                            id,
-                            name: member.name.clone(),
-                        },
-                    );
-                    member
-                })
-                .collect();
-            meshes.push(mesh);
-        }
-        info.meshes = meshes;
-        info.members = members.into_values().collect();
+        let member = spirit_sdk::MeshMember {
+            id: info.id,
+            name: "\"".repeat(128),
+            generation: 0,
+        };
+        info.meshes[0].members = vec![member; 256];
+        info.meshes = vec![info.meshes[0].clone(); 64];
         let response = serde_json::to_vec(&Response {
             result: Ok(Reply::Info(info)),
         })
         .unwrap();
         assert!(response.len() > MAX_REQUEST);
         assert!(response.len() < MAX_REPLY);
-        println!("worst-case control reply: {} bytes", response.len());
         node.shutdown().await.unwrap();
     }
 

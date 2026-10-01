@@ -145,56 +145,26 @@ fn three_devices_enroll_by_ticket_and_ping_by_nickname_without_introducer() {
 }
 
 #[test]
-fn mesh_selection_adds_and_leaves_only_the_named_mesh() {
-    let mut a = Device::new("a");
-    let mut b = Device::new("b");
-    let mut c = Device::new("c");
-    b.ok(&["mesh", "create", "--name", "M1"]);
-    let m1 = b
-        .ok(&["mesh", "status"])
-        .lines()
-        .find_map(|line| line.strip_prefix("Mesh ID: "))
-        .unwrap()
-        .to_owned();
-    b.ok(&["mesh", "create", "--name", "M2"]);
-    let m2 = b
-        .ok(&["mesh", "status"])
-        .lines()
-        .filter_map(|line| line.strip_prefix("Mesh ID: "))
-        .find(|id| *id != m1)
-        .unwrap()
-        .to_owned();
-    for device in [&mut a, &mut b, &mut c] {
-        device.start();
-    }
-    let status = b.ok(&["mesh", "status"]);
-    assert!(status.contains(&format!("Mesh: M1\nMesh ID: {m1}")));
-    assert!(status.contains(&format!("Mesh: M2\nMesh ID: {m2}")));
-    for args in [vec!["mesh", "add", "not-a-ticket"], vec!["mesh", "leave"]] {
-        let result = b.run(&args);
+fn mesh_specific_cli_actions_require_selection_when_multiple_meshes_exist() {
+    let mut device = Device::new("desktop");
+    device.start();
+    device.ok(&["mesh", "create", "--name", "one"]);
+    device.ok(&["mesh", "create", "--name", "two"]);
+    for args in [
+        vec!["mesh", "status"],
+        vec!["mesh", "members"],
+        vec!["mesh", "add", "not-a-ticket"],
+        vec!["mesh", "leave"],
+    ] {
+        let result = device.run(&args);
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr)
             .contains("this device is in several meshes; choose one"));
     }
-    let ticket = a.ok(&["node", "pair", "--no-qr"]);
-    b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m1]);
-    let ticket = c.ok(&["node", "pair", "--no-qr"]);
-    b.ok(&["mesh", "add", ticket.trim(), "--mesh", &m2]);
-    assert!(b.ok(&["mesh", "status"]).contains("Devices: 3"));
-    assert!(b.ok(&["mesh", "members", "--mesh", &m1]).contains("a"));
-    assert!(!b.ok(&["mesh", "members", "--mesh", &m1]).contains("c\n"));
-    assert!(b.ok(&["mesh", "members", "--mesh", &m2]).contains("c"));
-    let a_members = a.ok(&["mesh", "members"]);
-    let c_members = c.ok(&["mesh", "members"]);
-    assert!(!a_members.lines().any(|line| line == "c"));
-    assert!(!c_members.lines().any(|line| line == "a"));
-    assert!(b.ok(&["mesh", "leave", "--mesh", &m1]).contains("Left M1"));
-    let remaining = b.ok(&["mesh", "status"]);
-    assert!(!remaining.contains(&m1));
-    assert!(remaining.contains(&m2));
-    assert!(!b.ok(&["mesh", "members"]).lines().any(|line| line == "a"));
-    b.stop();
-    assert!(b.ok(&["mesh", "leave", "--mesh", &m2]).contains("Left M2"));
+    device.stop();
+    let result = device.run(&["mesh", "leave"]);
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("this device is in several meshes; choose one"));
 }
 
 #[test]

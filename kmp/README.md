@@ -40,8 +40,6 @@ Native preparation compiles the sibling Rust workspace before the consuming Grad
 
 `MeshNode` is the reusable native-node contract. It exposes suspend `status`, `createMesh`, `pair`, `add`, `ping`, `leaveMesh`, and `shutdown` operations using `NodeStatus`, `NodePeer`, `PairingInvitation`, `NodePong`, and `LeftMesh`. `SpiritNode` implements `MeshNode`, retains `AutoCloseable.close`, and provides noncancellable off-main `shutdown` for session cleanup.
 
-S2's FFI `add` and `leaveMesh` still require exactly one mesh; S3 replaces these bindings with mesh selection, and AFM consumes only S3.
-
 `PairingSession(nodeFactory, meshName, nowMillis)` owns exactly one node while `run()` is active. `run()` may be called once per session instance. It publishes `StateFlow<PairingState>`, automatically creates a ticket after its first successful status read, polls status and ages displayed peer samples once per second, serializes node operations and shutdown, and waits for in-flight opening/actions before closing the node on owner teardown. Call `refreshTicket()` for a manual QR refresh, `pair(value)` for a scanned or pasted ticket, `leaveMesh()` to leave the current mesh, and `reportError(message)` for host failures such as camera errors.
 
 A fresh receiver stays enrollable until it scans a ticket. Its first eligible enrollment attempt creates the requested mesh immediately before enrollment; later scans reuse that mesh. A failed remote enrollment can leave a founder-only mesh in place; the receiver QR is withdrawn as soon as this node enters a mesh. Independent meshes cannot merge. To join an existing mesh, have an existing member scan the fresh receiver's ticket, not the other way around.

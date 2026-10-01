@@ -1,4 +1,4 @@
-use crate::membership::{bounded_address, validate_name, Member, Mesh, Snapshot, VerifiedSnapshot};
+use crate::membership::{bounded_address, validate_name, Member, Mesh, Snapshot};
 use crate::mesh_id::MeshId;
 use crate::NodeInfo;
 use anyhow::{ensure, Context, Result};
@@ -9,53 +9,13 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub(crate) const MAX_CURRENT_MESHES: usize = 64;
 const MAX_DEPARTED_MESHES: usize = 64;
 const MULTI_MESH_SENTINEL: &str = "spirit/state/multi-mesh";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub(crate) enum AddressEntry {
-    Legacy(EndpointAddr),
-    Current {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        direct: Option<EndpointAddr>,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        hints: BTreeMap<MeshId, EndpointAddr>,
-    },
-}
-
-impl AddressEntry {
-    fn preferred(&self, mesh_id: MeshId) -> Option<&EndpointAddr> {
-        match self {
-            Self::Current { direct, hints } => direct.as_ref().or_else(|| hints.get(&mesh_id)),
-            Self::Legacy(_) => None,
-        }
-    }
-
-    pub fn dial(&self) -> Option<&EndpointAddr> {
-        match self {
-            Self::Current { direct, hints } => direct.as_ref().or_else(|| hints.values().next()),
-            Self::Legacy(_) => None,
-        }
-    }
-
-    fn set(&mut self, mesh_id: MeshId, address: EndpointAddr, direct_source: bool) -> bool {
-        let Self::Current { direct, hints } = self else {
-            return false;
-        };
-        if direct_source {
-            if direct.as_ref() == Some(&address) {
-                return false;
-            }
-            *direct = Some(address);
-        } else if hints.get(&mesh_id) != Some(&address) {
-            hints.insert(mesh_id, address);
-        } else {
-            return false;
-        }
-        true
-    }
+enum AddressSource {
+    Direct,
+    Hint(MeshId),
 }
 
 fn write_mesh_sentinel<S: Serializer>(
@@ -83,6 +43,7 @@ fn legacy_mesh_field<'de, D: Deserializer<'de>>(
         None => Ok(None),
     }
 }
+pub(crate) const MAX_CURRENT_MESHES: usize = 64;
 
 fn read_departed<'de, D: Deserializer<'de>>(
     deserializer: D,
@@ -112,9 +73,9 @@ pub(crate) struct State {
         serialize_with = "write_mesh_sentinel"
     )]
     legacy_mesh: Option<Mesh>,
-    pub addresses: BTreeMap<EndpointId, AddressEntry>,
-    #[serde(skip)]
-    needs_migration: bool,
+    pub addresses: BTreeMap<EndpointId, EndpointAddr>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    address_sources: BTreeMap<EndpointId, AddressSource>,
     #[serde(
         default,
         deserialize_with = "read_departed",
@@ -203,7 +164,7 @@ impl Storage {
                 meshes: BTreeMap::new(),
                 legacy_mesh: None,
                 addresses: BTreeMap::new(),
-                needs_migration: false,
+                address_sources: BTreeMap::new(),
                 departed: BTreeMap::new(),
                 departure_order: Vec::new(),
             })?;
@@ -213,7 +174,7 @@ impl Storage {
             state.member.id == storage.key.public(),
             "identity does not match state"
         );
-        if state.legacy_mesh.is_some() || state.needs_migration {
+        if state.legacy_mesh.is_some() {
             storage.save(&state)?;
         }
         Ok(state.info())
@@ -236,7 +197,7 @@ impl Storage {
             key,
             _lock: guard,
         };
-        if state.legacy_mesh.take().is_some() || state.needs_migration {
+        if state.legacy_mesh.take().is_some() {
             storage.save(&state)?;
         }
         Ok((storage, state))
@@ -259,29 +220,12 @@ impl Storage {
             state.meshes.len() <= MAX_CURRENT_MESHES,
             "device has reached the 64-group limit"
         );
-        let legacy_mesh_id =
-            (state.meshes.len() == 1).then(|| *state.meshes.keys().next().unwrap());
-        state.addresses.retain(|_, entry| {
-            if let AddressEntry::Legacy(address) = entry {
-                state.needs_migration = true;
-                let Some(mesh_id) = legacy_mesh_id else {
-                    return false;
-                };
-                *entry = AddressEntry::Current {
-                    direct: None,
-                    hints: BTreeMap::from([(mesh_id, bounded_address(address.clone()))]),
-                };
-            }
-            if let AddressEntry::Current { direct, hints } = entry {
-                if let Some(address) = direct {
-                    *address = bounded_address(address.clone());
-                }
-                for address in hints.values_mut() {
-                    *address = bounded_address(address.clone());
-                }
-            }
-            true
-        });
+        for addr in state.addresses.values_mut() {
+            *addr = bounded_address(addr.clone());
+        }
+        state
+            .address_sources
+            .retain(|id, _| state.addresses.contains_key(id));
         for (id, mesh) in &state.meshes {
             ensure!(*id == mesh.id, "mesh ID does not match its key");
             mesh.verify()?;
@@ -290,7 +234,6 @@ impl Storage {
                 "device is missing from its mesh"
             );
         }
-        state.retain_member_addresses();
         ensure!(
             state.departed.len() <= MAX_DEPARTED_MESHES,
             "too many departed meshes"
@@ -382,48 +325,43 @@ impl State {
         let mut addresses: BTreeMap<_, _> = self
             .addresses
             .iter()
-            .filter_map(|(id, entry)| {
-                mesh.member(*id).and_then(|_| {
-                    entry
-                        .preferred(mesh_id)
-                        .map(|addr| (*id, bounded_address(addr.clone())))
-                })
+            .filter(|(id, _)| {
+                mesh.member(**id).is_some()
+                    && self
+                        .address_sources
+                        .get(*id)
+                        .is_none_or(|source| match source {
+                            AddressSource::Direct => true,
+                            AddressSource::Hint(origin) => *origin == mesh_id,
+                        })
             })
+            .map(|(id, addr)| (*id, bounded_address(addr.clone())))
             .collect();
         addresses.insert(addr.id, bounded_address(addr));
         Ok(Snapshot { mesh, addresses })
     }
 
-    pub fn join(&mut self, verified: &VerifiedSnapshot<'_>, source: EndpointId) -> Result<bool> {
-        self.merge_inner(verified, source, false)
+    pub fn join(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<bool> {
+        self.merge_inner(snapshot, source, false)
     }
 
-    pub fn merge_current(
-        &mut self,
-        verified: &VerifiedSnapshot<'_>,
-        source: EndpointId,
-    ) -> Result<bool> {
-        self.merge_inner(verified, source, true)
+    pub fn merge_current(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<bool> {
+        self.merge_inner(snapshot, source, true)
     }
 
     fn merge_inner(
         &mut self,
-        verified: &VerifiedSnapshot<'_>,
+        snapshot: &Snapshot,
         source: EndpointId,
         current_only: bool,
     ) -> Result<bool> {
-        let snapshot = verified.snapshot();
         ensure!(
             snapshot.mesh.member(self.member.id) == Some(&self.member),
             "membership does not match this device"
         );
         let (mut mesh, mut changed) = if let Some(current) = self.meshes.get(&snapshot.mesh.id) {
-            ensure!(
-                !current.records_departure_at(&snapshot.mesh, source),
-                "mesh unavailable"
-            );
             let mut mesh = current.clone();
-            verified.merge_into(&mut mesh)?;
+            mesh.merge_trusted(&snapshot.mesh)?;
             let changed = mesh.admissions.len() != current.admissions.len()
                 || mesh.departures.len() != current.departures.len();
             (mesh, changed)
@@ -437,8 +375,7 @@ impl State {
         };
         if let Some(departed) = self.departed.get(&mesh.id) {
             ensure!(!current_only, "mesh unavailable");
-            VerifiedSnapshot::from_verified_local(&Snapshot::without_addresses(departed.clone()))
-                .merge_into(&mut mesh)?;
+            mesh.merge_trusted(departed)?;
             ensure!(
                 mesh.member(self.member.id).is_some(),
                 "this device left that mesh"
@@ -453,12 +390,7 @@ impl State {
         Ok(changed)
     }
 
-    pub fn merge_departure(
-        &mut self,
-        verified: &VerifiedSnapshot<'_>,
-        source: EndpointId,
-    ) -> Result<bool> {
-        let snapshot = verified.snapshot();
+    pub fn merge_departure(&mut self, snapshot: &Snapshot, source: EndpointId) -> Result<bool> {
         let mesh = self
             .meshes
             .get_mut(&snapshot.mesh.id)
@@ -468,7 +400,7 @@ impl State {
             "peer has not left this mesh"
         );
         let before = (mesh.admissions.len(), mesh.departures.len());
-        verified.merge_into(mesh)?;
+        mesh.merge_trusted(&snapshot.mesh)?;
         let changed = before != (mesh.admissions.len(), mesh.departures.len());
         self.retain_member_addresses();
         Ok(changed)
@@ -505,50 +437,50 @@ impl State {
             .map(|departed| Snapshot::without_addresses(departed.clone()))
     }
 
-    pub fn rejoin_conflict(&self, verified: &VerifiedSnapshot<'_>) -> Result<Option<Snapshot>> {
-        let Some(departure) = self.departure(verified.snapshot().mesh.id) else {
+    pub fn rejoin_conflict(&self, mesh: &Mesh) -> Result<Option<Snapshot>> {
+        let Some(departure) = self.departure(mesh.id) else {
             return Ok(None);
         };
-        let mut merged = verified.snapshot().mesh.clone();
-        VerifiedSnapshot::from_verified_local(&departure).merge_into(&mut merged)?;
+        let mut merged = mesh.clone();
+        merged.merge_trusted(&departure.mesh)?;
         Ok(merged.departed(self.member.id).then_some(departure))
     }
 
     fn store_addresses(&mut self, snapshot: &Snapshot, source: EndpointId) -> bool {
         let mut changed = false;
         for (id, addr) in &snapshot.addresses {
-            let entry = self
-                .addresses
-                .entry(*id)
-                .or_insert_with(|| AddressEntry::Current {
-                    direct: None,
-                    hints: BTreeMap::new(),
-                });
-            changed |= entry.set(
-                snapshot.mesh.id,
-                bounded_address(addr.clone()),
-                *id == source,
-            );
+            let provenance = if *id == source {
+                AddressSource::Direct
+            } else {
+                AddressSource::Hint(snapshot.mesh.id)
+            };
+            if matches!(provenance, AddressSource::Hint(_)) && self.addresses.contains_key(id) {
+                continue;
+            }
+            let addr = bounded_address(addr.clone());
+            if self.addresses.get(id) != Some(&addr)
+                || self
+                    .address_sources
+                    .get(id)
+                    .unwrap_or(&AddressSource::Direct)
+                    != &provenance
+            {
+                self.addresses.insert(*id, addr);
+                self.address_sources.insert(*id, provenance);
+                changed = true;
+            }
         }
         changed
     }
 
     fn retain_member_addresses(&mut self) {
-        let meshes = &self.meshes;
-        self.addresses.retain(|id, entry| {
-            let AddressEntry::Current { direct, hints } = entry else {
-                return false;
-            };
-            hints.retain(|mesh_id, _| {
-                meshes
-                    .get(mesh_id)
-                    .is_some_and(|mesh| mesh.member(*id).is_some())
-            });
-            if !meshes.values().any(|mesh| mesh.member(*id).is_some()) {
-                *direct = None;
-            }
-            direct.is_some() || !hints.is_empty()
-        });
+        let members: BTreeSet<_> = self
+            .meshes
+            .values()
+            .flat_map(|mesh| mesh.members().map(|member| member.id))
+            .collect();
+        self.addresses.retain(|id, _| members.contains(id));
+        self.address_sources.retain(|id, _| members.contains(id));
     }
 }
 
@@ -697,29 +629,8 @@ mod tests {
         let hint =
             EndpointAddr::new(shared.public()).with_ip_addr("127.0.0.1:54321".parse().unwrap());
         incoming.addresses.insert(shared.public(), hint.clone());
-        assert!(state
-            .join(
-                &VerifiedSnapshot::new(&incoming).unwrap(),
-                introducer.public()
-            )
-            .unwrap());
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(first),
-            Some(&hint)
-        );
-        let newer =
-            EndpointAddr::new(shared.public()).with_ip_addr("127.0.0.1:54322".parse().unwrap());
-        incoming.addresses.insert(shared.public(), newer.clone());
-        assert!(state
-            .merge_current(
-                &VerifiedSnapshot::new(&incoming).unwrap(),
-                introducer.public()
-            )
-            .unwrap());
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(first),
-            Some(&newer)
-        );
+        assert!(state.join(&incoming, introducer.public()).unwrap());
+        assert_eq!(state.addresses.get(&shared.public()), Some(&hint));
         assert!(!state
             .snapshot(second, EndpointAddr::new(state.member.id))
             .unwrap()
@@ -730,42 +641,9 @@ mod tests {
             .unwrap()
             .addresses
             .contains_key(&shared.public()));
-        let mut second_hint = Snapshot::without_addresses(state.meshes[&second].clone());
-        second_hint.addresses.insert(shared.public(), hint.clone());
-        state
-            .merge_current(
-                &VerifiedSnapshot::new(&second_hint).unwrap(),
-                state.member.id,
-            )
-            .unwrap();
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(first),
-            Some(&newer)
-        );
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(second),
-            Some(&hint)
-        );
         let mut direct = Snapshot::without_addresses(state.meshes[&second].clone());
-        direct.addresses.insert(shared.public(), hint.clone());
-        state
-            .merge_current(&VerifiedSnapshot::new(&direct).unwrap(), shared.public())
-            .unwrap();
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(first),
-            Some(&hint)
-        );
-        incoming.addresses.insert(shared.public(), newer);
-        state
-            .merge_current(
-                &VerifiedSnapshot::new(&incoming).unwrap(),
-                introducer.public(),
-            )
-            .unwrap();
-        assert_eq!(
-            state.addresses[&shared.public()].preferred(first),
-            Some(&hint)
-        );
+        direct.addresses.insert(shared.public(), hint);
+        state.merge_current(&direct, shared.public()).unwrap();
         assert!(state
             .snapshot(first, EndpointAddr::new(state.member.id))
             .unwrap()
@@ -776,12 +654,6 @@ mod tests {
             .unwrap()
             .addresses
             .contains_key(&shared.public()));
-        state.leave(first, &storage.key).unwrap();
-        if let AddressEntry::Current { hints, .. } = &state.addresses[&shared.public()] {
-            assert!(!hints.contains_key(&first));
-        } else {
-            panic!("address was not migrated");
-        }
     }
 
     #[test]
@@ -792,9 +664,7 @@ mod tests {
         state.meshes.insert(solo.id, solo);
         state.leave(snapshot.mesh.id, &storage.key).unwrap();
         assert!(state.departed.is_empty());
-        assert!(state
-            .merge_current(&VerifiedSnapshot::new(&snapshot).unwrap(), state.member.id)
-            .is_err());
+        assert!(state.merge_current(&snapshot, state.member.id).is_err());
         assert!(state.meshes.is_empty());
     }
 
@@ -823,11 +693,11 @@ mod tests {
         let old_main: MainState = serde_json::from_slice(main).unwrap();
         let old_leave: LeaveState = serde_json::from_slice(leave).unwrap();
         assert!(old_main.mesh.is_some());
-        assert_eq!(old_main.addresses.len(), 1);
+        assert!(old_main.addresses.is_empty());
         assert!(old_leave.mesh.is_some());
         assert_eq!(old_leave.departed.len(), 1);
         assert_eq!(old_leave.departure_order.len(), 1);
-        assert_eq!(old_leave.addresses.len(), 1);
+        assert!(old_leave.addresses.is_empty());
         for (bytes, id) in [
             (main.as_slice(), old_main.member.id),
             (leave.as_slice(), old_leave.member.id),
@@ -836,21 +706,6 @@ mod tests {
             write_private(&dir.path().join("state.json"), bytes).unwrap();
             let migrated = Storage::read(dir.path()).unwrap();
             assert_eq!(migrated.member.id, id);
-            let mesh_id = *migrated.meshes.keys().next().unwrap();
-            let legacy_address = if id == old_main.member.id {
-                &old_main.addresses
-            } else {
-                &old_leave.addresses
-            };
-            for (peer_id, address) in legacy_address {
-                match &migrated.addresses[peer_id] {
-                    AddressEntry::Current { direct, hints } => {
-                        assert!(direct.is_none());
-                        assert_eq!(hints.get(&mesh_id), Some(address));
-                    }
-                    AddressEntry::Legacy(_) => panic!("unmigrated address"),
-                }
-            }
             let signed = serde_json::to_value(migrated.meshes.values().next().unwrap()).unwrap();
             storage.save(&migrated).unwrap();
             let bytes = std::fs::read(dir.path().join("state.json")).unwrap();

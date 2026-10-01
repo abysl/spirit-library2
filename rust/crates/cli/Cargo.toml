@@ -21,4 +21,3 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-iroh.workspace = true
