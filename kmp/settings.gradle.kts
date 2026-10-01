@@ -1,5 +1,5 @@
 pluginManagement {
-    includeBuild("build-logic")
+    includeBuild("spirit-build-plugin")
 
     repositories {
         google {
